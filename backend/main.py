@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+# from fastapi.staticfiles import StaticFiles
+# from fastapi.responses import FileResponse
 from sqlalchemy import text
 
 load_dotenv()
@@ -16,6 +18,7 @@ from api.routers_batches import router as batches_router
 from api.routers_code import router as code_router
 from api.routers_practice import router as practice_router
 from api.routers_questions import router as questions_router
+from api.routers_interviews import user_router as interviews_router, admin_router as admin_interviews_router
 from api.routers_user_assessments import router as user_assessments_router
 from core.auth import get_password_hash
 from core.evaluation_service import start_evaluation_job_consumer
@@ -38,7 +41,7 @@ DEFAULT_USER_NAME = "Default User"
 
 DEFAULT_BATCH_NAME = "Default Batch"
 
-REGISTRATION_EXPIRY_DAYS = 30
+REGISTRATION_EXPIRY_DAYS = 14
 
 
 def seed_defaults(db):
@@ -157,6 +160,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# # React assets
+# app.mount(
+#     "/assets",
+#     StaticFiles(directory="dist/assets"),
+#     name="assets"
+# )
+
+# # SPA Fallback
+# @app.get("/")
+# async def serve_spa():
+#     return FileResponse("dist/index.html")
+
+
 # Routers
 app.include_router(auth_router)
 app.include_router(admin_router)
@@ -165,14 +181,16 @@ app.include_router(assessments_router)
 app.include_router(batches_router)
 app.include_router(user_assessments_router)
 app.include_router(practice_router)
+app.include_router(interviews_router)
+app.include_router(admin_interviews_router)
 app.include_router(code_router)
 
 
-@app.get("/")
-def root():
-    return {"message": "AI Assessment System API is running"}
+# @app.get("/")
+# def root():
+#     return {"message": "AI Assessment System API is running"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)

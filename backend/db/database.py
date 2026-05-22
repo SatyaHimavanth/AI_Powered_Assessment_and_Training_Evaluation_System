@@ -21,16 +21,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-def get_db():
-    """Sync DB session dependency (existing calls use this)."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# ---------- Async (hybrid) support ---------- #
+# ---------- Async support ---------- #
 # Provide an async engine and an async sessionmaker so we can gradually
 # migrate endpoints to true async DB usage. By default we try to infer
 # an async URL for common drivers (Postgres + asyncpg). You can also

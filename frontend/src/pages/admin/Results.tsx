@@ -19,7 +19,7 @@ interface TopicScore {
 }
 
 interface UserAttemptResult {
-  attempt_id: string;
+  attempt_id: string | null;
   user_id: string;
   user_name: string;
   username: string;
@@ -42,6 +42,7 @@ interface AssessmentResults {
   average_score: number | null;
   topic_performance: TopicPerformance[];
   user_results: UserAttemptResult[];
+  total_user_results: number;
 }
 
 interface Props {
@@ -90,6 +91,13 @@ export default function Results({ batches }: Props) {
   const [attemptResults, setAttemptResults] = useState<AttemptResults | null>(null);
   const [loadingAttemptResults, setLoadingAttemptResults] = useState(false);
 
+  // Status filter and sorting for individual results
+  const [statusFilter, setStatusFilter] = useState("");
+  const [sortField, setSortField] = useState<"name" | "username" | "score" | "status" | "">("");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  // Pagination
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
   // Load all assessments on mount
   useEffect(() => {
     const load = async () => {
@@ -114,14 +122,19 @@ export default function Results({ batches }: Props) {
       )
     : assessments;
 
-  const loadResults = async (assessmentId: string) => {
+  const loadResults = async (assessmentId: string, pg?: number, ps?: number, sf?: string) => {
     if (!assessmentId) {
       setResults(null);
       return;
     }
     setLoading(true);
     try {
-      const res = await api.get(`/assessments/${assessmentId}/results`);
+      const params = new URLSearchParams();
+      params.set("page", String(pg ?? page));
+      params.set("page_size", String(ps ?? pageSize));
+      const currentStatusFilter = sf !== undefined ? sf : statusFilter;
+      if (currentStatusFilter) params.set("status_filter", currentStatusFilter);
+      const res = await api.get(`/assessments/${assessmentId}/results?${params.toString()}`);
       setResults(res.data);
     } catch {
       setResults(null);
@@ -132,7 +145,8 @@ export default function Results({ batches }: Props) {
 
   const handleAssessmentChange = (id: string) => {
     setSelectedAssessment(id);
-    loadResults(id);
+    setPage(1);
+    loadResults(id, 1);
   };
 
   const handleResetAttempt = async (attemptId: string, userName: string) => {
@@ -540,24 +554,60 @@ export default function Results({ batches }: Props) {
 
           {/* Per-User Results Table */}
           <div className={`${card} overflow-hidden`}>
-            <div className="px-5 py-4 border-b border-[var(--color-border)]">
+            <div className="px-5 py-4 border-b border-[var(--color-border)] flex items-center justify-between">
               <h3 className="text-sm font-semibold">Individual Results</h3>
+              <div className="flex items-center gap-3">
+                <select
+                  className="border border-[var(--color-border)] rounded px-2 py-1.5 text-xs bg-white"
+                  value={statusFilter}
+                  onChange={(e) => { setStatusFilter(e.target.value); setPage(1); if (selectedAssessment) loadResults(selectedAssessment, 1, undefined, e.target.value); }}
+                >
+                  <option value="">All Statuses</option>
+                  <option value="pending">Pending</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="completed">Completed</option>
+                  <option value="evaluating">Evaluating</option>
+                  <option value="missed">Missed</option>
+                </select>
+                <select
+                  className="border border-[var(--color-border)] rounded px-2 py-1.5 text-xs bg-white"
+                  value={pageSize}
+                  onChange={(e) => { const ps = Number(e.target.value); setPageSize(ps); setPage(1); if (selectedAssessment) loadResults(selectedAssessment, 1, ps); }}
+                >
+                  <option value={10}>10 / page</option>
+                  <option value={20}>20 / page</option>
+                  <option value={50}>50 / page</option>
+                </select>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 text-left">
                   <tr>
-                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Name</th>
-                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Username</th>
-                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Score</th>
-                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Status</th>
+                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)] cursor-pointer select-none hover:text-[var(--color-text)]" onClick={() => { if (sortField === "name") setSortDir(d => d === "asc" ? "desc" : "asc"); else { setSortField("name"); setSortDir("asc"); } }}>Name {sortField === "name" ? (sortDir === "asc" ? "↑" : "↓") : "↕"}</th>
+                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)] cursor-pointer select-none hover:text-[var(--color-text)]" onClick={() => { if (sortField === "username") setSortDir(d => d === "asc" ? "desc" : "asc"); else { setSortField("username"); setSortDir("asc"); } }}>Username {sortField === "username" ? (sortDir === "asc" ? "↑" : "↓") : "↕"}</th>
+                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)] cursor-pointer select-none hover:text-[var(--color-text)]" onClick={() => { if (sortField === "score") setSortDir(d => d === "asc" ? "desc" : "asc"); else { setSortField("score"); setSortDir("desc"); } }}>Score {sortField === "score" ? (sortDir === "asc" ? "↑" : "↓") : "↕"}</th>
+                    <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)] cursor-pointer select-none hover:text-[var(--color-text)]" onClick={() => { if (sortField === "status") setSortDir(d => d === "asc" ? "desc" : "asc"); else { setSortField("status"); setSortDir("asc"); } }}>Status {sortField === "status" ? (sortDir === "asc" ? "↑" : "↓") : "↕"}</th>
                     <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Answered</th>
                     <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Submitted</th>
                     <th className="px-5 py-3 font-medium text-[var(--color-text-secondary)]">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[var(--color-border)]">
-                  {results.user_results.map((ur) => (
+                  {(() => {
+                    let items = [...results.user_results];
+                    if (sortField) {
+                      items.sort((a, b) => {
+                        const dir = sortDir === "asc" ? 1 : -1;
+                        if (sortField === "name") return (a.user_name || "").localeCompare(b.user_name || "") * dir;
+                        if (sortField === "username") return (a.username || "").localeCompare(b.username || "") * dir;
+                        if (sortField === "score") return ((a.score ?? -1) - (b.score ?? -1)) * dir;
+                        if (sortField === "status") return (a.status || "").localeCompare(b.status || "") * dir;
+                        return 0;
+                      });
+                    }
+                    return items;
+                  })().map((ur) => (
                     <tr key={ur.user_id} className="hover:bg-gray-50">
                       <td className="px-5 py-3 font-medium">{ur.user_name}</td>
                       <td className="px-5 py-3 text-[var(--color-text-secondary)]">{ur.username}</td>
@@ -583,6 +633,8 @@ export default function Results({ batches }: Props) {
                               ? "bg-red-50 text-red-700"
                               : ur.status === "evaluating"
                               ? "bg-blue-50 text-blue-700"
+                              : ur.status === "pending"
+                              ? "bg-purple-50 text-purple-700"
                               : "bg-yellow-50 text-yellow-700"
                           }`}
                         >
@@ -607,15 +659,15 @@ export default function Results({ batches }: Props) {
                       <td className="px-5 py-3">
                         <div className="flex gap-2">
                           <button
-                            onClick={() => handleViewAttemptResults(ur.attempt_id)}
+                            onClick={() => handleViewAttemptResults(ur.attempt_id!)}
                             disabled={!ur.attempt_id}
                             className="px-2 py-1.5 text-xs font-medium rounded bg-[var(--color-primary)] text-white hover:bg-[var(--color-primary-hover)] disabled:opacity-50 cursor-pointer transition-colors"
                           >
                             View
                           </button>
                           <button
-                            onClick={() => handleViewTopics(ur.attempt_id, ur.user_name)}
-                            disabled={loadingTopics}
+                            onClick={() => handleViewTopics(ur.attempt_id!, ur.user_name)}
+                            disabled={loadingTopics || !ur.attempt_id}
                             className="px-2 py-1.5 text-xs font-medium rounded bg-purple-100 text-purple-700 hover:bg-purple-200 disabled:opacity-50 cursor-pointer transition-colors"
                           >
                             Topics
@@ -663,6 +715,60 @@ export default function Results({ batches }: Props) {
                 </tbody>
               </table>
             </div>
+
+            {/* Pagination */}
+            {results.total_user_results > 0 && (() => {
+              const totalFiltered = results.total_user_results;
+              const totalPages = Math.max(1, Math.ceil(totalFiltered / pageSize));
+              return (
+                <div className="px-5 py-3 border-t border-[var(--color-border)] flex items-center justify-between">
+                  <span className="text-xs text-[var(--color-text-secondary)]">
+                    Showing {Math.min((page - 1) * pageSize + 1, totalFiltered)}–{Math.min(page * pageSize, totalFiltered)} of {totalFiltered}
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => { const p = Math.max(1, page - 1); setPage(p); loadResults(selectedAssessment, p); }}
+                      disabled={page === 1}
+                      className="px-2.5 py-1.5 text-xs rounded border border-[var(--color-border)] disabled:opacity-40 hover:bg-gray-50 cursor-pointer disabled:cursor-default"
+                    >
+                      ← Prev
+                    </button>
+                    {totalPages > 1 && Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                      let pageNum: number;
+                      if (totalPages <= 5) {
+                        pageNum = i + 1;
+                      } else if (page <= 3) {
+                        pageNum = i + 1;
+                      } else if (page >= totalPages - 2) {
+                        pageNum = totalPages - 4 + i;
+                      } else {
+                        pageNum = page - 2 + i;
+                      }
+                      return (
+                        <button
+                          key={pageNum}
+                          onClick={() => { setPage(pageNum); loadResults(selectedAssessment, pageNum); }}
+                          className={`px-2.5 py-1.5 text-xs rounded border cursor-pointer ${
+                            page === pageNum
+                              ? "bg-[var(--color-primary)] text-white border-[var(--color-primary)]"
+                              : "border-[var(--color-border)] hover:bg-gray-50"
+                          }`}
+                        >
+                          {pageNum}
+                        </button>
+                      );
+                    })}
+                    <button
+                      onClick={() => { const p = Math.min(totalPages, page + 1); setPage(p); loadResults(selectedAssessment, p); }}
+                      disabled={page === totalPages}
+                      className="px-2.5 py-1.5 text-xs rounded border border-[var(--color-border)] disabled:opacity-40 hover:bg-gray-50 cursor-pointer disabled:cursor-default"
+                    >
+                      Next →
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </>
       )}

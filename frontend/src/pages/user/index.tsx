@@ -4,7 +4,9 @@ import api from "../../api";
 import Dashboard from "./Dashboard";
 import Performance from "./Performance";
 import Practice from "./Practice";
+import Interviews from "./Interviews";
 import ExamPage from "./ExamPage";
+import InterviewPage from "./InterviewPage";
 
 interface UserProfile {
   username: string;
@@ -16,8 +18,15 @@ interface UserProfile {
 export default function UserHome() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [examAssessmentId, setExamAssessmentId] = useState<string | null>(null);
-  const [currentView, setCurrentView] = useState<"dashboard" | "performance" | "practice">("dashboard");
+  const [interviewTemplateId, setInterviewTemplateId] = useState<string | null>(null);
+  const [interviewSessionId, setInterviewSessionId] = useState<string | null>(null);
+  const [currentView, setCurrentView] = useState<"dashboard" | "performance" | "practice" | "interviews">("dashboard");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [counts, setCounts] = useState({
+    assessmentsToAttend: 0,
+    interviewsToAttend: 0,
+    interviewsInProgress: 0,
+  });
   const navigate = useNavigate();
 
   const loadProfile = useCallback(async () => {
@@ -41,6 +50,31 @@ export default function UserHome() {
     return () => clearTimeout(t);
   }, [loadProfile, navigate]);
 
+  useEffect(() => {
+    if (!profile) return;
+    loadSidebarCounts();
+  }, [profile]);
+
+  const loadSidebarCounts = useCallback(async () => {
+    try {
+      const [assessmentsRes, interviewsRes] = await Promise.all([
+        api.get("/user/assessments/"),
+        api.get("/interviews/dashboard-counts"),
+      ]);
+
+      const assessments = Array.isArray(assessmentsRes.data) ? assessmentsRes.data : [];
+      const assessmentsToAttend = assessments.filter((a: any) => a.status === "pending").length;
+
+      setCounts({
+        assessmentsToAttend,
+        interviewsToAttend: Number(interviewsRes.data?.interviews_to_attend || 0),
+        interviewsInProgress: Number(interviewsRes.data?.interviews_in_progress || 0),
+      });
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const handleLogout = () => {
     localStorage.clear();
     navigate("/login");
@@ -52,6 +86,17 @@ export default function UserHome() {
       <ExamPage
         assessmentId={examAssessmentId}
         onExit={() => setExamAssessmentId(null)}
+      />
+    );
+  }
+
+  // If in interview mode, render fullscreen interview
+  if (interviewTemplateId) {
+    return (
+      <InterviewPage
+        templateId={interviewTemplateId}
+        sessionId={interviewSessionId || undefined}
+        onExit={() => { setInterviewTemplateId(null); setInterviewSessionId(null); }}
       />
     );
   }
@@ -85,6 +130,11 @@ export default function UserHome() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zM13.5 6a2.25 2.25 0 012.25-2.25H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM13.5 15.75a2.25 2.25 0 012.25-2.25H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" />
             </svg>
             {!sidebarCollapsed && "Dashboard"}
+            {!sidebarCollapsed && counts.assessmentsToAttend > 0 && (
+              <span className="ml-auto text-xs bg-blue-100 text-[var(--color-primary)] px-2 py-0.5 rounded-full font-medium">
+                {counts.assessmentsToAttend}
+              </span>
+            )}
           </button>
 
           <button
@@ -116,6 +166,26 @@ export default function UserHome() {
             </svg>
             {!sidebarCollapsed && "Practice Test"}
           </button>
+
+          <button
+            onClick={() => setCurrentView("interviews")}
+            title={sidebarCollapsed ? "Interviews" : undefined}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-[var(--radius-sm)] text-sm font-medium cursor-pointer transition-colors ${
+              currentView === "interviews"
+                ? "bg-blue-50 text-[var(--color-primary)]"
+                : "text-[var(--color-text-secondary)] hover:bg-gray-50"
+            } ${sidebarCollapsed ? "justify-center" : ""}`}
+          >
+            <svg className="w-5 h-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25h9m-9 3h6m-7.5 8.25h12a2.25 2.25 0 002.25-2.25V6.75A2.25 2.25 0 0018 4.5H6A2.25 2.25 0 003.75 6.75v10.5A2.25 2.25 0 006 19.5z" />
+            </svg>
+            {!sidebarCollapsed && "Interviews"}
+            {!sidebarCollapsed && (counts.interviewsToAttend + counts.interviewsInProgress) > 0 && (
+              <span className="ml-auto text-xs bg-[var(--color-danger)] text-white px-2 py-0.5 rounded-full font-medium">
+                {counts.interviewsToAttend + counts.interviewsInProgress}
+              </span>
+            )}
+          </button>
         </nav>
 
         <div className="px-2 py-4 border-t border-[var(--color-border)] space-y-1">
@@ -145,7 +215,13 @@ export default function UserHome() {
       <main className="flex-1 overflow-auto">
         <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-[var(--color-border)] px-8 py-4">
           <h1 className="text-lg font-semibold">
-            {currentView === "dashboard" ? "Dashboard" : currentView === "performance" ? "Performance Report" : "Practice Test"}
+            {currentView === "dashboard"
+              ? "Dashboard"
+              : currentView === "performance"
+              ? "Performance Report"
+              : currentView === "practice"
+              ? "Practice Test"
+              : "Interviews"}
           </h1>
         </header>
         <div className="p-8 max-w-[1200px]">
@@ -156,8 +232,24 @@ export default function UserHome() {
             />
           ) : currentView === "performance" ? (
             <Performance />
-          ) : (
+          ) : currentView === "practice" ? (
             <Practice />
+          ) : (
+            <Interviews
+              onStartInterview={(templateId) => setInterviewTemplateId(templateId)}
+              onResumeInterview={(sessionId) => {
+                // We need template ID for resume - fetch it from sessions
+                // For now, use a placeholder approach: set templateId from the session data
+                api.get(`/interviews/${sessionId}/results`).then((res) => {
+                  setInterviewTemplateId(res.data?.template_id || "");
+                  setInterviewSessionId(sessionId);
+                }).catch(() => {
+                  // fallback: just open with session
+                  setInterviewTemplateId("_resume_");
+                  setInterviewSessionId(sessionId);
+                });
+              }}
+            />
           )}
         </div>
       </main>

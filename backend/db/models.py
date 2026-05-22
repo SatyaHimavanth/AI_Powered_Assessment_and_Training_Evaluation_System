@@ -80,7 +80,7 @@ class ImportedAssessment(Base):
     title = Column(String, nullable=True)
     uploader_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     status = Column(Enum(ImportStatus), default=ImportStatus.uploaded)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     meta = Column(JSON, nullable=True)
     preview = Column(JSON, nullable=True)
 
@@ -124,7 +124,7 @@ class AssessmentQuestionItem(Base):
     difficulty = Column(String, nullable=True)
     default_code = Column(Text, nullable=True)
     test_cases = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # no back_populates needed; referenced from AssessmentQuestion
 
@@ -145,7 +145,7 @@ class User(Base):
     role = Column(Enum(UserRole), nullable=False, default=UserRole.user)
     is_active = Column(Boolean, default=True)
     account = Column(String, nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     batches = relationship("BatchUser", back_populates="user")
     attempts = relationship("Attempt", back_populates="user")
@@ -162,8 +162,8 @@ class RegistrationRequest(Base):
     account = Column(String, nullable=True)
     hashed_password = Column(String, nullable=False)
     status = Column(Enum(RegistrationStatus), default=RegistrationStatus.pending)
-    requested_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    resolved_at = Column(DateTime, nullable=True)
+    requested_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Batch(Base):
@@ -213,7 +213,7 @@ class Question(Base):
     reference_answer = Column(Text)
     default_code = Column(Text, nullable=True)  # Pre-filled code template for coding questions
     is_archived = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     topic = relationship("Topic", back_populates="questions")
     options = relationship("QuestionOption", back_populates="question")
@@ -251,11 +251,11 @@ class Assessment(Base):
     description = Column(Text)
     duration = Column(Integer)
     negative_marking = Column(Boolean, default=False)
-    start_time = Column(DateTime, nullable=True)
-    end_time = Column(DateTime, nullable=True)
+    start_time = Column(DateTime(timezone=True), nullable=True)
+    end_time = Column(DateTime(timezone=True), nullable=True)
     is_archived = Column(Boolean, default=False)
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     topics = relationship("AssessmentTopic", back_populates="assessment")
     questions = relationship("AssessmentQuestion", back_populates="assessment")
@@ -302,8 +302,8 @@ class Assignment(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
     batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"))
-    assigned_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    due_date = Column(DateTime)
+    assigned_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    due_date = Column(DateTime(timezone=True))
 
     assessment = relationship("Assessment", back_populates="assignments")
     batch = relationship("Batch", back_populates="assignments")
@@ -315,8 +315,8 @@ class Attempt(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
-    started_at = Column(DateTime)
-    submitted_at = Column(DateTime)
+    started_at = Column(DateTime(timezone=True))
+    submitted_at = Column(DateTime(timezone=True))
     score = Column(Float)
     status = Column(Enum(AttemptStatus))
     tab_violations = Column(Integer, default=0)
@@ -355,9 +355,9 @@ class EvaluationJob(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     attempt_id = Column(UUID(as_uuid=True), ForeignKey("attempts.id"), unique=True)
     status = Column(Enum(EvaluationJobStatus), default=EvaluationJobStatus.pending)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    started_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)
     retry_count = Column(Integer, default=0)
 
@@ -381,9 +381,9 @@ class PracticeAccessRequest(Base):
     requested_days = Column(Integer, default=14)
     requested_tests_per_day = Column(Integer, default=1)
     status = Column(Enum(PracticeAccessStatus), default=PracticeAccessStatus.pending)
-    requested_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    approved_at = Column(DateTime, nullable=True)
-    expires_at = Column(DateTime, nullable=True)
+    requested_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
     days_granted = Column(Integer, nullable=True)
     tests_per_day_granted = Column(Integer, nullable=True)
     admin_note = Column(Text, nullable=True)
@@ -412,9 +412,9 @@ class PracticeTest(Base):
     resume_text = Column(Text, nullable=True)
     status = Column(Enum(PracticeTestStatus), default=PracticeTestStatus.generating)
     score = Column(Float, nullable=True)
-    started_at = Column(DateTime, nullable=True)
-    submitted_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     error_message = Column(Text, nullable=True)
 
     user = relationship("User")
@@ -447,3 +447,127 @@ class PracticeAnswer(Base):
     feedback = Column(Text, nullable=True)
 
     question = relationship("PracticeQuestion", back_populates="answer")
+
+
+# -------------- AGENTIC INTERVIEWS -------------- #
+
+
+class InterviewAccessStatus(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    revoked = "revoked"
+    expired = "expired"
+
+
+class InterviewRequestType(str, enum.Enum):
+    initial = "initial"
+    retry = "retry"
+
+
+class InterviewAssignmentStatus(str, enum.Enum):
+    active = "active"
+    archived = "archived"
+    completed = "completed"
+    revoked = "revoked"
+
+
+class InterviewSessionStatus(str, enum.Enum):
+    started = "started"
+    in_progress = "in_progress"
+    paused = "paused"
+    completed = "completed"
+    abandoned = "abandoned"
+    missed = "missed"
+
+
+class InterviewTemplate(Base):
+    __tablename__ = "interview_templates"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    admin_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    role = Column(String, nullable=False)
+    experience_level = Column(String, nullable=False, default="mid")
+    difficulty = Column(String, nullable=False, default="intermediate")
+    focus_areas = Column(JSON, nullable=False, default=list)
+    duration_minutes = Column(Integer, nullable=False, default=60)
+    question_count = Column(Integer, nullable=False, default=5)
+    default_questions_or_topics = Column(JSON, nullable=False, default=list)
+    system_prompt = Column(Text, nullable=True)
+    evaluation_rubric = Column(JSON, nullable=False, default=dict)
+    is_active = Column(Boolean, nullable=False, default=True)
+    is_archived = Column(Boolean, nullable=False, default=False)
+    archived_at = Column(DateTime(timezone=True), nullable=True)
+    max_pauses_allowed = Column(Integer, nullable=False, default=3)
+    max_followup_depth = Column(Integer, nullable=False, default=2)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class InterviewAccessRequest(Base):
+    __tablename__ = "interview_access_requests"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    template_id = Column(UUID(as_uuid=True), ForeignKey("interview_templates.id"), nullable=False)
+    status = Column(Enum(InterviewAccessStatus), nullable=False, default=InterviewAccessStatus.pending)
+    request_type = Column(Enum(InterviewRequestType), nullable=False, default=InterviewRequestType.initial)
+    reason = Column(Text, nullable=True)
+    requested_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    admin_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class InterviewAssignment(Base):
+    __tablename__ = "interview_assignments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    template_id = Column(UUID(as_uuid=True), ForeignKey("interview_templates.id"), nullable=False)
+    assigned_by_admin_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    assigned_to_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    assigned_to_batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), nullable=True)
+    status = Column(Enum(InterviewAssignmentStatus), nullable=False, default=InterviewAssignmentStatus.active)
+    deadline_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class InterviewSession(Base):
+    __tablename__ = "interview_sessions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    template_id = Column(UUID(as_uuid=True), ForeignKey("interview_templates.id"), nullable=False)
+    access_request_id = Column(UUID(as_uuid=True), ForeignKey("interview_access_requests.id"), nullable=False)
+    attempt_number = Column(Integer, nullable=False, default=1)
+    status = Column(Enum(InterviewSessionStatus), nullable=False, default=InterviewSessionStatus.started)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    paused_at = Column(DateTime(timezone=True), nullable=True)
+    resumed_at = Column(DateTime(timezone=True), nullable=True)
+    pause_count = Column(Integer, nullable=False, default=0)
+    disconnect_count = Column(Integer, nullable=False, default=0)
+    max_pauses_allowed_snapshot = Column(Integer, nullable=False, default=3)
+    duration_seconds = Column(Integer, nullable=True)
+    total_score = Column(Float, nullable=True)
+    transcript = Column(JSON, nullable=True)
+    feedback = Column(JSON, nullable=True)
+    summary = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class InterviewResponseEvaluation(Base):
+    __tablename__ = "interview_response_evaluations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(UUID(as_uuid=True), ForeignKey("interview_sessions.id"), nullable=False)
+    turn_index = Column(Integer, nullable=False)
+    user_response = Column(Text, nullable=True)
+    ai_evaluation = Column(JSON, nullable=True)
+    score = Column(Float, nullable=True)
+    focus_area = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

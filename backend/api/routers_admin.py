@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from core.auth import get_password_hash, require_admin
@@ -39,6 +39,10 @@ from db.models import (
     TopicScore,
     Answer,
     AttemptStatus,
+    InterviewAccessRequest,
+    InterviewAccessStatus,
+    InterviewSession,
+    InterviewSessionStatus,
 )
 
 import re
@@ -49,6 +53,81 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 class MessageResponse(BaseModel):
     message: str
+
+
+class AdminDashboardCountersOut(BaseModel):
+    pending_interview_requests: int
+    in_progress_interviews: int
+    pending_assessments: int
+    in_progress_assessments: int
+    total_users: int
+    pending_registrations: int
+    total_topics: int
+    total_batches: int
+
+
+@router.get("/dashboard/counters", response_model=AdminDashboardCountersOut)
+async def get_admin_dashboard_counters(
+    _admin: User = Depends(require_admin),
+):
+    """Return dashboard counters for approvals/workload cards."""
+
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            pending_interview_requests = (
+                db.query(InterviewAccessRequest)
+                .filter(InterviewAccessRequest.status == InterviewAccessStatus.pending)
+                .count()
+            )
+            in_progress_interviews = (
+                db.query(InterviewSession)
+                .filter(
+                    InterviewSession.status.in_(
+                        [InterviewSessionStatus.in_progress, InterviewSessionStatus.paused]
+                    )
+                )
+                .count()
+            )
+            pending_assessments = (
+                db.query(Assignment)
+                .join(Assessment, Assignment.assessment_id == Assessment.id)
+                .filter(Assessment.is_archived.is_(False))
+                .count()
+            )
+            in_progress_assessments = (
+                db.query(Attempt)
+                .filter(Attempt.status == AttemptStatus.in_progress)
+                .count()
+            )
+
+            total_users = (
+                db.query(User)
+                .filter(User.role == UserRole.user)
+                .count()
+            )
+            pending_registrations = (
+                db.query(RegistrationRequest)
+                .filter(RegistrationRequest.status == RegistrationStatus.pending)
+                .count()
+            )
+            total_topics = db.query(Topic).count()
+            total_batches = db.query(Batch).count()
+
+            return {
+                "pending_interview_requests": pending_interview_requests,
+                "in_progress_interviews": in_progress_interviews,
+                "pending_assessments": pending_assessments,
+                "in_progress_assessments": in_progress_assessments,
+                "total_users": total_users,
+                "pending_registrations": pending_registrations,
+                "total_topics": total_topics,
+                "total_batches": total_batches,
+            }
+        finally:
+            db.close()
+
+    return await run_db_sync(_sync_work)
 
 
 
@@ -714,7 +793,7 @@ async def get_stalled_evaluations(
             for job, attempt, user in stalled_jobs:
                 assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
                 time_elapsed = int(
-                    (datetime.now(timezone.utc) - job.created_at.replace(tzinfo=timezone.utc)).total_seconds()
+                    (datetime.now(timezone.utc) - job.created_at).total_seconds()
                     / 60
                 )
 
@@ -1007,6 +1086,11 @@ class AdminUserOut(BaseModel):
         from_attributes = True
 
 
+class AdminUsersPaginatedOut(BaseModel):
+    items: List[AdminUserOut]
+    total_count: int
+
+
 @router.get("/pending-registrations", response_model=List[PendingRegistrationOut])
 async def get_pending_registrations(
     _admin: User = Depends(require_admin),
@@ -1115,24 +1199,40 @@ async def reject_registration(
     return await run_db_sync(_sync_work)
 
 
-@router.get("/users", response_model=List[AdminUserOut])
+@router.get("/users", response_model=AdminUsersPaginatedOut)
 async def list_users(
+    page: int = 1,
+    page_size: int = 50,
+    search: str | None = None,
     _admin: User = Depends(require_admin),
 ):
-    """List all user accounts for admin. Runs DB work in threadpool."""
+    """List all user accounts for admin with server-side pagination and search."""
 
     def _sync_work():
         db = SessionLocal()
         try:
+            q = db.query(User).filter(User.role == UserRole.user)
+
+            if search:
+                search_term = f"%{search}%"
+                q = q.filter(
+                    or_(
+                        User.name.ilike(search_term),
+                        User.username.ilike(search_term),
+                        User.email.ilike(search_term),
+                    )
+                )
+
+            total_count = q.count()
             users = (
-                db.query(User)
-                .filter(User.role == UserRole.user)
-                .order_by(User.created_at.desc())
+                q.order_by(User.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
                 .all()
             )
-            out = []
+            items = []
             for u in users:
-                out.append({
+                items.append({
                     "id": u.id,
                     "username": u.username,
                     "email": u.email,
@@ -1143,7 +1243,7 @@ async def list_users(
                     "is_active": u.is_active,
                     "created_at": u.created_at,
                 })
-            return out
+            return {"items": items, "total_count": total_count}
         finally:
             db.close()
 

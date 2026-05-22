@@ -97,12 +97,12 @@ export default function Practice() {
 
   const todayCount = useMemo(() => {
     try {
-      const today = new Date().toDateString();
+      const today = new Date().toISOString().slice(0, 10);
       const ids = new Set<string>();
       history.forEach((h) => {
-        if (new Date(h.created_at).toDateString() === today) ids.add(h.id);
+        if (new Date(h.created_at).toISOString().slice(0, 10) === today) ids.add(h.id);
       });
-      if (todayTest && new Date(todayTest.created_at).toDateString() === today) ids.add(todayTest.id);
+      if (todayTest && new Date(todayTest.created_at).toISOString().slice(0, 10) === today) ids.add(todayTest.id);
       return ids.size;
     } catch {
       return 0;

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.llms import get_chat_model
 from core.auth import get_current_user
-from db.database import SessionLocal, get_db
+from db.database import SessionLocal
 from db.models import (
     Answer,
     Assessment,
@@ -46,12 +46,9 @@ router = APIRouter(prefix="/user/assessments", tags=["user-assessments"])
 def _as_utc_aware(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-
-
-def _utcnow_naive() -> datetime:
-    """Return current UTC time as a naive datetime (for use with timestamp without timezone columns)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _to_utc_iso(dt: datetime | None) -> str | None:
@@ -219,7 +216,7 @@ async def get_my_assessments(
             )
 
             result = []
-            now = _utcnow_naive()
+            now = datetime.now(timezone.utc)
 
             for a in assessments:
                 # Check if user already attempted
@@ -314,7 +311,7 @@ async def start_assessment(
             if existing:
                 # Allow resumption if in_progress and within duration window
                 if existing.status == AttemptStatus.in_progress:
-                    now_naive = _utcnow_naive()
+                    now_naive = datetime.now(timezone.utc)
                     time_elapsed = (now_naive - existing.started_at) if existing.started_at else timedelta.max
                     if time_elapsed < timedelta(minutes=assessment.duration):
                         # Return existing attempt data for resumption
@@ -409,7 +406,7 @@ async def start_assessment(
                     raise HTTPException(status_code=400, detail="You have already attempted this assessment")
     
             # Create new attempt
-            now = _utcnow_naive()
+            now = datetime.now(timezone.utc)
             if assessment.start_time and now < assessment.start_time:
                 raise HTTPException(status_code=400, detail="Assessment has not started yet")
             if assessment.end_time and now > assessment.end_time:
@@ -648,7 +645,7 @@ async def submit_assessment(
                         )
                         db.add(answer)
 
-            attempt.submitted_at = datetime.utcnow()
+            attempt.submitted_at = datetime.now(timezone.utc)
             attempt.status = AttemptStatus.completed
             db.commit()
             
@@ -723,7 +720,7 @@ async def abort_assessment(
                             )
                             db.add(answer)
 
-            attempt.submitted_at = datetime.utcnow()
+            attempt.submitted_at = datetime.now(timezone.utc)
             attempt.status = AttemptStatus.missed  # marked incomplete
             db.commit()
             
@@ -914,9 +911,9 @@ async def export_my_results(
         try:
             started_dt = datetime.fromisoformat(started_iso.replace("Z", "+00:00"))
         except Exception:
-            started_dt = datetime.utcnow()
+            started_dt = datetime.now(timezone.utc)
     else:
-        started_dt = datetime.utcnow()
+        started_dt = datetime.now(timezone.utc)
 
     filename = (
         f"{_safe_filename_part(user.username)}_"

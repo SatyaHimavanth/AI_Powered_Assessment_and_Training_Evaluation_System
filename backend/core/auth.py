@@ -6,9 +6,10 @@ import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.database import get_db
+from db.database import get_async_db
 from db.models import User, UserRole
 
 SECRET_KEY = os.environ.get(
@@ -49,8 +50,8 @@ def create_refresh_token(data: dict) -> str:
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def get_current_user(
-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+async def get_current_user(
+    token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_async_db)
 ) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -65,7 +66,8 @@ def get_current_user(
     except jwt.PyJWTError:
         raise credentials_exception
 
-    user = db.query(User).filter(User.username == username).first()
+    result = await db.execute(select(User).filter(User.username == username))
+    user = result.scalars().first()
     if user is None or not user.is_active:
         raise credentials_exception
     return user

@@ -15,6 +15,19 @@ interface PracticeAccessReq {
   requested_at: string;
 }
 
+interface InterviewAccessReq {
+  id: string;
+  user_id: string;
+  user_name: string;
+  username: string;
+  template_id: string;
+  template_title: string;
+  request_type: string;
+  reason?: string | null;
+  status: string;
+  requested_at: string;
+}
+
 interface Props {
   pending: PendingRequest[];
   setMessage: (msg: string) => void;
@@ -23,11 +36,13 @@ interface Props {
 
 export default function Approvals({ pending, setMessage, reload }: Props) {
   const [practiceRequests, setPracticeRequests] = useState<PracticeAccessReq[]>([]);
+  const [interviewRequests, setInterviewRequests] = useState<InterviewAccessReq[]>([]);
   const [daysMap, setDaysMap] = useState<Record<string, number>>({});
   const [testsMap, setTestsMap] = useState<Record<string, number>>({});
 
   useEffect(() => {
     loadPracticeRequests();
+    loadInterviewRequests();
   }, []);
 
   async function loadPracticeRequests() {
@@ -43,6 +58,15 @@ export default function Approvals({ pending, setMessage, reload }: Props) {
       setDaysMap(defaults);
       setTestsMap(testsDefaults);
     } catch { /* ignore */ }
+  }
+
+  async function loadInterviewRequests() {
+    try {
+      const res = await api.get("/admin/interviews/access-requests?status=pending");
+      setInterviewRequests(Array.isArray(res.data) ? res.data : []);
+    } catch {
+      // ignore
+    }
   }
 
   const handleApprove = async (id: string) => {
@@ -90,6 +114,30 @@ export default function Approvals({ pending, setMessage, reload }: Props) {
     } catch (err: unknown) {
       console.error(err);
       setMessage("Failed to reject");
+    }
+  };
+
+  const handleApproveInterview = async (id: string) => {
+    try {
+      const res = await api.post(`/admin/interviews/access-requests/${id}/approve`, { days: 14 });
+      setMessage(res.data.message);
+      loadInterviewRequests();
+      reload();
+    } catch (err: unknown) {
+      console.error(err);
+      setMessage("Failed to approve interview request");
+    }
+  };
+
+  const handleRejectInterview = async (id: string) => {
+    try {
+      const res = await api.post(`/admin/interviews/access-requests/${id}/reject`);
+      setMessage(res.data.message);
+      loadInterviewRequests();
+      reload();
+    } catch (err: unknown) {
+      console.error(err);
+      setMessage("Failed to reject interview request");
     }
   };
 
@@ -208,6 +256,54 @@ export default function Approvals({ pending, setMessage, reload }: Props) {
                       </button>
                       <button
                         onClick={() => handleRejectPractice(req.id)}
+                        className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-red-50 text-[var(--color-danger)] hover:bg-red-100 cursor-pointer transition-colors"
+                      >
+                        Reject
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Interview Access Requests */}
+      <div>
+        <h3 className="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">Interview Access Requests</h3>
+        {interviewRequests.length === 0 ? (
+          <div className={`${card} p-12 text-center`}>
+            <p className="text-[var(--color-text-secondary)] text-sm">No pending interview access requests.</p>
+          </div>
+        ) : (
+          <div className={`${card} overflow-hidden`}>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-[var(--color-border)] bg-gray-50/50">
+                  <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Name</th>
+                  <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Template</th>
+                  <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Type</th>
+                  <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Requested</th>
+                  <th className="text-right px-5 py-3 font-medium text-[var(--color-text-secondary)]">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {interviewRequests.map((req) => (
+                  <tr key={req.id} className="border-b border-[var(--color-border)] last:border-0 hover:bg-gray-50/50 transition-colors">
+                    <td className="px-5 py-3.5 font-medium">{req.user_name}</td>
+                    <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{req.template_title}</td>
+                    <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{req.request_type}</td>
+                    <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{new Date(req.requested_at).toLocaleDateString()}</td>
+                    <td className="px-5 py-3.5 text-right space-x-2">
+                      <button
+                        onClick={() => handleApproveInterview(req.id)}
+                        className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-green-50 text-[var(--color-success)] hover:bg-green-100 cursor-pointer transition-colors"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        onClick={() => handleRejectInterview(req.id)}
                         className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-red-50 text-[var(--color-danger)] hover:bg-red-100 cursor-pointer transition-colors"
                       >
                         Reject

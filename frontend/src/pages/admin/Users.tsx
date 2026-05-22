@@ -29,9 +29,11 @@ interface UserPerformanceReport {
 
 export default function Users({ users: initialUsers, batches, setMessage, reloadUsers }: Props) {
   const [searchQuery, setSearchQuery] = useState("");
-  const [filteredUsers, setFilteredUsers] = useState(initialUsers);
+  const [users, setUsers] = useState<UserInfo[]>(initialUsers);
+  const [totalCount, setTotalCount] = useState(initialUsers.length);
   const [pageSize, setPageSize] = useState(10);
   const [currentPage, setCurrentPage] = useState(1);
+  const [loading, setLoading] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [selectedUserPerformance, setSelectedUserPerformance] = useState<UserPerformanceReport | null>(null);
   const [loadingPerformance, setLoadingPerformance] = useState(false);
@@ -51,35 +53,52 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
   const [confirmPassword, setConfirmPassword] = useState("");
   const [savingPassword, setSavingPassword] = useState(false);
 
+  // Load users from server with pagination
+  const loadUsers = async (pg?: number, ps?: number, search?: string) => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("page", String(pg ?? currentPage));
+      params.set("page_size", String(ps ?? pageSize));
+      const q = search !== undefined ? search : searchQuery;
+      if (q) params.set("search", q);
+      const res = await api.get(`/admin/users?${params.toString()}`);
+      const data = res.data;
+      if (data && typeof data === "object" && "items" in data) {
+        setUsers(data.items);
+        setTotalCount(data.total_count);
+      } else {
+        // Backward compat: old API returns array
+        const arr = Array.isArray(data) ? data : [];
+        setUsers(arr);
+        setTotalCount(arr.length);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    const t = setTimeout(() => setFilteredUsers(initialUsers), 0);
-    return () => clearTimeout(t);
-  }, [initialUsers]);
+    loadUsers(1, pageSize, "");
+  }, []);
 
   // Handle search
   const handleSearch = () => {
-    const query = searchQuery.toLowerCase();
-    const filtered = initialUsers.filter(
-      (u) =>
-        u.name.toLowerCase().includes(query) ||
-        u.username.toLowerCase().includes(query) ||
-        u.email.toLowerCase().includes(query)
-    );
-    setFilteredUsers(filtered);
     setCurrentPage(1);
+    loadUsers(1, pageSize, searchQuery);
   };
 
   // Handle pagination
-  const totalPages = Math.ceil(filteredUsers.length / pageSize);
-  const paginatedUsers = filteredUsers.slice(
-    (currentPage - 1) * pageSize,
-    currentPage * pageSize
-  );
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const paginatedUsers = users;
 
   // Handle page size change
   const handlePageSizeChange = (newSize: number) => {
     setPageSize(newSize);
     setCurrentPage(1);
+    loadUsers(1, newSize);
   };
 
   // View user performance
@@ -135,6 +154,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
       await api.put(`/admin/users/${editingUser.id}/batches`, { batch_ids: editBatchIds });
       setMessage(`User '${editUsername || editingUser.username}' updated successfully.`);
       setShowEditModal(false);
+      loadUsers();
       reloadUsers();
     } catch (err: unknown) {
       console.error(err);
@@ -168,6 +188,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
       await api.patch(`/admin/users/${editingUser.id}/password`, { password: newPassword });
       setMessage("Password updated successfully.");
       setShowPasswordModal(false);
+      loadUsers();
       reloadUsers();
     } catch (err: unknown) {
       console.error(err);
@@ -546,13 +567,13 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
         {searchQuery && (
           <div className="flex items-center justify-between text-sm">
             <span className="text-gray-600">
-              Found {filteredUsers.length} user{filteredUsers.length !== 1 ? "s" : ""}
+              Found {totalCount} user{totalCount !== 1 ? "s" : ""}
             </span>
             <button
               onClick={() => {
                 setSearchQuery("");
-                setFilteredUsers(initialUsers);
                 setCurrentPage(1);
+                loadUsers(1, pageSize, "");
               }}
               className="text-blue-600 hover:text-blue-700 text-xs"
             >
@@ -563,10 +584,12 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
       </div>
 
       {/* Users Table */}
-      {paginatedUsers.length === 0 ? (
+      {loading ? (
+        <div className="text-center py-8 text-[var(--color-text-secondary)] text-sm">Loading users...</div>
+      ) : paginatedUsers.length === 0 ? (
         <div className={`${card} p-12 text-center`}>
           <p className="text-[var(--color-text-secondary)] text-sm">
-            {filteredUsers.length === 0 && searchQuery ? "No users match your search." : "No users yet."}
+            {totalCount === 0 && searchQuery ? "No users match your search." : "No users yet."}
           </p>
         </div>
       ) : (
@@ -629,11 +652,11 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
       )}
 
       {/* Pagination Controls */}
-      {filteredUsers.length > 0 && (
+      {totalCount > 0 && (
         <div className={`${card} p-5 flex items-center justify-between`}>
           <div className="flex items-center gap-4">
             <span className="text-sm text-gray-600">
-              Showing {(currentPage - 1) * pageSize + 1} to {Math.min(currentPage * pageSize, filteredUsers.length)} of {filteredUsers.length}
+              Showing {(currentPage - 1) * pageSize + 1} to {Math.min(currentPage * pageSize, totalCount)} of {totalCount}
             </span>
             <div className="flex items-center gap-2">
               <label className="text-sm text-gray-600">Per page:</label>
@@ -650,29 +673,41 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
           </div>
           <div className="flex gap-2">
             <button
-              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+              onClick={() => { const p = Math.max(1, currentPage - 1); setCurrentPage(p); loadUsers(p); }}
               disabled={currentPage === 1}
               className="px-3 py-1.5 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               Previous
             </button>
             <div className="flex items-center gap-1">
-              {Array.from({ length: totalPages }, (_, i) => i + 1).map((page) => (
-                <button
-                  key={page}
-                  onClick={() => setCurrentPage(page)}
-                  className={`w-8 h-8 rounded text-sm font-medium cursor-pointer ${
-                    currentPage === page
-                      ? "bg-blue-600 text-white"
-                      : "border border-gray-300 hover:bg-gray-50"
-                  }`}
-                >
-                  {page}
-                </button>
-              ))}
+              {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                let pageNum: number;
+                if (totalPages <= 5) {
+                  pageNum = i + 1;
+                } else if (currentPage <= 3) {
+                  pageNum = i + 1;
+                } else if (currentPage >= totalPages - 2) {
+                  pageNum = totalPages - 4 + i;
+                } else {
+                  pageNum = currentPage - 2 + i;
+                }
+                return (
+                  <button
+                    key={pageNum}
+                    onClick={() => { setCurrentPage(pageNum); loadUsers(pageNum); }}
+                    className={`w-8 h-8 rounded text-sm font-medium cursor-pointer ${
+                      currentPage === pageNum
+                        ? "bg-blue-600 text-white"
+                        : "border border-gray-300 hover:bg-gray-50"
+                    }`}
+                  >
+                    {pageNum}
+                  </button>
+                );
+              })}
             </div>
             <button
-              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+              onClick={() => { const p = Math.min(totalPages, currentPage + 1); setCurrentPage(p); loadUsers(p); }}
               disabled={currentPage === totalPages}
               className="px-3 py-1.5 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >

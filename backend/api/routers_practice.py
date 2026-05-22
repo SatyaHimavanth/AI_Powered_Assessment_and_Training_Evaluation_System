@@ -2,7 +2,7 @@ import json
 import re
 import threading
 import os
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import List
 from uuid import UUID
@@ -376,7 +376,7 @@ async def create_practice_test(
             if access and getattr(access, "tests_per_day_granted", None):
                 per_day_limit = int(access.tests_per_day_granted)
             per_day_limit = max(1, min(per_day_limit, system_max))
-            today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+            today_start = datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time()).replace(tzinfo=timezone.utc)
             existing_count = (
                 db.query(PracticeTest)
                 .filter(
@@ -440,7 +440,7 @@ async def get_today_test(
     def _sync_work():
         db = SessionLocal()
         try:
-            today_start = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+            today_start = datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time()).replace(tzinfo=timezone.utc)
             test = (
                 db.query(PracticeTest)
                 .filter(

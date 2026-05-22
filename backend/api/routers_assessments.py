@@ -20,6 +20,7 @@ from db.models import (
     Attempt,
     AttemptStatus,
     Batch,
+    BatchUser,
     Difficulty,
     EvaluationJob,
     Question,
@@ -34,22 +35,26 @@ router = APIRouter(prefix="/assessments", tags=["assessments"])
 
 
 def _parse_to_utc_naive(value: str) -> datetime:
+    """Parse ISO string to a UTC-aware datetime."""
     raw = value.strip()
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
 
     dt = datetime.fromisoformat(raw)
     if dt.tzinfo is None:
-        # Backward-compatible default: treat naive datetime as UTC.
-        return dt
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        # Treat naive datetime as UTC.
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _to_utc_iso(dt: datetime | None) -> str | None:
     if not dt:
         return None
-    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-    return aware.isoformat().replace("+00:00", "Z")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 # ---------- Schemas ---------- #
@@ -395,7 +400,7 @@ async def list_assessments(
             if batch_id:
                 q = q.join(Assignment, Assignment.assessment_id == Assessment.id).filter(Assignment.batch_id == batch_id)
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             if status:
                 s = status.lower()
                 if s == "upcoming":
@@ -661,7 +666,7 @@ _ERROR_LABELS = {
 
 
 class UserAttemptResult(BaseModel):
-    attempt_id: UUID
+    attempt_id: UUID | None = None
     user_id: UUID
     user_name: str
     username: str
@@ -691,11 +696,15 @@ class AssessmentResultsOut(BaseModel):
     average_score: float | None
     topic_performance: List[TopicPerformance]
     user_results: List[UserAttemptResult]
+    total_user_results: int  # total count before pagination (after filtering)
 
 
 @router.get("/{assessment_id}/results", response_model=AssessmentResultsOut)
 async def get_assessment_results(
     assessment_id: UUID,
+    page: int = 1,
+    page_size: int = 50,
+    status_filter: str | None = None,
     _admin: User = Depends(require_admin),
 ):
     """Get detailed results for an assessment including per-user and per-topic breakdown.
@@ -764,14 +773,64 @@ async def get_assessment_results(
             completed_count = len([a for a in attempts if a.status == AttemptStatus.completed])
             avg_score = round(sum(total_scores) / len(total_scores), 1) if total_scores else None
 
+            # Find assigned users who haven't started yet
+            # Get all batch_ids assigned to this assessment
+            assignment_batch_ids = [
+                a.batch_id for a in db.query(Assignment).filter(Assignment.assessment_id == assessment_id).all()
+                if a.batch_id
+            ]
+            if assignment_batch_ids:
+                # Get all users in those batches
+                assigned_user_ids = set(
+                    row.user_id for row in
+                    db.query(BatchUser).filter(BatchUser.batch_id.in_(assignment_batch_ids)).all()
+                )
+                # Remove users who already have an attempt
+                users_with_attempts = set(latest_attempts.keys())
+                pending_user_ids = assigned_user_ids - users_with_attempts
+
+                for uid in pending_user_ids:
+                    user = db.query(User).filter(User.id == uid).first()
+                    if user:
+                        user_results.append(UserAttemptResult(
+                            attempt_id=None,
+                            user_id=uid,
+                            user_name=user.name or user.username,
+                            username=user.username,
+                            score=None,
+                            status="pending",
+                            started_at=None,
+                            submitted_at=None,
+                            total_answered=0,
+                            evaluation_status=None,
+                            evaluation_job_id=None,
+                            evaluation_error=None,
+                            evaluation_error_category=None,
+                        ))
+
+            total_participants = len(user_results)
+
+            # Apply status filter if provided
+            filtered_results = user_results
+            if status_filter:
+                filtered_results = [ur for ur in user_results if ur.status == status_filter]
+
+            total_user_results = len(filtered_results)
+
+            # Apply pagination
+            start = (page - 1) * page_size
+            end = start + page_size
+            paged_results = filtered_results[start:end]
+
             return AssessmentResultsOut(
                 assessment_id=assessment_id,
                 assessment_title=assessment.title,
-                total_participants=len(attempts),
+                total_participants=total_participants,
                 completed_count=completed_count,
                 average_score=avg_score,
                 topic_performance=topic_performance,
-                user_results=user_results,
+                user_results=paged_results,
+                total_user_results=total_user_results,
             )
         finally:
             db.close()

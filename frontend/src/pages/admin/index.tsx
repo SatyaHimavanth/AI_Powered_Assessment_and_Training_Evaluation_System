@@ -9,9 +9,11 @@ import Questions from "./Questions";
 import Assessments from "./Assessments";
 import Batches from "./Batches";
 import Results from "./Results";
+import Interviews from "./Interviews";
+import InterviewResults from "./InterviewResults";
 import Toast from "../../components/Toast";
 
-type Tab = "dashboard" | "approvals" | "users" | "assessments" | "questions" | "batches" | "results";
+type Tab = "dashboard" | "approvals" | "users" | "assessments" | "questions" | "batches" | "results" | "interviews" | "interview-results";
 
 const NAV_ITEMS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   {
@@ -51,20 +53,20 @@ const NAV_ITEMS: { key: Tab; label: string; icon: React.ReactNode }[] = [
     ),
   },
   {
-    key: "assessments",
-    label: "Assessments",
-    icon: (
-      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15a2.25 2.25 0 012.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z" />
-      </svg>
-    ),
-  },
-  {
     key: "questions",
     label: "Questions",
     icon: (
       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+      </svg>
+    ),
+  },
+  {
+    key: "assessments",
+    label: "Assessments",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15a2.25 2.25 0 012.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25zM6.75 12h.008v.008H6.75V12zm0 3h.008v.008H6.75V15zm0 3h.008v.008H6.75V18z" />
       </svg>
     ),
   },
@@ -77,11 +79,38 @@ const NAV_ITEMS: { key: Tab; label: string; icon: React.ReactNode }[] = [
       </svg>
     ),
   },
+  {
+    key: "interviews",
+    label: "Interviews",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25h9m-9 3h6m-7.5 8.25h12a2.25 2.25 0 002.25-2.25V6.75A2.25 2.25 0 0018 4.5H6A2.25 2.25 0 003.75 6.75v10.5A2.25 2.25 0 006 19.5z" />
+      </svg>
+    ),
+  },
+  {
+    key: "interview-results",
+    label: "Interview Results",
+    icon: (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15a2.25 2.25 0 012.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V19.5a2.25 2.25 0 002.25 2.25h6.75" />
+      </svg>
+    ),
+  },
 ];
 
 export default function AdminHome() {
   const [pending, setPending] = useState<PendingRequest[]>([]);
   const [pendingPracticeCount, setPendingPracticeCount] = useState(0);
+  const [pendingInterviewCount, setPendingInterviewCount] = useState(0);
+  const [dashboardCounts, setDashboardCounts] = useState({
+    pending_assessments: 0,
+    in_progress_assessments: 0,
+    total_users: 0,
+    pending_registrations: 0,
+    total_topics: 0,
+    total_batches: 0,
+  });
   const [users, setUsers] = useState<UserInfo[]>([]);
   const [topics, setTopics] = useState<TopicInfo[]>([]);
   const [batches, setBatches] = useState<BatchInfo[]>([]);
@@ -102,10 +131,7 @@ export default function AdminHome() {
   useEffect(() => {
     switch (activeTab) {
       case "dashboard":
-        loadUsers();
-        loadTopics();
-        loadBatches();
-        loadPending();
+        loadDashboardCounts();
         break;
       case "approvals":
         loadPending();
@@ -128,17 +154,48 @@ export default function AdminHome() {
       case "results":
         loadBatches();
         break;
+      case "interviews":
+        loadPending();
+        break;
     }
   }, [activeTab]);
 
+  async function loadDashboardCounts() {
+    try {
+      const res = await api.get("/admin/dashboard/counters");
+      const d = res.data;
+      setDashboardCounts({
+        pending_assessments: Number(d?.pending_assessments || 0),
+        in_progress_assessments: Number(d?.in_progress_assessments || 0),
+        total_users: Number(d?.total_users || 0),
+        pending_registrations: Number(d?.pending_registrations || 0),
+        total_topics: Number(d?.total_topics || 0),
+        total_batches: Number(d?.total_batches || 0),
+      });
+    } catch {
+      // ignore
+    }
+  }
+
   async function loadPending() {
     try {
-      const [regRes, practiceRes] = await Promise.all([
+      const [regRes, practiceRes, interviewRes, countersRes] = await Promise.all([
         api.get("/admin/pending-registrations"),
         api.get("/admin/practice-access-requests"),
+        api.get("/admin/interviews/access-requests?status=pending"),
+        api.get("/admin/dashboard/counters"),
       ]);
       setPending(regRes.data);
       setPendingPracticeCount(Array.isArray(practiceRes.data) ? practiceRes.data.length : 0);
+      setPendingInterviewCount(Array.isArray(interviewRes.data) ? interviewRes.data.length : 0);
+      setDashboardCounts({
+        pending_assessments: Number(countersRes.data?.pending_assessments || 0),
+        in_progress_assessments: Number(countersRes.data?.in_progress_assessments || 0),
+        total_users: Number(countersRes.data?.total_users || 0),
+        pending_registrations: Number(countersRes.data?.pending_registrations || 0),
+        total_topics: Number(countersRes.data?.total_topics || 0),
+        total_batches: Number(countersRes.data?.total_batches || 0),
+      });
     } catch {
       // ignore
     }
@@ -146,8 +203,9 @@ export default function AdminHome() {
 
   async function loadUsers() {
     try {
-      const res = await api.get("/admin/users");
-      setUsers(res.data);
+      const res = await api.get("/admin/users?page_size=1000");
+      const data = res.data;
+      setUsers(data && data.items ? data.items : Array.isArray(data) ? data : []);
     } catch {
       // ignore
     }
@@ -187,6 +245,7 @@ export default function AdminHome() {
       case "assessments": return "Assessments";
       case "batches": return "Batches";
       case "results": return "Results Analytics";
+      case "interview-results": return "Interview Results";
       default: return activeTab.charAt(0).toUpperCase() + activeTab.slice(1);
     }
   };
@@ -221,12 +280,12 @@ export default function AdminHome() {
             >
               <span className="shrink-0">{item.icon}</span>
               {!sidebarCollapsed && item.label}
-              {!sidebarCollapsed && item.key === "approvals" && (pending.length + pendingPracticeCount) > 0 && (
+              {!sidebarCollapsed && item.key === "approvals" && (pending.length + pendingPracticeCount + pendingInterviewCount) > 0 && (
                 <span className="ml-auto text-xs bg-[var(--color-danger)] text-white px-2 py-0.5 rounded-full font-medium">
-                  {pending.length + pendingPracticeCount}
+                  {pending.length + pendingPracticeCount + pendingInterviewCount}
                 </span>
               )}
-              {sidebarCollapsed && item.key === "approvals" && (pending.length + pendingPracticeCount) > 0 && (
+              {sidebarCollapsed && item.key === "approvals" && (pending.length + pendingPracticeCount + pendingInterviewCount) > 0 && (
                 <span className="absolute -top-1 -right-1 w-2 h-2 bg-[var(--color-danger)] rounded-full" />
               )}
             </button>
@@ -266,13 +325,15 @@ export default function AdminHome() {
         <div className="p-8 max-w-[1200px]">
           <Toast message={message} onClose={() => setMessage("")} />
 
-          {activeTab === "dashboard" && <Dashboard users={users} pending={pending} topics={topics} batches={batches} />}
+          {activeTab === "dashboard" && <Dashboard users={users} pending={pending} topics={topics} batches={batches} counts={dashboardCounts} />}
           {activeTab === "approvals" && <Approvals pending={pending} setMessage={setMessage} reload={reloadAfterApprovals} />}
           {activeTab === "users" && <Users users={users} batches={batches} setMessage={setMessage} reloadUsers={loadUsers} />}
           {activeTab === "questions" && <Questions topics={topics} setMessage={setMessage} reloadTopics={loadTopics} />}
           {activeTab === "assessments" && <Assessments topics={topics} batches={batches} setMessage={setMessage} />}
           {activeTab === "batches" && <Batches batches={batches} users={users} setMessage={setMessage} reloadBatches={loadBatches} />}
           {activeTab === "results" && <Results batches={batches} />}
+          {activeTab === "interviews" && <Interviews setMessage={setMessage} />}
+          {activeTab === "interview-results" && <InterviewResults setMessage={setMessage} />}
         </div>
       </main>
     </div>
