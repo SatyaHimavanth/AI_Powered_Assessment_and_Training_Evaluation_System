@@ -94,14 +94,19 @@ backend/
 │   ├── routers_assessments.py   # Assessment CRUD
 │   ├── routers_batches.py       # Batch management
 │   ├── routers_user_assessments.py  # User taking assessments
-│   └── routers_practice.py      # Practice test flow
+│   ├── routers_practice.py      # Practice test flow
+│   └── routers_question_generation.py  # AI question generation & staged review
 ├── app/
 │   ├── llms.py          # Azure OpenAI client setup
 │   └── prompts.py       # LLM prompt templates
 ├── core/
 │   ├── auth.py          # JWT + password utilities
 │   ├── evaluation_service.py  # Background eval job consumer
-│   └── logger.py
+│   ├── logger.py
+│   ├── vector_store.py        # FAISS/pgvector abstraction
+│   ├── embedding_service.py   # Embedding computation & similarity search
+│   ├── question_generation.py # LLM question generation pipeline
+│   └── embedding_backfill.py  # Startup backfill for missing embeddings
 └── db/
     ├── database.py      # SQLAlchemy engine & session
     └── models.py        # All ORM models
@@ -128,6 +133,40 @@ frontend/
 - **Practice tests** — AI-generated questions based on job description and resume
 - **Performance analytics** — Topic-wise scores and improvement areas
 - **Export** — Download results as Excel
+- **AI Question Generation** — Generate questions from source text using LLM with duplicate detection
+- **Vector Similarity Search** — FAISS-based embedding store (pgvector-ready) for detecting duplicate/similar questions
+
+## AI Question Generation
+
+Admins can generate new questions from any source text (textbooks, notes, documentation) using Azure OpenAI, with automatic similarity checking against the existing question bank.
+
+### How It Works
+
+1. **Generate** — Provide source text, select topic/type/difficulty, and specify count (1–50). The LLM generates questions with correct answers and options.
+2. **Similarity Check** — Each generated question is embedded (composite of question text + options/answer) and compared against all existing questions using cosine similarity.
+3. **Staged Review** — Questions land in a staging area with match bands:
+   - **High Duplicate** (≥ threshold) — likely duplicates, flagged for rejection
+   - **Review** (≥ lower threshold) — similar to existing, needs manual review
+   - **Unique** — no close matches, safe to approve
+4. **Approve/Reject** — Admin reviews staged questions with a side-by-side comparison modal showing the generated question vs. the matched existing question.
+5. **Auto-Approve** — Optional setting to automatically approve unique questions.
+
+### Configuration
+
+```env
+# Similarity thresholds (0.0 to 1.0)
+SIMILARITY_THRESHOLD_HIGH_DUP=0.85    # Above this = likely duplicate
+SIMILARITY_THRESHOLD_REVIEW=0.70      # Above this = needs review
+
+# Embedding model
+EMBEDDING_DEPLOYMENT_NAME=text-embedding-3-small
+```
+
+### Background Processing
+
+- **Auto-embedding on upload** — When questions are imported via Excel/CSV, embeddings are computed in the background automatically.
+- **Startup backfill** — On server start, a background thread finds any questions missing embeddings and generates them.
+- **FAISS index persistence** — The vector index is saved to `data/faiss_index/` and reloaded on restart.
 
 ## API Documentation
 

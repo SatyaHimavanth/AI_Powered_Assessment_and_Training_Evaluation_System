@@ -20,6 +20,7 @@ from api.routers_practice import router as practice_router
 from api.routers_questions import router as questions_router
 from api.routers_interviews import user_router as interviews_router, admin_router as admin_interviews_router
 from api.routers_user_assessments import router as user_assessments_router
+from api.routers_question_generation import router as question_generation_router
 from core.auth import get_password_hash
 from core.evaluation_service import start_evaluation_job_consumer
 from core.setup_demo_db import create_demo_db_for_tests
@@ -141,6 +142,11 @@ async def lifespan(app: FastAPI):
     # Create demo db for postgres assessment
     create_demo_db_for_tests()
 
+    # Backfill embeddings for questions that don't have them yet
+    import threading
+    from core.embedding_backfill import backfill_missing_embeddings
+    threading.Thread(target=backfill_missing_embeddings, daemon=True).start()
+
     yield
     # Shutdown (nothing to clean up)
 
@@ -184,6 +190,7 @@ app.include_router(practice_router)
 app.include_router(interviews_router)
 app.include_router(admin_interviews_router)
 app.include_router(code_router)
+app.include_router(question_generation_router)
 
 
 # @app.get("/")

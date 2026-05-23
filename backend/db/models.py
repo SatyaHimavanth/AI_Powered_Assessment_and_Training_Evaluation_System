@@ -571,3 +571,86 @@ class InterviewResponseEvaluation(Base):
     score = Column(Float, nullable=True)
     focus_area = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+# -------------- QUESTION GENERATION -------------- #
+
+
+class GenerationBatchStatus(str, enum.Enum):
+    pending = "pending"
+    processing = "processing"
+    embedding = "embedding"
+    similarity_check = "similarity_check"
+    completed = "completed"
+    failed = "failed"
+
+
+class StagedQuestionStatus(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    auto_rejected = "auto_rejected"
+
+
+class MatchBand(str, enum.Enum):
+    high_dup = "high_dup"      # >= 0.85 cosine similarity
+    review = "review"          # 0.70 - 0.84
+    unique = "unique"          # < 0.70
+
+
+class QuestionGenerationBatch(Base):
+    __tablename__ = "question_generation_batches"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    admin_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    filename = Column(String, nullable=True)
+    source_text = Column(Text, nullable=True)
+    topic_id = Column(UUID(as_uuid=True), ForeignKey("topics.id"), nullable=True)
+    question_type = Column(Enum(QuestionType), nullable=True)
+    difficulty = Column(Enum(Difficulty), nullable=True)
+    requested_count = Column(Integer, default=10)
+    auto_approve_unique = Column(Boolean, default=False)
+    status = Column(Enum(GenerationBatchStatus), default=GenerationBatchStatus.pending)
+    total_generated = Column(Integer, default=0)
+    total_approved = Column(Integer, default=0)
+    total_rejected = Column(Integer, default=0)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    staged_questions = relationship("StagedQuestion", back_populates="batch", cascade="all, delete-orphan")
+
+
+class StagedQuestion(Base):
+    __tablename__ = "staged_questions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    batch_id = Column(UUID(as_uuid=True), ForeignKey("question_generation_batches.id"), nullable=False)
+    question_type = Column(Enum(QuestionType), nullable=False)
+    question_text = Column(Text, nullable=False)
+    reference_answer = Column(Text, nullable=True)
+    options = Column(JSON, nullable=True)
+    correct_answers = Column(JSON, nullable=True)
+    topic_id = Column(UUID(as_uuid=True), ForeignKey("topics.id"), nullable=True)
+    difficulty = Column(Enum(Difficulty), nullable=True)
+    similarity_score = Column(Float, nullable=True)
+    matched_question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"), nullable=True)
+    match_band = Column(Enum(MatchBand), nullable=True)
+    status = Column(Enum(StagedQuestionStatus), default=StagedQuestionStatus.pending)
+    reviewer_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    batch = relationship("QuestionGenerationBatch", back_populates="staged_questions")
+
+
+class QuestionEmbedding(Base):
+    __tablename__ = "question_embeddings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"), nullable=True)
+    staged_question_id = Column(UUID(as_uuid=True), ForeignKey("staged_questions.id"), nullable=True)
+    embedding_text = Column(Text, nullable=False)
+    embedding = Column(JSON, nullable=False)  # stored as JSON list; pgvector casts at query time if available
+    model_version = Column(String, default="text-embedding-3-small")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

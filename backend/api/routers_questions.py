@@ -1,4 +1,6 @@
 import io
+import asyncio
+import logging
 from typing import List
 from uuid import UUID
 
@@ -20,6 +22,8 @@ from db.models import (
     Topic,
     User,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
@@ -208,6 +212,42 @@ def _question_matches_db(db_q: Question, parsed: dict, parsed_tcs: list[dict]) -
     return True
 
 
+# ---------- Embedding helpers ---------- #
+
+
+def _generate_embeddings_for_questions(questions: list[dict]) -> None:
+    """Generate and store embeddings for a list of newly created questions (runs in background thread)."""
+    try:
+        from core.embedding_service import build_embedding_text, compute_embeddings, store_question_embedding
+
+        # Build composite texts
+        texts = [
+            build_embedding_text(
+                question_text=q["question_text"],
+                question_type=q["question_type"],
+                options=q.get("options"),
+                reference_answer=q.get("reference_answer"),
+            )
+            for q in questions
+        ]
+
+        # Batch compute embeddings
+        embeddings = compute_embeddings(texts)
+
+        # Store each embedding
+        for q, text, embedding in zip(questions, texts, embeddings):
+            store_question_embedding(
+                question_id=q["id"],
+                staged_question_id=None,
+                text=text,
+                embedding=embedding,
+            )
+
+        logger.info(f"Generated embeddings for {len(questions)} uploaded questions")
+    except Exception as e:
+        logger.error(f"Failed to generate embeddings for uploaded questions: {e}")
+
+
 # ---------- Endpoints ---------- #
 
 
@@ -293,6 +333,7 @@ async def upload_questions(
             imported = 0
             skipped = 0
             errors: list[str] = []
+            new_questions_for_embedding: list[dict] = []
 
             for idx, row in df.iterrows():
                 row_num = idx + 2  # 1-indexed + header
@@ -367,6 +408,15 @@ async def upload_questions(
                             is_sample=tc["is_sample"],
                         ))
 
+                # Collect data for embedding generation
+                new_questions_for_embedding.append({
+                    "id": question.id,
+                    "question_text": parsed["question"],
+                    "question_type": parsed["type"],
+                    "options": [{"option_text": o["text"], "is_correct": o["is_correct"]} for o in parsed["options"]],
+                    "reference_answer": parsed["reference_answer"],
+                })
+
                 imported += 1
 
             db.commit()
@@ -377,11 +427,20 @@ async def upload_questions(
                 "imported": imported,
                 "skipped": skipped,
                 "errors": errors[:20],
+                "_new_questions": new_questions_for_embedding,
             }
         finally:
             db.close()
 
     result = await run_db_sync(_sync_work, content, filename, topic_name)
+
+    # Generate embeddings in background for newly imported questions
+    new_questions = result.pop("_new_questions", [])
+    if new_questions:
+        asyncio.get_event_loop().run_in_executor(
+            None, _generate_embeddings_for_questions, new_questions
+        )
+
     return UploadResult(**result)
 
 

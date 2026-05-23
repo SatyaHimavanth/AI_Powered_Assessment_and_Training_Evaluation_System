@@ -1,0 +1,232 @@
+FastAPI: A Modern Python Web Framework
+=======================================
+
+Chapter 1: Introduction to FastAPI
+-----------------------------------
+
+FastAPI is a modern, high-performance Python web framework for building APIs. It was created by Sebastián Ramírez and is built on top of Starlette for the web parts and Pydantic for data validation. FastAPI requires Python 3.7 or higher and leverages Python type hints extensively to provide automatic data validation, serialization, and documentation.
+
+One of FastAPI's standout features is its automatic generation of interactive API documentation in the OpenAPI/Swagger format. When you run a FastAPI application, it automatically creates documentation endpoints at /docs (Swagger UI) and /redoc (ReDoc), allowing developers to explore and test API endpoints directly from the browser without any additional configuration.
+
+To get started with FastAPI, you need to install it along with an ASGI server. The most commonly used server for running FastAPI applications is Uvicorn, which is a lightning-fast ASGI server implementation:
+
+    pip install fastapi uvicorn
+
+A minimal FastAPI application looks like:
+
+    from fastapi import FastAPI
+    app = FastAPI()
+
+    @app.get("/")
+    def read_root():
+        return {"Hello": "World"}
+
+Run it with: uvicorn main:app --reload
+
+
+Chapter 2: Path and Query Parameters
+-------------------------------------
+
+FastAPI supports several types of parameters for handling incoming request data:
+
+**Path Parameters** are defined using curly braces in the URL path. They are always required and are extracted directly from the URL. For example:
+
+    @app.get("/items/{item_id}")
+    def read_item(item_id: int):
+        return {"item_id": item_id}
+
+Here, accessing /items/42 would extract 42 as the item_id. FastAPI supports various data types for path parameters including int, str, float, and UUID.
+
+**Query Parameters** are appended after the ? in the URL and can be optional with default values:
+
+    @app.get("/items")
+    def list_items(skip: int = 0, limit: int = 10):
+        return items[skip:skip + limit]
+
+The URL /items?skip=0&limit=10 demonstrates query parameters in action. Unlike path parameters, query parameters can have defaults and are therefore optional.
+
+**Header Parameters** allow you to extract values from HTTP headers, while **Cookie Parameters** provide access to cookie values in the request.
+
+
+Chapter 3: Data Validation with Pydantic
+-----------------------------------------
+
+Pydantic models are at the heart of FastAPI's data handling. They define the structure and validation rules for request and response data. When a request comes in, Pydantic automatically validates the incoming data, performs type coercion where possible, and generates JSON Schema for the API documentation.
+
+For request body validation, FastAPI uses Pydantic BaseModel classes:
+
+    from pydantic import BaseModel
+
+    class Item(BaseModel):
+        name: str
+        price: float
+        is_offer: bool = False
+
+    @app.post("/items")
+    def create_item(item: Item):
+        return item
+
+FastAPI can serialize various types in responses including Pydantic models, SQLAlchemy models (with orm_mode/model_config), and Python dataclasses. The response_model parameter on decorators controls what gets serialized.
+
+
+Chapter 4: Dependency Injection
+-------------------------------
+
+FastAPI features a powerful dependency injection system using the Depends() function. Dependencies can be synchronous or asynchronous functions, and they can yield values for resource cleanup (useful for database sessions).
+
+    from fastapi import Depends
+
+    def get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    @app.get("/users")
+    def get_users(db: Session = Depends(get_db)):
+        return db.query(User).all()
+
+Key facts about FastAPI's dependency injection:
+- Dependencies can be async (using async def)
+- Dependencies can yield for cleanup (like closing DB connections)
+- Dependencies can be cached per-request (avoiding duplicate calls)
+- Dependencies can be class-based
+- Request-scoped dependencies are the default with Depends()
+- App-scoped dependencies can use yield for application lifecycle
+
+FastAPI handles async database sessions correctly by using dependency injection with yield, which ensures proper session lifecycle management without thread-safety issues that come with global sessions or thread-local storage.
+
+
+Chapter 5: Middleware and CORS
+------------------------------
+
+Middleware in FastAPI intercepts requests and responses to add cross-cutting concerns. There are multiple valid ways to add middleware:
+
+1. Using the @app.middleware("http") decorator
+2. Using app.add_middleware() with middleware classes
+3. Using Starlette middleware classes directly
+
+**CORS Configuration:**
+Cross-Origin Resource Sharing (CORS) is needed when your frontend and backend are served from different origins. FastAPI's CORSMiddleware lets you configure:
+- Allowed origins (which domains can make requests)
+- Allowed methods (GET, POST, etc.)
+- Max age (how long preflight responses are cached)
+- Allowed headers and credentials
+
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+**HTTPS Redirect:**
+For production deployments requiring HTTPS, use the HTTPSRedirectMiddleware which redirects all HTTP requests to HTTPS.
+
+**Custom Latency Middleware:**
+You can create custom middleware to measure request latency. Create a class inheriting from BaseHTTPMiddleware, record the start time, call await call_next(request), then calculate the duration. If it exceeds a threshold, log the slow request details including method, path, and status code. Use time.perf_counter() for high-precision timing.
+
+
+Chapter 6: Background Tasks and Async Support
+----------------------------------------------
+
+FastAPI has built-in support for background tasks through the BackgroundTasks class. These allow executing functions after the response is sent to the client, making them ideal for sending emails, logging, cleanup tasks, or other operations that shouldn't delay the HTTP response.
+
+    from fastapi import BackgroundTasks
+
+    @app.post("/send-notification")
+    async def send_notification(background_tasks: BackgroundTasks):
+        background_tasks.add_task(send_email, "user@example.com")
+        return {"message": "Notification will be sent"}
+
+FastAPI features that support async/await include:
+- Route handlers (async def endpoints)
+- Dependencies (async dependencies)
+- Middleware (async dispatch methods)
+
+Note that template rendering is synchronous and does not benefit from async/await.
+
+
+Chapter 7: Authentication and Security
+---------------------------------------
+
+FastAPI provides built-in security utilities:
+- OAuth2PasswordBearer for OAuth2 token authentication
+- APIKeyHeader for API key authentication
+- HTTPBasic for basic HTTP authentication
+
+**JWT Authentication Implementation:**
+1. Create an OAuth2PasswordBearer scheme
+2. Implement a login endpoint that validates credentials and returns a JWT token (using python-jose or PyJWT)
+3. Create a dependency that extracts the token from the Authorization header, decodes and validates it
+4. Protect routes by declaring this dependency
+
+For WebSocket authentication, valid approaches include:
+- Query parameter tokens (ws://host/ws?token=xxx)
+- First message authentication (send credentials as first message)
+- Cookie-based authentication
+
+
+Chapter 8: File Uploads
+-----------------------
+
+FastAPI handles file uploads using the UploadFile type:
+
+    from fastapi import UploadFile
+
+    @app.post("/upload")
+    async def upload(file: UploadFile):
+        contents = await file.read()
+        return {"filename": file.filename}
+
+For multiple files, use List[UploadFile]. UploadFile internally uses SpooledTemporaryFile for memory efficiency with large files — this is the recommended approach rather than reading the entire file into memory or using base64 encoding in JSON bodies.
+
+
+Chapter 9: Testing FastAPI Applications
+----------------------------------------
+
+Multiple strategies work for testing FastAPI applications:
+- TestClient from Starlette for synchronous tests
+- pytest with httpx.AsyncClient for async test scenarios
+- Overriding dependencies to inject mock services
+
+The dependency override system allows you to replace real services with test doubles during testing without modifying application code.
+
+
+Chapter 10: Production Deployment and Scaling
+---------------------------------------------
+
+**Scaling Patterns:**
+- Multiple workers with Gunicorn (gunicorn -w 4 -k uvicorn.workers.UvicornWorker)
+- Horizontal scaling behind a load balancer
+- Async I/O for database calls to maximize throughput
+
+**Database Connection Pooling:**
+Configure SQLAlchemy engine with appropriate pool settings: pool_size, max_overflow, pool_timeout, and pool_recycle. Use pool_pre_ping=True for stale connection detection. For async endpoints, use create_async_engine with asyncpg driver.
+
+**Application Lifecycle:**
+FastAPI uses the lifespan context manager for startup and shutdown events. Note: the older app.on_event("startup") decorator is deprecated in favor of the lifespan approach, which provides better resource management.
+
+**Rate Limiting:**
+For rate limiting without external services, use slowapi library or custom middleware with an in-memory store. For distributed deployments across multiple workers, use Redis-backed sliding window or token bucket algorithms with INCR and TTL for atomic operations.
+
+**API Versioning:**
+Implement versioning using URL prefix with APIRouter (prefix="/v1", "/v2"), header-based routing, or mounting separate FastAPI apps as sub-applications. Maintain backward compatibility using response_model_exclude_unset and adapter patterns.
+
+**Exception Handling:**
+- Use HTTPException for client errors (4xx responses)
+- Register custom exception handlers via app.exception_handler()
+- RequestValidationError handles input validation errors automatically
+- Exceptions do NOT always return 500 — FastAPI maps them to appropriate status codes
+
+
+Chapter 11: Event-Driven Architecture
+--------------------------------------
+
+For real-time features, FastAPI supports WebSocket endpoints. Implement a ConnectionManager class to track active connections. Use Redis Pub/Sub or message queues (RabbitMQ, Kafka) for inter-service communication. Background workers using Celery or ARQ process long-running tasks and publish results back through WebSocket channels.
+
+Key considerations: handle reconnection gracefully, implement heartbeat mechanisms, clean up stale connections, and use the broadcast library for multi-worker WebSocket support.
