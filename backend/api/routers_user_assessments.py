@@ -58,6 +58,51 @@ def _to_utc_iso(dt: datetime | None) -> str | None:
     return aware.isoformat().replace("+00:00", "Z")
 
 
+def _attempt_sort_key(attempt: Attempt) -> tuple[datetime, datetime, int, str]:
+    min_dt = datetime.min.replace(tzinfo=timezone.utc)
+    status_rank = {
+        AttemptStatus.completed: 3,
+        AttemptStatus.in_progress: 2,
+        AttemptStatus.missed: 1,
+    }.get(attempt.status, 0)
+    return (
+        _as_utc_aware(attempt.started_at) or min_dt,
+        _as_utc_aware(attempt.submitted_at) or min_dt,
+        status_rank,
+        str(attempt.id),
+    )
+
+
+def _latest_attempt_for_user_assessment(
+    db: Session,
+    user_id: UUID,
+    assessment_id: UUID,
+) -> Attempt | None:
+    attempts = (
+        db.query(Attempt)
+        .filter(Attempt.assessment_id == assessment_id, Attempt.user_id == user_id)
+        .all()
+    )
+    return max(attempts, key=_attempt_sort_key) if attempts else None
+
+
+def _completed_attempt_for_user_assessment(
+    db: Session,
+    user_id: UUID,
+    assessment_id: UUID,
+) -> Attempt | None:
+    completed_attempts = (
+        db.query(Attempt)
+        .filter(
+            Attempt.assessment_id == assessment_id,
+            Attempt.user_id == user_id,
+            Attempt.status == AttemptStatus.completed,
+        )
+        .all()
+    )
+    return max(completed_attempts, key=_attempt_sort_key) if completed_attempts else None
+
+
 # ---------- Schemas ---------- #
 
 
@@ -219,11 +264,12 @@ async def get_my_assessments(
             now = datetime.now(timezone.utc)
 
             for a in assessments:
-                # Check if user already attempted
+                # Check if user already attempted. There can be historical missed
+                # attempts; use the latest so an older missed row does not hide a
+                # submitted attempt on the dashboard.
                 attempt = (
-                    db.query(Attempt)
-                    .filter(Attempt.assessment_id == a.id, Attempt.user_id == user.id)
-                    .first()
+                    _completed_attempt_for_user_assessment(db, user.id, a.id)
+                    or _latest_attempt_for_user_assessment(db, user.id, a.id)
                 )
 
                 # Skip archived assessments for users who haven't attempted them
@@ -285,6 +331,11 @@ async def start_assessment(
             if not assessment:
                 raise HTTPException(status_code=404, detail="Assessment not found")
 
+            # Serialize start requests from the same user. This prevents rapid
+            # double-clicks or concurrent requests from both seeing "no attempt"
+            # and creating duplicate in-progress attempts.
+            db.query(User).filter(User.id == user.id).with_for_update().first()
+
             # Check user is assigned to this assessment
             batch_links = db.query(BatchUser).filter(BatchUser.user_id == user.id).all()
             batch_ids = [bl.batch_id for bl in batch_links]
@@ -299,12 +350,11 @@ async def start_assessment(
             if not assigned:
                 raise HTTPException(status_code=403, detail="You are not assigned to this assessment")
 
-            # Check if already attempted
-            existing = (
-                db.query(Attempt)
-                .filter(Attempt.assessment_id == assessment_id, Attempt.user_id == user.id)
-                .first()
-            )
+            # Check if already attempted. Prefer any completed attempt first so
+            # a stale missed/in-progress row cannot allow or block incorrectly.
+            existing = _completed_attempt_for_user_assessment(db, user.id, assessment_id)
+            if not existing:
+                existing = _latest_attempt_for_user_assessment(db, user.id, assessment_id)
             # Prevent starting a newly archived assessment for users without an existing attempt
             if getattr(assessment, "is_archived", False) and not existing:
                 raise HTTPException(status_code=403, detail="Assessment is archived and cannot be started")
@@ -787,9 +837,8 @@ async def get_my_results(
         db = SessionLocal()
         try:
             attempt = (
-                db.query(Attempt)
-                .filter(Attempt.assessment_id == assessment_id, Attempt.user_id == user.id)
-                .first()
+                _completed_attempt_for_user_assessment(db, user.id, assessment_id)
+                or _latest_attempt_for_user_assessment(db, user.id, assessment_id)
             )
             if not attempt:
                 raise HTTPException(status_code=404, detail="No attempt found for this assessment")
@@ -826,9 +875,8 @@ async def export_my_results(
         db = SessionLocal()
         try:
             attempt = (
-                db.query(Attempt)
-                .filter(Attempt.assessment_id == assessment_id, Attempt.user_id == user.id)
-                .first()
+                _completed_attempt_for_user_assessment(db, user.id, assessment_id)
+                or _latest_attempt_for_user_assessment(db, user.id, assessment_id)
             )
             if not attempt:
                 raise HTTPException(status_code=404, detail="No attempt found for this assessment")

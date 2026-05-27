@@ -57,6 +57,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
   const [phase, setPhase] = useState<Phase>("speed-test");
   const [speedMbps, setSpeedMbps] = useState<number | null>(null);
   const [speedTesting, setSpeedTesting] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [examData, setExamData] = useState<ExamData | null>(null);
   const [currentQ, setCurrentQ] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
@@ -144,6 +145,8 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
 
   // ---- Start Exam ----
   const startExam = async () => {
+    if (starting) return;
+    setStarting(true);
     try {
       const res = await api.post(`/user/assessments/start/${assessmentId}`);
       const data: ExamData = res.data;
@@ -179,6 +182,8 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     } catch (err: unknown) {
       console.error(err);
       setError("Failed to start assessment");
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -538,10 +543,10 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
           <div className="mt-6 space-y-3">
             <button
               onClick={startExam}
-              disabled={speedTesting}
+              disabled={speedTesting || starting}
               className="w-full h-10 bg-[var(--color-primary)] text-white text-sm font-medium rounded-[var(--radius-sm)] hover:bg-[var(--color-primary-hover)] disabled:opacity-50 cursor-pointer"
             >
-              Start Assessment
+              {starting ? "Starting..." : "Start Assessment"}
             </button>
             <button
               onClick={runSpeedTest}
