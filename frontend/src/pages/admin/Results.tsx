@@ -90,6 +90,8 @@ export default function Results({ batches }: Props) {
   const [viewingAttempt, setViewingAttempt] = useState<string | null>(null);
   const [attemptResults, setAttemptResults] = useState<AttemptResults | null>(null);
   const [loadingAttemptResults, setLoadingAttemptResults] = useState(false);
+  const [exportingAttemptId, setExportingAttemptId] = useState<string | null>(null);
+  const [exportingAll, setExportingAll] = useState(false);
 
   // Status filter and sorting for individual results
   const [statusFilter, setStatusFilter] = useState("");
@@ -122,6 +124,25 @@ export default function Results({ batches }: Props) {
       )
     : assessments;
 
+  const selectedBatchName = selectedBatch
+    ? batches.find((b) => b.id === selectedBatch)?.name || "Selected Batch"
+    : "All Batches";
+  const selectedAssessmentName = selectedAssessment
+    ? assessments.find((a) => a.id === selectedAssessment)?.title || "Selected Assessment"
+    : "";
+
+  const downloadBlobResponse = (data: BlobPart, disposition: string | undefined, fallbackName: string) => {
+    const blobUrl = window.URL.createObjectURL(new Blob([data]));
+    const link = document.createElement("a");
+    const filename = disposition?.split("filename=")[1]?.replace(/"/g, "")?.trim();
+    link.href = blobUrl;
+    link.download = filename || fallbackName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(blobUrl);
+  };
+
   const loadResults = async (assessmentId: string, pg?: number, ps?: number, sf?: string) => {
     if (!assessmentId) {
       setResults(null);
@@ -133,6 +154,7 @@ export default function Results({ batches }: Props) {
       params.set("page", String(pg ?? page));
       params.set("page_size", String(ps ?? pageSize));
       const currentStatusFilter = sf !== undefined ? sf : statusFilter;
+      if (selectedBatch) params.set("batch_id", selectedBatch);
       if (currentStatusFilter) params.set("status_filter", currentStatusFilter);
       const res = await api.get(`/assessments/${assessmentId}/results?${params.toString()}`);
       setResults(res.data);
@@ -149,7 +171,8 @@ export default function Results({ batches }: Props) {
     loadResults(id, 1);
   };
 
-  const handleResetAttempt = async (attemptId: string, userName: string) => {
+  const handleResetAttempt = async (attemptId: string | null, userName: string) => {
+    if (!attemptId) return;
     if (!window.confirm(`Re-enable test for ${userName}? They will be able to retake this assessment.`)) {
       return;
     }
@@ -217,6 +240,42 @@ export default function Results({ batches }: Props) {
     }
   };
 
+  const handleExportAttemptResults = async (attemptId: string | null) => {
+    if (!attemptId) return;
+    setExportingAttemptId(attemptId);
+    try {
+      const res = await api.get(`/admin/attempt/${attemptId}/export`, {
+        responseType: "blob",
+      });
+      downloadBlobResponse(res.data, res.headers["content-disposition"] as string | undefined, "attempt-results.xlsx");
+    } catch (err: unknown) {
+      console.error(err);
+      alert("Failed to export attempt results");
+    } finally {
+      setExportingAttemptId(null);
+    }
+  };
+
+  const handleExportAllResults = async () => {
+    if (!selectedAssessment) return;
+    setExportingAll(true);
+    try {
+      const params = new URLSearchParams();
+      if (selectedBatch) params.set("batch_id", selectedBatch);
+      if (statusFilter) params.set("status_filter", statusFilter);
+      const qs = params.toString();
+      const res = await api.get(`/assessments/${selectedAssessment}/results/export${qs ? `?${qs}` : ""}`, {
+        responseType: "blob",
+      });
+      downloadBlobResponse(res.data, res.headers["content-disposition"] as string | undefined, "assessment-results.xlsx");
+    } catch (err: unknown) {
+      console.error(err);
+      alert("Failed to export all results");
+    } finally {
+      setExportingAll(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Topic Scores Modal */}
@@ -261,12 +320,21 @@ export default function Results({ batches }: Props) {
           <div className="bg-white rounded-[var(--radius)] shadow-xl w-full max-w-3xl max-h-[90vh] overflow-auto">
             <div className="sticky top-0 bg-white border-b border-[var(--color-border)] px-6 py-4 flex items-center justify-between">
               <h2 className="text-base font-semibold">{attemptResults?.assessment_title || "Results"}</h2>
-              <button
-                onClick={() => { setViewingAttempt(null); setAttemptResults(null); }}
-                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-gray-100 cursor-pointer text-lg"
-              >
-                &times;
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleExportAttemptResults(viewingAttempt)}
+                  disabled={!viewingAttempt || exportingAttemptId === viewingAttempt}
+                  className="h-8 px-3 text-xs font-medium rounded bg-[var(--color-primary)] text-white hover:bg-[var(--color-primary-hover)] disabled:opacity-50 cursor-pointer"
+                >
+                  {exportingAttemptId === viewingAttempt ? "Exporting..." : "Export"}
+                </button>
+                <button
+                  onClick={() => { setViewingAttempt(null); setAttemptResults(null); }}
+                  className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-gray-100 cursor-pointer text-lg"
+                >
+                  &times;
+                </button>
+              </div>
             </div>
 
             <div className="p-6 space-y-6">
@@ -495,6 +563,23 @@ export default function Results({ batches }: Props) {
 
       {results && (
         <>
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold">Results Summary</p>
+              <p className="text-xs text-[var(--color-text-secondary)]">
+                {selectedAssessmentName} - {selectedBatchName}
+                {statusFilter ? ` - ${statusFilter}` : ""}
+              </p>
+            </div>
+            <button
+              onClick={handleExportAllResults}
+              disabled={exportingAll || !selectedAssessment}
+              className="h-9 px-4 bg-[var(--color-primary)] text-white text-sm font-medium rounded-[var(--radius-sm)] hover:bg-[var(--color-primary-hover)] disabled:opacity-50 cursor-pointer"
+            >
+              {exportingAll ? "Exporting..." : "Export All Users"}
+            </button>
+          </div>
+
           {/* Summary Cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className={`${card} p-5`}>
@@ -659,14 +744,14 @@ export default function Results({ batches }: Props) {
                       <td className="px-5 py-3">
                         <div className="flex gap-2">
                           <button
-                            onClick={() => handleViewAttemptResults(ur.attempt_id!)}
+                            onClick={() => handleViewAttemptResults(ur.attempt_id || "")}
                             disabled={!ur.attempt_id}
                             className="px-2 py-1.5 text-xs font-medium rounded bg-[var(--color-primary)] text-white hover:bg-[var(--color-primary-hover)] disabled:opacity-50 cursor-pointer transition-colors"
                           >
                             View
                           </button>
                           <button
-                            onClick={() => handleViewTopics(ur.attempt_id!, ur.user_name)}
+                            onClick={() => ur.attempt_id && handleViewTopics(ur.attempt_id, ur.user_name)}
                             disabled={loadingTopics || !ur.attempt_id}
                             className="px-2 py-1.5 text-xs font-medium rounded bg-purple-100 text-purple-700 hover:bg-purple-200 disabled:opacity-50 cursor-pointer transition-colors"
                           >
@@ -685,7 +770,7 @@ export default function Results({ batches }: Props) {
                             <>
                               {ur.evaluation_error_category !== "content_filtered" && (
                                 <button
-                                  onClick={() => handleRetryEvaluation(ur.evaluation_job_id!)}
+                                  onClick={() => ur.evaluation_job_id && handleRetryEvaluation(ur.evaluation_job_id)}
                                   disabled={retryingJobId === ur.evaluation_job_id}
                                   className="px-2 py-1.5 text-xs font-medium rounded bg-orange-100 text-orange-700 hover:bg-orange-200 disabled:opacity-50 cursor-pointer transition-colors"
                                 >

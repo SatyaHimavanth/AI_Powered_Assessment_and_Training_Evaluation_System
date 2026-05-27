@@ -1,8 +1,11 @@
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
 from pydantic import BaseModel
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -625,6 +628,109 @@ async def get_attempt_results(
             db.close()
 
     return await run_db_sync(_sync_work)
+
+
+def _safe_filename_part(value: str) -> str:
+    sanitized = re.sub(r'[^A-Za-z0-9._-]+', '_', value.strip())
+    return sanitized.strip('_') or 'value'
+
+
+@router.get("/attempt/{attempt_id}/export")
+async def export_attempt_results(
+    attempt_id: UUID,
+    _admin: User = Depends(require_admin),
+):
+    """Admin: export a specific user's attempt results using the user export format."""
+
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            try:
+                from .results_helpers import build_attempt_results
+            except Exception:
+                raise HTTPException(status_code=500, detail="Failed to load results helper")
+
+            attempt = db.query(Attempt).filter(Attempt.id == attempt_id).first()
+            if not attempt:
+                raise HTTPException(status_code=404, detail="Attempt not found")
+
+            user = db.query(User).filter(User.id == attempt.user_id).first()
+            assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
+            if not assessment:
+                raise HTTPException(status_code=404, detail="Assessment not found")
+
+            try:
+                results = build_attempt_results(db, attempt)
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+
+            username = user.username if user else "unknown"
+            user_name = user.name if user else "Unknown"
+
+            workbook = Workbook()
+            summary_sheet = workbook.active
+            summary_sheet.title = "Summary"
+            summary_sheet.append(["Username", username])
+            summary_sheet.append(["Name", user_name])
+            summary_sheet.append(["Assessment", assessment.title])
+            summary_sheet.append(["Started At", results.get("started_at") or ""])
+            summary_sheet.append(["Submitted At", results.get("submitted_at") or ""])
+            summary_sheet.append(["Status", results.get("status")])
+            summary_sheet.append(["Score", results.get("score") if results.get("score") is not None else "Pending"])
+            summary_sheet.append(["Answered", f"{results.get('answered')}/{results.get('total_questions')}"])
+            summary_sheet.append([])
+            summary_sheet.append(["Topic", "Earned", "Total", "Percentage"])
+            for topic_score in results.get("topic_scores", []):
+                summary_sheet.append([
+                    topic_score.get("topic_name"),
+                    topic_score.get("correct"),
+                    topic_score.get("total"),
+                    topic_score.get("percentage"),
+                ])
+
+            detail_sheet = workbook.create_sheet("Question Review")
+            detail_sheet.append([
+                "Question No",
+                "Topic",
+                "Type",
+                "Question",
+                "Your Answer",
+                "Correct Answer",
+                "Score",
+                "Suggestion",
+            ])
+            for index, answer in enumerate(results.get("answers", []), start=1):
+                detail_sheet.append([
+                    index,
+                    answer.get("topic_name"),
+                    answer.get("question_type"),
+                    answer.get("question_text"),
+                    answer.get("your_answer"),
+                    answer.get("correct_answer"),
+                    answer.get("score") if answer.get("score") is not None else "Pending",
+                    answer.get("suggestion") or "",
+                ])
+
+            buffer = BytesIO()
+            workbook.save(buffer)
+            buffer.seek(0)
+
+            started_at = attempt.started_at or datetime.now(timezone.utc)
+            filename = (
+                f"{_safe_filename_part(username)}_"
+                f"{_safe_filename_part(assessment.title)}_"
+                f"{started_at.strftime('%Y%m%d_%H%M%S')}.xlsx"
+            )
+            return {"buffer": buffer, "filename": filename}
+        finally:
+            db.close()
+
+    payload = await run_db_sync(_sync_work)
+    return StreamingResponse(
+        payload["buffer"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{payload["filename"]}"'},
+    )
 
 
 class UserTopicPerformance(BaseModel):
