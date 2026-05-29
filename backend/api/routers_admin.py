@@ -1197,6 +1197,99 @@ class AdminUsersPaginatedOut(BaseModel):
     total_count: int
 
 
+class AdminCreateUserIn(BaseModel):
+    username: str
+    email: str
+    contact_email: str
+    name: str
+    account: str | None = None
+    password: str
+    role: str = "user"
+
+
+@router.post("/users", response_model=AdminUserOut)
+async def create_user_by_admin(
+    payload: AdminCreateUserIn,
+    _admin: User = Depends(require_admin),
+):
+    """Create an active user/admin account directly from the admin area."""
+    if not payload.password or len(payload.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    try:
+        role = UserRole(payload.role)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            username = payload.username.strip()
+            email = payload.email.strip()
+            contact_email = payload.contact_email.strip()
+            name = payload.name.strip()
+            account = (payload.account or "").strip() or None
+
+            if not username or not email or not contact_email or not name:
+                raise HTTPException(status_code=400, detail="Name, username, email, and contact email are required")
+
+            existing_user = (
+                db.query(User)
+                .filter(
+                    (User.username == username)
+                    | (User.email == email)
+                    | (User.contact_email == contact_email)
+                )
+                .first()
+            )
+            if existing_user:
+                raise HTTPException(status_code=400, detail="A user with same username/email/contact already exists")
+
+            pending_request = (
+                db.query(RegistrationRequest)
+                .filter(
+                    or_(
+                        RegistrationRequest.username == username,
+                        RegistrationRequest.email == email,
+                        RegistrationRequest.contact_email == contact_email,
+                    ),
+                    RegistrationRequest.status == RegistrationStatus.pending,
+                )
+                .first()
+            )
+            if pending_request:
+                raise HTTPException(status_code=400, detail="A pending registration already exists for this username/email/contact")
+
+            user = User(
+                username=username,
+                email=email,
+                contact_email=contact_email,
+                name=name,
+                account=account,
+                hashed_password=get_password_hash(payload.password),
+                role=role,
+                is_active=True,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            return {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "contact_email": user.contact_email,
+                "name": user.name,
+                "account": user.account,
+                "role": user.role.value,
+                "is_active": user.is_active,
+                "created_at": user.created_at,
+            }
+        finally:
+            db.close()
+
+    return await run_db_sync(_sync_work)
+
+
 @router.get("/pending-registrations", response_model=List[PendingRegistrationOut])
 async def get_pending_registrations(
     _admin: User = Depends(require_admin),
@@ -1317,7 +1410,7 @@ async def list_users(
     def _sync_work():
         db = SessionLocal()
         try:
-            q = db.query(User).filter(User.role == UserRole.user)
+            q = db.query(User)
 
             if search:
                 search_term = f"%{search}%"

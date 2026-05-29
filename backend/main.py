@@ -28,21 +28,21 @@ from db.database import Base, SessionLocal, engine
 from db.models import Batch, BatchStatus, BatchUser, RegistrationRequest, RegistrationStatus, User, UserRole
 
 # ---------- Default credentials ---------- #
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"
-DEFAULT_ADMIN_EMAIL = "admin@assessment.com"
-DEFAULT_ADMIN_CONTACT_EMAIL = "admin@assessment.com"
-DEFAULT_ADMIN_NAME = "System Admin"
+DEFAULT_ADMIN_USERNAME = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
+DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
+DEFAULT_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@assessment.com")
+DEFAULT_ADMIN_CONTACT_EMAIL = os.getenv("DEFAULT_ADMIN_CONTACT_EMAIL", "admin@assessment.com")
+DEFAULT_ADMIN_NAME = os.getenv("DEFAULT_ADMIN_NAME", "System Admin")
 
-DEFAULT_USER_USERNAME = "user"
-DEFAULT_USER_PASSWORD = "user123"
-DEFAULT_USER_EMAIL = "user@assessment.com"
-DEFAULT_USER_CONTACT_EMAIL = "user@assessment.com"
-DEFAULT_USER_NAME = "Default User"
+DEFAULT_USER_USERNAME = os.getenv("DEFAULT_USER_USERNAME", "user")
+DEFAULT_USER_PASSWORD = os.getenv("DEFAULT_USER_PASSWORD", "user123")
+DEFAULT_USER_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "user@assessment.com")
+DEFAULT_USER_CONTACT_EMAIL = os.getenv("DEFAULT_USER_CONTACT_EMAIL", "user@assessment.com")
+DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Default User")
 
-DEFAULT_BATCH_NAME = "Default Batch"
+DEFAULT_BATCH_NAME = os.getenv("DEFAULT_BATCH_NAME", "Default Batch")
 
-REGISTRATION_EXPIRY_DAYS = 14
+REGISTRATION_EXPIRY_DAYS = int(os.getenv("REGISTRATION_EXPIRY_DAYS", "14"))
 
 
 def seed_defaults(db):

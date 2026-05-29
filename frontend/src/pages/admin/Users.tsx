@@ -28,6 +28,16 @@ interface UserPerformanceReport {
 }
 
 export default function Users({ users: initialUsers, batches, setMessage, reloadUsers }: Props) {
+  const emptyCreateForm = {
+    name: "",
+    username: "",
+    email: "",
+    contact_email: "",
+    account: "",
+    password: "",
+    confirmPassword: "",
+    role: "user",
+  };
   const [searchQuery, setSearchQuery] = useState("");
   const [users, setUsers] = useState<UserInfo[]>(initialUsers);
   const [totalCount, setTotalCount] = useState(initialUsers.length);
@@ -52,6 +62,10 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [savingPassword, setSavingPassword] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [createForm, setCreateForm] = useState(emptyCreateForm);
+  const [createSameEmail, setCreateSameEmail] = useState(false);
+  const [savingCreate, setSavingCreate] = useState(false);
 
   // Load users from server with pagination
   const loadUsers = async (pg?: number, ps?: number, search?: string) => {
@@ -88,6 +102,69 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
   const handleSearch = () => {
     setCurrentPage(1);
     loadUsers(1, pageSize, searchQuery);
+  };
+
+  const openCreateModal = () => {
+    setCreateForm(emptyCreateForm);
+    setCreateSameEmail(false);
+    setShowCreateModal(true);
+  };
+
+  const handleCreateChange = (field: keyof typeof emptyCreateForm, value: string) => {
+    setCreateForm((prev) => {
+      if (field === "email" && createSameEmail) {
+        return { ...prev, email: value, contact_email: value };
+      }
+      return { ...prev, [field]: value };
+    });
+  };
+
+  const handleCreateSameEmailToggle = (checked: boolean) => {
+    setCreateSameEmail(checked);
+    if (checked) {
+      setCreateForm((prev) => ({ ...prev, contact_email: prev.email }));
+    }
+  };
+
+  const handleCreateUser = async () => {
+    if (!createForm.name.trim() || !createForm.username.trim() || !createForm.email.trim() || !createForm.contact_email.trim()) {
+      setMessage("Name, username, email, and contact email are required.");
+      return;
+    }
+    if (createForm.password.length < 6) {
+      setMessage("Password must be at least 6 characters.");
+      return;
+    }
+    if (createForm.password !== createForm.confirmPassword) {
+      setMessage("Passwords do not match.");
+      return;
+    }
+
+    setSavingCreate(true);
+    try {
+      await api.post("/admin/users", {
+        name: createForm.name,
+        username: createForm.username,
+        email: createForm.email,
+        contact_email: createForm.contact_email,
+        account: createForm.account,
+        password: createForm.password,
+        role: createForm.role,
+      });
+      setMessage(`${createForm.role === "admin" ? "Admin" : "User"} '${createForm.username}' created successfully.`);
+      setShowCreateModal(false);
+      setCreateForm(emptyCreateForm);
+      setCreateSameEmail(false);
+      setCurrentPage(1);
+      await loadUsers(1, pageSize, searchQuery);
+      reloadUsers();
+    } catch (err: unknown) {
+      console.error(err);
+      const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail;
+      setMessage(detail || "Failed to create user");
+    } finally {
+      setSavingCreate(false);
+    }
   };
 
   // Handle pagination
@@ -204,6 +281,72 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
 
   return (
     <div className="space-y-6">
+      {/* Create User Modal */}
+      {showCreateModal && (
+        <div className="fixed inset-0 z-50 overflow-auto flex items-start md:items-center justify-center bg-black/60">
+          <div className="bg-white rounded-lg shadow-2xl w-full max-w-lg max-h-[90vh] mx-4 my-6 overflow-y-auto">
+            <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-semibold">Create Account</h3>
+                <p className="text-sm text-gray-500">Add a user or admin directly.</p>
+              </div>
+              <button onClick={() => setShowCreateModal(false)} className="text-gray-500 hover:text-gray-700 cursor-pointer">x</button>
+            </div>
+            <div className="p-6 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Full Name *</label>
+                <input type="text" value={createForm.name} onChange={(e) => handleCreateChange("name", e.target.value)} placeholder="John Doe" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Username *</label>
+                <input type="text" value={createForm.username} onChange={(e) => handleCreateChange("username", e.target.value)} placeholder="johndoe" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Email *</label>
+                <input type="email" value={createForm.email} onChange={(e) => handleCreateChange("email", e.target.value)} placeholder="john@example.com" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none" />
+              </div>
+              <div className="flex items-center gap-2">
+                <input id="createSameEmail" type="checkbox" checked={createSameEmail} onChange={(e) => handleCreateSameEmailToggle(e.target.checked)} className="h-4 w-4" />
+                <label htmlFor="createSameEmail" className="text-sm text-gray-600">Email and contact email are same</label>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Contact Email *</label>
+                <input type="email" value={createForm.contact_email} onChange={(e) => handleCreateChange("contact_email", e.target.value)} disabled={createSameEmail} placeholder="john@example.com" className={`w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none ${createSameEmail ? "opacity-50 cursor-not-allowed" : ""}`} />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Account</label>
+                <input type="text" value={createForm.account} onChange={(e) => handleCreateChange("account", e.target.value)} placeholder="e.g. India Ops" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">User Type</label>
+                <select value={createForm.role} onChange={(e) => handleCreateChange("role", e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none bg-white">
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Password *</label>
+                  <input type="password" value={createForm.password} onChange={(e) => handleCreateChange("password", e.target.value)} placeholder="Min 6 chars" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Confirm *</label>
+                  <input type="password" value={createForm.confirmPassword} onChange={(e) => handleCreateChange("confirmPassword", e.target.value)} placeholder="Re-enter" className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:border-blue-500 focus:outline-none" />
+                </div>
+              </div>
+            </div>
+            <div className="px-6 py-4 border-t border-gray-200 flex justify-end gap-3">
+              <button onClick={() => setShowCreateModal(false)} className="px-4 py-2 text-sm font-medium text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 cursor-pointer">
+                Cancel
+              </button>
+              <button onClick={handleCreateUser} disabled={savingCreate} className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 cursor-pointer">
+                {savingCreate ? "Creating..." : "Create Account"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* User Performance Modal */}
       {showDetailModal && selectedUserPerformance && (
         <div className="fixed inset-0 z-50 overflow-auto flex items-start md:items-center justify-center bg-black/60">
@@ -562,6 +705,12 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
           >
             Search
           </button>
+          <button
+            onClick={openCreateModal}
+            className="px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 cursor-pointer"
+          >
+            Create Account
+          </button>
         </div>
 
         {searchQuery && (
@@ -601,6 +750,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
                 <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Username</th>
                 <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Email</th>
                 <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Account</th>
+                <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Role</th>
                 <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Status</th>
                 <th className="text-left px-5 py-3 font-medium text-[var(--color-text-secondary)]">Actions</th>
               </tr>
@@ -612,6 +762,13 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
                   <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{u.username}</td>
                   <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{u.email}</td>
                   <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{u.account || "—"}</td>
+                  <td className="px-5 py-3.5">
+                    <span className={`inline-flex px-2 py-0.5 text-xs font-medium rounded-full ${
+                      u.role === "admin" ? "bg-purple-50 text-purple-700" : "bg-blue-50 text-blue-700"
+                    }`}>
+                      {u.role}
+                    </span>
+                  </td>
                   <td className="px-5 py-3.5">
                     <span className={`inline-flex items-center gap-1.5 text-xs font-medium ${
                       u.is_active ? "text-[var(--color-success)]" : "text-[var(--color-danger)]"
