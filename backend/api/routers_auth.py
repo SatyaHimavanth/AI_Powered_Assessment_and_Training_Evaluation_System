@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta, timezone
-
+import os
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from core.auth import (
     ALGORITHM,
@@ -22,7 +25,7 @@ from db.database import SessionLocal
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-REGISTRATION_EXPIRY_DAYS = 30
+REGISTRATION_EXPIRY_DAYS = int(os.getenv("REGISTRATION_EXPIRY_DAYS", "2"))
 
 
 # ---------- Schemas ---------- #

@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 from typing import List
 from uuid import UUID
@@ -25,6 +26,8 @@ from db.models import (
 
 user_router = APIRouter(prefix="/interviews", tags=["interviews"])
 admin_router = APIRouter(prefix="/admin/interviews", tags=["admin-interviews"])
+
+INTERVIEW_REQUEST_EXPIRY_DAYS = int(os.getenv("INTERVIEW_REQUEST_EXPIRY_DAYS", "2"))
 
 
 class MessageResponse(BaseModel):
@@ -373,12 +376,12 @@ async def get_access_requests(
         db = SessionLocal()
         try:
             now = datetime.now(timezone.utc)
-            # Auto-expire pending requests older than 14 days
+            # Auto-expire pending requests older than the configured window.
             stale_pending = (
                 db.query(InterviewAccessRequest)
                 .filter(
                     InterviewAccessRequest.status == InterviewAccessStatus.pending,
-                    InterviewAccessRequest.requested_at < now - timedelta(days=14),
+                    InterviewAccessRequest.requested_at < now - timedelta(days=INTERVIEW_REQUEST_EXPIRY_DAYS),
                 )
                 .all()
             )
@@ -1149,13 +1152,13 @@ async def my_requests(
         db = SessionLocal()
         try:
             now = datetime.now(timezone.utc)
-            # Auto-expire user's own pending requests older than 14 days
+            # Auto-expire user's own pending requests older than the configured window.
             stale = (
                 db.query(InterviewAccessRequest)
                 .filter(
                     InterviewAccessRequest.user_id == current_user.id,
                     InterviewAccessRequest.status == InterviewAccessStatus.pending,
-                    InterviewAccessRequest.requested_at < now - timedelta(days=14),
+                    InterviewAccessRequest.requested_at < now - timedelta(days=INTERVIEW_REQUEST_EXPIRY_DAYS),
                 )
                 .all()
             )

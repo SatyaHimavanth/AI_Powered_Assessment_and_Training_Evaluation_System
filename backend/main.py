@@ -42,7 +42,7 @@ DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Default User")
 
 DEFAULT_BATCH_NAME = os.getenv("DEFAULT_BATCH_NAME", "Default Batch")
 
-REGISTRATION_EXPIRY_DAYS = int(os.getenv("REGISTRATION_EXPIRY_DAYS", "14"))
+REGISTRATION_EXPIRY_DAYS = int(os.getenv("REGISTRATION_EXPIRY_DAYS", "2"))
 
 
 def seed_defaults(db):
