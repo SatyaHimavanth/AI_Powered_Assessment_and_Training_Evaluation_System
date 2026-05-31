@@ -16,6 +16,8 @@ interface BatchItem {
   total_approved: number;
   total_rejected: number;
   requested_count: number;
+  active_saved_count: number;
+  archived_saved_count: number;
   created_at: string;
   completed_at: string | null;
 }
@@ -43,6 +45,21 @@ interface MatchedQuestion {
   options: { option_text: string; is_correct: boolean }[] | null;
 }
 
+interface ArchiveBatchResponse {
+  message: string;
+  approved_count: number;
+  archived_count: number;
+  skipped_count: number;
+  question_ids: string[];
+}
+
+interface RestoreBatchResponse {
+  message: string;
+  restored_count: number;
+  skipped_count: number;
+  question_ids: string[];
+}
+
 export default function QuestionGeneration({ topics, setMessage }: Props) {
   // Generation form state
   const [sourceText, setSourceText] = useState("");
@@ -58,6 +75,10 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
   const [loadingBatches, setLoadingBatches] = useState(false);
   const [batchesTotal, setBatchesTotal] = useState(0);
   const [batchesPage, setBatchesPage] = useState(1);
+  const [batchToArchive, setBatchToArchive] = useState<BatchItem | null>(null);
+  const [batchToRestore, setBatchToRestore] = useState<BatchItem | null>(null);
+  const [archivingBatchId, setArchivingBatchId] = useState<string | null>(null);
+  const [restoringBatchId, setRestoringBatchId] = useState<string | null>(null);
   const batchesPageSize = 10;
 
   // Staged questions for selected batch
@@ -99,14 +120,14 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
     }
   };
 
-  const loadStaged = async () => {
-    if (!selectedBatchId) return;
+  const loadStaged = async (batchId = selectedBatchId, statusOverride = filterStatus) => {
+    if (!batchId) return;
     setLoadingStaged(true);
     try {
       const params: Record<string, string | number> = { page: stagedPage, page_size: 20 };
-      if (filterStatus) params.status = filterStatus;
+      if (statusOverride) params.status = statusOverride;
       if (filterBand) params.band = filterBand;
-      const res = await api.get(`/admin/questions/generation/batches/${selectedBatchId}/staged`, { params });
+      const res = await api.get(`/admin/questions/generation/batches/${batchId}/staged`, { params });
       setStaged(res.data.items || []);
       setStagedTotal(res.data.total || 0);
     } catch {
@@ -168,6 +189,47 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
       loadBatches();
     } catch {
       setMessage("Failed to reject question");
+    }
+  };
+
+  const confirmArchiveBatch = async () => {
+    if (!batchToArchive) return;
+    setArchivingBatchId(batchToArchive.id);
+    try {
+      const res = await api.post<ArchiveBatchResponse>(
+        `/admin/questions/generation/batches/${batchToArchive.id}/archive-questions`
+      );
+      setMessage(res.data.message || "Saved questions archived");
+      setBatchToArchive(null);
+      loadBatches();
+      if (selectedBatchId === batchToArchive.id) {
+        loadStaged();
+      }
+    } catch {
+      setMessage("Failed to archive saved questions for this batch");
+    } finally {
+      setArchivingBatchId(null);
+    }
+  };
+
+  const confirmRestoreBatch = async () => {
+    if (!batchToRestore) return;
+    setRestoringBatchId(batchToRestore.id);
+    try {
+      const res = await api.post<RestoreBatchResponse>(
+        `/admin/questions/generation/batches/${batchToRestore.id}/restore-archived-questions`
+      );
+      setMessage(res.data.message || "Archived questions moved to review");
+      setBatchToRestore(null);
+      setSelectedBatchId(batchToRestore.id);
+      setFilterStatus("pending");
+      setStagedPage(1);
+      loadBatches();
+      loadStaged(batchToRestore.id, "pending");
+    } catch {
+      setMessage("Failed to move archived questions back to review");
+    } finally {
+      setRestoringBatchId(null);
     }
   };
 
@@ -307,9 +369,33 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
                     {b.total_generated} generated · {b.total_approved} approved · {b.total_rejected} rejected
                   </span>
                 </div>
-                <span className="text-xs text-gray-400">
-                  {new Date(b.created_at).toLocaleDateString()}
-                </span>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-gray-400">
+                    {new Date(b.created_at).toLocaleDateString()}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBatchToArchive(b);
+                    }}
+                    disabled={b.active_saved_count === 0 || archivingBatchId === b.id}
+                    className="text-xs px-3 py-1 border border-red-200 text-red-700 rounded hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {archivingBatchId === b.id ? "Archiving..." : "Archive saved"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBatchToRestore(b);
+                    }}
+                    disabled={(b.archived_saved_count === 0 && b.total_rejected === 0) || restoringBatchId === b.id}
+                    className="text-xs px-3 py-1 border border-blue-200 text-blue-700 rounded hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {restoringBatchId === b.id ? "Moving..." : "Unarchive"}
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -454,6 +540,90 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
               )}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Archive Batch Questions Modal */}
+      {batchToArchive && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setBatchToArchive(null)}>
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-lg m-4" onClick={(e) => e.stopPropagation()}>
+            <div className="border-b px-6 py-4 flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-semibold">Archive Saved Questions</h3>
+                <p className="text-sm text-gray-500">Archive question-bank rows created from this AI batch.</p>
+              </div>
+              <button onClick={() => setBatchToArchive(null)} className="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-gray-600">
+                This archives saved questions from this generation batch and removes them from active question lists.
+                Staged review history will remain visible here.
+              </p>
+              <div className="bg-gray-50 rounded p-4 text-sm text-gray-700">
+                <div className="font-medium">{batchToArchive.total_generated} generated</div>
+                <div>{batchToArchive.active_saved_count} active saved</div>
+                <div>{batchToArchive.archived_saved_count} already archived</div>
+                <div>{batchToArchive.total_rejected} rejected</div>
+              </div>
+            </div>
+            <div className="border-t px-6 py-4 flex gap-3 justify-end">
+              <button
+                onClick={() => setBatchToArchive(null)}
+                className="text-sm px-4 py-2 border rounded hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmArchiveBatch}
+                disabled={archivingBatchId === batchToArchive.id}
+                className="text-sm px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {archivingBatchId === batchToArchive.id ? "Archiving..." : "Archive Questions"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Restore Archived Batch Questions Modal */}
+      {batchToRestore && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setBatchToRestore(null)}>
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-lg m-4" onClick={(e) => e.stopPropagation()}>
+            <div className="border-b px-6 py-4 flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-semibold">Unarchive To Review</h3>
+                <p className="text-sm text-gray-500">Move archived or rejected generated questions back to pending review.</p>
+              </div>
+              <button onClick={() => setBatchToRestore(null)} className="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-gray-600">
+                Archived question-bank rows will stay archived. Archived saved questions and rejected generated questions
+                will become pending, so you can approve only the questions that should be added again.
+              </p>
+              <div className="bg-gray-50 rounded p-4 text-sm text-gray-700">
+                <div className="font-medium">{batchToRestore.total_generated} generated</div>
+                <div>{batchToRestore.archived_saved_count} archived saved</div>
+                <div>{batchToRestore.total_rejected} rejected</div>
+                <div>{batchToRestore.active_saved_count} active saved</div>
+              </div>
+            </div>
+            <div className="border-t px-6 py-4 flex gap-3 justify-end">
+              <button
+                onClick={() => setBatchToRestore(null)}
+                className="text-sm px-4 py-2 border rounded hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmRestoreBatch}
+                disabled={restoringBatchId === batchToRestore.id}
+                className="text-sm px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {restoringBatchId === batchToRestore.id ? "Moving..." : "Move To Review"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

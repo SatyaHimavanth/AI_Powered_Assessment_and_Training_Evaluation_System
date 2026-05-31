@@ -7,7 +7,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 # from fastapi.staticfiles import StaticFiles
 # from fastapi.responses import FileResponse
-from sqlalchemy import text
 
 load_dotenv()
 
@@ -24,6 +23,7 @@ from api.routers_question_generation import router as question_generation_router
 from core.auth import get_password_hash
 from core.evaluation_service import start_evaluation_job_consumer
 from core.setup_demo_db import create_demo_db_for_tests
+from core.vector_store import ensure_pgvector_ready
 from db.database import Base, SessionLocal, engine
 from db.models import Batch, BatchStatus, BatchUser, RegistrationRequest, RegistrationStatus, User, UserRole
 
@@ -125,7 +125,9 @@ def auto_reject_expired_registrations(db):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    ensure_pgvector_ready()
     Base.metadata.create_all(bind=engine)
+    ensure_pgvector_ready()
     print("[OK] Database tables created")
 
     db = SessionLocal()

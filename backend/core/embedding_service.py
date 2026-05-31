@@ -2,22 +2,17 @@
 Embedding service for question similarity checking.
 
 Computes embeddings for questions and manages similarity searches
-using the vector store abstraction layer.
+using pgvector.
 """
 
-import logging
 import os
 from typing import List, Optional, Tuple
 from uuid import UUID
 
-from sqlalchemy import select
-
 from app.llms import get_embeddings_model
-from core.vector_store import get_vector_store, EMBEDDING_DIM
+from core.vector_store import EMBEDDING_DIM, search_question_embeddings
 from db.database import SessionLocal
-from db.models import QuestionEmbedding, Question
-
-logger = logging.getLogger(__name__)
+from db.models import QuestionEmbedding
 
 # Similarity thresholds (cosine similarity 0.0 - 1.0)
 THRESHOLD_HIGH_DUP = float(os.getenv("SIMILARITY_THRESHOLD_HIGH_DUP", "0.10"))
@@ -80,8 +75,11 @@ def store_question_embedding(
     text: str,
     embedding: List[float],
 ) -> UUID:
-    """Store an embedding in the database and vector store."""
+    """Store an embedding in pgvector."""
     import uuid as uuid_mod
+
+    if len(embedding) != EMBEDDING_DIM:
+        raise ValueError(f"Expected embedding dimension {EMBEDDING_DIM}, got {len(embedding)}")
 
     db = SessionLocal()
     try:
@@ -96,10 +94,6 @@ def store_question_embedding(
         db.commit()
         db.refresh(emb_record)
 
-        # Add to vector store index
-        store = get_vector_store()
-        store.add_embeddings([emb_record.id], [embedding])
-
         return emb_record.id
     finally:
         db.close()
@@ -113,25 +107,10 @@ def find_similar_questions(
     Returns list of (question_id, similarity_score, match_band).
     """
     embedding = compute_single_embedding(text)
-    store = get_vector_store()
-    results = store.search(embedding, top_k=top_k)
-
-    # Map embedding IDs back to question IDs
-    if not results:
-        return []
-
-    db = SessionLocal()
-    try:
-        output = []
-        for emb_id, score in results:
-            row = db.execute(
-                select(QuestionEmbedding.question_id).where(QuestionEmbedding.id == emb_id)
-            ).scalar_one_or_none()
-            if row:
-                output.append((row, score, get_match_band(score)))
-        return output
-    finally:
-        db.close()
+    return [
+        (question_id, score, get_match_band(score))
+        for question_id, score in search_question_embeddings(embedding, top_k=top_k)
+    ]
 
 
 def check_similarity(text: str) -> Tuple[float, UUID | None, str]:
@@ -144,28 +123,3 @@ def check_similarity(text: str) -> Tuple[float, UUID | None, str]:
         return (0.0, None, "unique")
     q_id, score, band = results[0]
     return (score, q_id, band)
-
-
-def rebuild_vector_index():
-    """
-    Rebuild the vector store index from all stored embeddings.
-    Useful after switching from FAISS to pgvector or vice versa.
-    """
-    db = SessionLocal()
-    try:
-        embeddings = db.execute(
-            select(QuestionEmbedding.id, QuestionEmbedding.embedding)
-            .where(QuestionEmbedding.question_id.isnot(None))
-        ).fetchall()
-
-        if not embeddings:
-            logger.info("No embeddings to rebuild index from")
-            return
-
-        store = get_vector_store()
-        ids = [row[0] for row in embeddings]
-        vectors = [row[1] for row in embeddings]
-        store.add_embeddings(ids, vectors)
-        logger.info(f"Rebuilt vector index with {len(ids)} embeddings")
-    finally:
-        db.close()
