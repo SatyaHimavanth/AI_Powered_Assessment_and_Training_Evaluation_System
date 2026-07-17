@@ -21,6 +21,7 @@ from core.auth import (
 from db.models import RegistrationRequest, RegistrationStatus, User
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
+from api.timezone_helper import as_utc_aware
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -112,7 +113,7 @@ async def register(payload: UserRegister):
                 )
                 .filter(RegistrationRequest.status == RegistrationStatus.rejected)
                 .filter(
-                    RegistrationRequest.resolved_at
+                    as_utc_aware(RegistrationRequest.resolved_at)
                     > datetime.now(timezone.utc) - timedelta(days=REGISTRATION_EXPIRY_DAYS)
                 )
                 .first()

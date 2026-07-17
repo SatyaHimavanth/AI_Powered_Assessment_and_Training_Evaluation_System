@@ -26,6 +26,7 @@ from db.models import (
     PracticeTestStatus,
     User,
 )
+from api.timezone_helper import as_utc_aware
 
 router = APIRouter(prefix="/practice", tags=["practice"])
 

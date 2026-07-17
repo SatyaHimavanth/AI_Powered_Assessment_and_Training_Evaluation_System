@@ -23,6 +23,7 @@ from db.models import (
     InterviewTemplate,
     User,
 )
+from api.timezone_helper import as_utc_aware
 
 user_router = APIRouter(prefix="/interviews", tags=["interviews"])
 admin_router = APIRouter(prefix="/admin/interviews", tags=["admin-interviews"])
@@ -777,13 +778,13 @@ async def get_results(
                     q = q.filter(InterviewAccessRequest.user_id == user_id)
                 if date_from:
                     try:
-                        dt_from = datetime.fromisoformat(date_from)
+                        dt_from = as_utc_aware(datetime.fromisoformat(date_from))
                         q = q.filter(InterviewAccessRequest.approved_at >= dt_from)
                     except ValueError:
                         pass
                 if date_to:
                     try:
-                        dt_to = datetime.fromisoformat(date_to)
+                        dt_to = as_utc_aware(datetime.fromisoformat(date_to))
                         dt_to = dt_to.replace(hour=23, minute=59, second=59)
                         q = q.filter(InterviewAccessRequest.approved_at <= dt_to)
                     except ValueError:
@@ -846,13 +847,13 @@ async def get_results(
                     pass
             if date_from:
                 try:
-                    dt_from = datetime.fromisoformat(date_from)
+                    dt_from = as_utc_aware(datetime.fromisoformat(date_from))
                     q = q.filter(InterviewSession.created_at >= dt_from)
                 except ValueError:
                     pass
             if date_to:
                 try:
-                    dt_to = datetime.fromisoformat(date_to)
+                    dt_to = as_utc_aware(datetime.fromisoformat(date_to))
                     dt_to = dt_to.replace(hour=23, minute=59, second=59)
                     q = q.filter(InterviewSession.created_at <= dt_to)
                 except ValueError:
@@ -1321,7 +1322,7 @@ async def start_interview(
             )
             if not approved:
                 raise HTTPException(status_code=403, detail="Interview access not approved")
-            if approved.expires_at and approved.expires_at < datetime.now(timezone.utc):
+            if approved.expires_at and as_utc_aware(approved.expires_at) < datetime.now(timezone.utc):
                 approved.status = InterviewAccessStatus.expired
                 db.commit()
                 raise HTTPException(status_code=403, detail="Approved access expired. Please request again")

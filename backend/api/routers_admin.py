@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from core.auth import get_password_hash, require_admin
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
+from api.timezone_helper import as_utc_aware, parse_to_utc_aware
 from db.models import (
     Batch,
     BatchUser,
@@ -899,7 +900,7 @@ async def get_stalled_evaluations(
             for job, attempt, user in stalled_jobs:
                 assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
                 time_elapsed = int(
-                    (datetime.now(timezone.utc) - job.created_at).total_seconds()
+                    (datetime.now(timezone.utc) - as_utc_aware(job.created_at)).total_seconds()
                     / 60
                 )
 
@@ -1669,8 +1670,8 @@ async def create_assessment_from_import(
                     raw = raw[:-1] + "+00:00"
                 dt = datetime.fromisoformat(raw)
                 if dt.tzinfo is None:
-                    return dt
-                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+                    return dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
 
             start_dt = None
             end_dt = None

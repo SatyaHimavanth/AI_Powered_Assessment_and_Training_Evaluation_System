@@ -292,7 +292,7 @@ async def get_my_assessments(
                         status = "incomplete"
                     else:
                         status = "missed"
-                elif a.end_time and now > a.end_time:
+                elif a.end_time and now > _as_utc_aware(a.end_time):
                     status = "missed"
                 else:
                     status = "pending"
@@ -362,7 +362,7 @@ async def start_assessment(
                 # Allow resumption if in_progress and within duration window
                 if existing.status == AttemptStatus.in_progress:
                     now_naive = datetime.now(timezone.utc)
-                    time_elapsed = (now_naive - existing.started_at) if existing.started_at else timedelta.max
+                    time_elapsed = (now_naive - _as_utc_aware(existing.started_at)) if existing.started_at else timedelta.max
                     if time_elapsed < timedelta(minutes=assessment.duration):
                         # Return existing attempt data for resumption
                         aq_links = (
@@ -435,7 +435,7 @@ async def start_assessment(
                         saved_answers_out = [SavedAnswerOut(question_id=(a.assessment_item_id or a.question_id), answer=a.answer or "") for a in saved]
 
                         # Calculate time already elapsed
-                        elapsed = int((now_naive - existing.started_at).total_seconds()) if existing.started_at else 0
+                        elapsed = int((now_naive - _as_utc_aware(existing.started_at)).total_seconds()) if existing.started_at else 0
 
                         return StartAttemptResponse(
                             attempt_id=existing.id,
@@ -457,9 +457,9 @@ async def start_assessment(
     
             # Create new attempt
             now = datetime.now(timezone.utc)
-            if assessment.start_time and now < assessment.start_time:
+            if assessment.start_time and now < _as_utc_aware(assessment.start_time):
                 raise HTTPException(status_code=400, detail="Assessment has not started yet")
-            if assessment.end_time and now > assessment.end_time:
+            if assessment.end_time and now > _as_utc_aware(assessment.end_time):
                 raise HTTPException(status_code=400, detail="Assessment time window has ended")
 
             # Create attempt

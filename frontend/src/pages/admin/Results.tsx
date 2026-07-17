@@ -757,7 +757,7 @@ export default function Results({ batches }: Props) {
                           >
                             Topics
                           </button>
-                          {(ur.status === "missed" || ur.status === "in_progress") && (
+                          {(ur.status === "missed" || ur.status === "in_progress" || ur.status === "completed") && (
                             <button
                               onClick={() => handleResetAttempt(ur.attempt_id, ur.user_name)}
                               disabled={resettingAttemptId === ur.attempt_id}
