@@ -34,31 +34,9 @@ from db.models import (
     Topic,
     User,
 )
+from api.timezone_helper import parse_to_utc_aware, as_utc_aware, to_utc_iso
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
-
-
-def _parse_to_utc_naive(value: str) -> datetime:
-    """Parse ISO string to a UTC-aware datetime."""
-    raw = value.strip()
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-
-    dt = datetime.fromisoformat(raw)
-    if dt.tzinfo is None:
-        # Treat naive datetime as UTC.
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _to_utc_iso(dt: datetime | None) -> str | None:
-    if not dt:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.isoformat().replace("+00:00", "Z")
 
 
 # ---------- Schemas ---------- #
@@ -203,12 +181,12 @@ async def create_assessment(
     end_dt = None
     if body.start_time:
         try:
-            start_dt = _parse_to_utc_naive(body.start_time)
+            start_dt = parse_to_utc_aware(body.start_time)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid start_time format (use ISO format)")
     if body.end_time:
         try:
-            end_dt = _parse_to_utc_naive(body.end_time)
+            end_dt = parse_to_utc_aware(body.end_time)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid end_time format (use ISO format)")
     if start_dt and end_dt and end_dt <= start_dt:
@@ -371,9 +349,9 @@ async def create_assessment(
                 "total_questions": total_questions,
                 "topics": topic_results,
                 "batch_names": batch_names,
-                "start_time": _to_utc_iso(assessment.start_time),
-                "end_time": _to_utc_iso(assessment.end_time),
-                "created_at": assessment.created_at.isoformat(),
+                "start_time": to_utc_iso(assessment.start_time),
+                "end_time": to_utc_iso(assessment.end_time),
+                "created_at": to_utc_iso(assessment.created_at),
             }
         finally:
             db.close()
@@ -443,9 +421,9 @@ async def list_assessments(
                     is_archived=getattr(a, "is_archived", False),
                     total_questions=total_q,
                     batch_names=b_names,
-                    start_time=_to_utc_iso(a.start_time),
-                    end_time=_to_utc_iso(a.end_time),
-                    created_at=a.created_at.isoformat(),
+                    start_time=to_utc_iso(a.start_time),
+                    end_time=to_utc_iso(a.end_time),
+                    created_at=to_utc_iso(a.created_at),
                 ))
 
             return AssessmentListResponse(items=result, total=total, page=(page if limit and limit > 0 else 1), limit=(limit if limit and limit > 0 else total))
@@ -519,9 +497,9 @@ async def get_assessment(
                 total_questions=total_q,
                 topics=topic_results,
                 batch_names=b_names,
-                start_time=_to_utc_iso(assessment.start_time),
-                end_time=_to_utc_iso(assessment.end_time),
-                created_at=assessment.created_at.isoformat(),
+                start_time=to_utc_iso(assessment.start_time),
+                end_time=to_utc_iso(assessment.end_time),
+                created_at=to_utc_iso(assessment.created_at),
             )
         finally:
             db.close()
@@ -602,7 +580,7 @@ async def edit_assessment(
             start_dt = None
         else:
             try:
-                start_dt = _parse_to_utc_naive(body.start_time)
+                start_dt = parse_to_utc_aware(body.start_time)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid start_time format")
 
@@ -611,7 +589,7 @@ async def edit_assessment(
             end_dt = None
         else:
             try:
-                end_dt = _parse_to_utc_naive(body.end_time)
+                end_dt = parse_to_utc_aware(body.end_time)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid end_time format")
 
@@ -783,8 +761,8 @@ async def get_assessment_results(
                     username=user.username if user else "unknown",
                     score=score,
                     status=("evaluating" if attempt.status == AttemptStatus.completed and score is None else (attempt.status.value if attempt.status else "unknown")),
-                    started_at=attempt.started_at.isoformat() if attempt.started_at else None,
-                    submitted_at=attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+                    started_at=to_utc_iso(attempt.started_at),
+                    submitted_at=to_utc_iso(attempt.submitted_at),
                     total_answered=answer_count,
                     evaluation_status=eval_job.status.value if eval_job else None,
                     evaluation_job_id=eval_job.id if eval_job else None,
@@ -991,8 +969,8 @@ async def export_assessment_results(
                     "username": user.username if user else "unknown",
                     "score": score,
                     "status": status,
-                    "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
-                    "submitted_at": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+                    "started_at": to_utc_iso(attempt.started_at),
+                    "submitted_at": to_utc_iso(attempt.submitted_at),
                     "total_answered": answer_count,
                     "evaluation_status": eval_job.status.value if eval_job else None,
                 })

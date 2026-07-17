@@ -23,7 +23,7 @@ from db.models import (
     InterviewTemplate,
     User,
 )
-from api.timezone_helper import as_utc_aware
+from api.timezone_helper import as_utc_aware, to_utc_iso
 
 user_router = APIRouter(prefix="/interviews", tags=["interviews"])
 admin_router = APIRouter(prefix="/admin/interviews", tags=["admin-interviews"])
@@ -1366,7 +1366,7 @@ async def start_interview(
                 {
                     "role": "assistant",
                     "content": opening,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": to_utc_iso(datetime.now(timezone.utc)),
                 }
             ]
             db.commit()
@@ -1421,7 +1421,7 @@ async def interview_message(
                 {
                     "role": "user",
                     "content": response_text,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": to_utc_iso(datetime.now(timezone.utc)),
                 }
             )
 
@@ -1466,7 +1466,7 @@ async def interview_message(
                 {
                     "role": "assistant",
                     "content": ai_message,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": to_utc_iso(datetime.now(timezone.utc)),
                 }
             )
             session.transcript = transcript

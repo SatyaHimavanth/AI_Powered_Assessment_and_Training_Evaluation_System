@@ -1,10 +1,12 @@
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 # from fastapi.staticfiles import StaticFiles
 # from fastapi.responses import FileResponse
 
@@ -198,6 +200,18 @@ app.include_router(question_generation_router)
 # @app.get("/")
 # def root():
 #     return {"message": "AI Assessment System API is running"}
+
+
+@app.get("/speed-test")
+async def speed_test(size: int = Query(default=512000, ge=1024, le=10_000_000)):
+    """Return a payload of random bytes for network speed measurement.
+
+    Default size is 500 KB.  The client measures download time to estimate
+    throughput.  Random bytes prevent transparent compression from inflating
+    the result.
+    """
+    payload = secrets.token_bytes(size)
+    return Response(content=payload, media_type="application/octet-stream")
 
 
 if __name__ == "__main__":

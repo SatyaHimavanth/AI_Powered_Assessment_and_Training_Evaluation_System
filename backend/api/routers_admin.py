@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from core.auth import get_password_hash, require_admin
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
-from api.timezone_helper import as_utc_aware, parse_to_utc_aware
+from api.timezone_helper import as_utc_aware, parse_to_utc_aware, to_utc_iso
 from db.models import (
     Batch,
     BatchUser,
@@ -620,8 +620,8 @@ async def get_attempt_results(
                 "total_questions": total_questions,
                 "answered": answered,
                 "correct_count": correct_count,
-                "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
-                "submitted_at": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+                "started_at": to_utc_iso(attempt.started_at),
+                "submitted_at": to_utc_iso(attempt.submitted_at),
                 "topic_scores": topic_scores,
                 "answers": answers_out,
             }
@@ -1811,7 +1811,7 @@ async def create_assessment_from_import(
                 "batch_names": batch_names,
                 "start_time": None,
                 "end_time": None,
-                "created_at": assessment.created_at.isoformat(),
+                "created_at": to_utc_iso(assessment.created_at),
             }
         finally:
             db.close()

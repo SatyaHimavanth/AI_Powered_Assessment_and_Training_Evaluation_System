@@ -1,5 +1,6 @@
 from typing import Any
 from sqlalchemy.orm import Session
+from api.timezone_helper import to_utc_iso
 
 
 def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
@@ -194,8 +195,8 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
         "total_questions": total_questions,
         "answered": answered,
         "correct_count": correct_count,
-        "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
-        "submitted_at": attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+        "started_at": to_utc_iso(attempt.started_at),
+        "submitted_at": to_utc_iso(attempt.submitted_at),
         "topic_scores": topic_scores,
         "answers": answers_out,
     }

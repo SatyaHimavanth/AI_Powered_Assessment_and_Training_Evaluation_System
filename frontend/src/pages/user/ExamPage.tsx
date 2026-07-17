@@ -93,19 +93,24 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     setSpeedTesting(true);
     setSpeedMbps(null);
     try {
-      // Download a known-size payload to estimate speed
-      const testUrl = `${window.location.origin}/src/assets/react.svg?t=${Date.now()}`;
+      // Download a known-size payload from the API to estimate real throughput.
+      // The endpoint returns random bytes (default 500 KB) to prevent
+      // transparent compression from inflating the measured speed.
+      const apiUrl = import.meta.env.VITE_API_URL || "";
+      const testUrl = `${apiUrl}/speed-test?size=524288&_t=${Date.now()}`;
       const startTime = performance.now();
       const response = await fetch(testUrl, { cache: "no-store" });
       const blob = await response.blob();
       const endTime = performance.now();
       const durationSec = (endTime - startTime) / 1000;
-      const sizeBytes = blob.size || 1024; // fallback
+      if (durationSec <= 0 || blob.size === 0) {
+        setSpeedMbps(0);
+        return;
+      }
+      const sizeBytes = blob.size;
       const speedBps = (sizeBytes * 8) / durationSec;
       const mbps = speedBps / 1_000_000;
-      // For small files, estimate conservatively (simulate with minimum 0.5)
-      const estimated = Math.max(mbps, 0.1);
-      setSpeedMbps(Math.round(estimated * 100) / 100);
+      setSpeedMbps(Math.round(mbps * 100) / 100);
     } catch {
       // If fetch fails, network might be down
       setSpeedMbps(0);

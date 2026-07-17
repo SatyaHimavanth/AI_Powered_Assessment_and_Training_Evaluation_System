@@ -31,3 +31,15 @@ def parse_to_utc_aware(value: str) -> datetime:
         raw = raw[:-1] + "+00:00"
     dt = datetime.fromisoformat(raw)
     return as_utc_aware(dt)
+
+
+def to_utc_iso(dt: datetime | None) -> str | None:
+    """Format a datetime as a UTC ISO-8601 string ending with 'Z'.
+
+    Returns None for None input.  Handles naive datetimes (treated as UTC)
+    and aware datetimes (converted to UTC).
+    """
+    if dt is None:
+        return None
+    aware = as_utc_aware(dt)
+    return aware.isoformat().replace("+00:00", "Z")

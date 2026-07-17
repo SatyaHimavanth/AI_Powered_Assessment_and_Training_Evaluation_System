@@ -29,6 +29,7 @@ from db.models import (
     StagedQuestionStatus,
     User,
 )
+from api.timezone_helper import to_utc_iso
 
 from sqlalchemy import func, select
 
@@ -220,8 +221,8 @@ def _batch_response(db, batch: QuestionGenerationBatch) -> dict:
         "requested_count": batch.requested_count,
         "active_saved_count": active_saved_count,
         "archived_saved_count": archived_saved_count,
-        "created_at": batch.created_at.isoformat(),
-        "completed_at": batch.completed_at.isoformat() if batch.completed_at else None,
+        "created_at": to_utc_iso(batch.created_at),
+        "completed_at": to_utc_iso(batch.completed_at),
     }
 
 
@@ -286,8 +287,8 @@ async def start_generation(
                 "requested_count": batch.requested_count,
                 "active_saved_count": 0,
                 "archived_saved_count": 0,
-                "created_at": batch.created_at.isoformat(),
-                "completed_at": batch.completed_at.isoformat() if batch.completed_at else None,
+                "created_at": to_utc_iso(batch.created_at),
+                "completed_at": to_utc_iso(batch.completed_at),
             }
         finally:
             db.close()
@@ -581,7 +582,7 @@ async def list_staged_questions(
                     "matched_question_id": str(sq.matched_question_id) if sq.matched_question_id else None,
                     "match_band": sq.match_band.value if sq.match_band else None,
                     "status": sq.status.value,
-                    "created_at": sq.created_at.isoformat(),
+                    "created_at": to_utc_iso(sq.created_at),
                 })
             return {"items": items, "total": total, "page": page, "page_size": page_size}
         finally:

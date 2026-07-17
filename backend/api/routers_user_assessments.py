@@ -39,23 +39,9 @@ from db.models import (
 )
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
+from api.timezone_helper import as_utc_aware, to_utc_iso
 
 router = APIRouter(prefix="/user/assessments", tags=["user-assessments"])
-
-
-def _as_utc_aware(dt: datetime | None) -> datetime | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _to_utc_iso(dt: datetime | None) -> str | None:
-    aware = _as_utc_aware(dt)
-    if aware is None:
-        return None
-    return aware.isoformat().replace("+00:00", "Z")
 
 
 def _attempt_sort_key(attempt: Attempt) -> tuple[datetime, datetime, int, str]:
@@ -66,8 +52,8 @@ def _attempt_sort_key(attempt: Attempt) -> tuple[datetime, datetime, int, str]:
         AttemptStatus.missed: 1,
     }.get(attempt.status, 0)
     return (
-        _as_utc_aware(attempt.started_at) or min_dt,
-        _as_utc_aware(attempt.submitted_at) or min_dt,
+        as_utc_aware(attempt.started_at) or min_dt,
+        as_utc_aware(attempt.submitted_at) or min_dt,
         status_rank,
         str(attempt.id),
     )
@@ -292,7 +278,7 @@ async def get_my_assessments(
                         status = "incomplete"
                     else:
                         status = "missed"
-                elif a.end_time and now > _as_utc_aware(a.end_time):
+                elif a.end_time and now > as_utc_aware(a.end_time):
                     status = "missed"
                 else:
                     status = "pending"
@@ -303,8 +289,8 @@ async def get_my_assessments(
                     description=a.description,
                     duration=a.duration,
                     total_questions=total_q,
-                    start_time=_to_utc_iso(a.start_time),
-                    end_time=_to_utc_iso(a.end_time),
+                    start_time=to_utc_iso(a.start_time),
+                    end_time=to_utc_iso(a.end_time),
                     status=status,
                     attempt_id=str(attempt.id) if attempt else None,
                 ))
@@ -361,8 +347,8 @@ async def start_assessment(
             if existing:
                 # Allow resumption if in_progress and within duration window
                 if existing.status == AttemptStatus.in_progress:
-                    now_naive = datetime.now(timezone.utc)
-                    time_elapsed = (now_naive - _as_utc_aware(existing.started_at)) if existing.started_at else timedelta.max
+                    now_utc = datetime.now(timezone.utc)
+                    time_elapsed = (now_utc - as_utc_aware(existing.started_at)) if existing.started_at else timedelta.max
                     if time_elapsed < timedelta(minutes=assessment.duration):
                         # Return existing attempt data for resumption
                         aq_links = (
@@ -435,7 +421,7 @@ async def start_assessment(
                         saved_answers_out = [SavedAnswerOut(question_id=(a.assessment_item_id or a.question_id), answer=a.answer or "") for a in saved]
 
                         # Calculate time already elapsed
-                        elapsed = int((now_naive - _as_utc_aware(existing.started_at)).total_seconds()) if existing.started_at else 0
+                        elapsed = int((now_utc - as_utc_aware(existing.started_at)).total_seconds()) if existing.started_at else 0
 
                         return StartAttemptResponse(
                             attempt_id=existing.id,
@@ -457,9 +443,9 @@ async def start_assessment(
     
             # Create new attempt
             now = datetime.now(timezone.utc)
-            if assessment.start_time and now < _as_utc_aware(assessment.start_time):
+            if assessment.start_time and now < as_utc_aware(assessment.start_time):
                 raise HTTPException(status_code=400, detail="Assessment has not started yet")
-            if assessment.end_time and now > _as_utc_aware(assessment.end_time):
+            if assessment.end_time and now > as_utc_aware(assessment.end_time):
                 raise HTTPException(status_code=400, detail="Assessment time window has ended")
 
             # Create attempt
@@ -897,7 +883,7 @@ async def export_my_results(
             except ValueError as e:
                 raise HTTPException(status_code=404, detail=str(e))
 
-            return {"results": results, "assessment_title": assessment.title, "attempt_started_at": attempt.started_at.isoformat() if attempt.started_at else None}
+            return {"results": results, "assessment_title": assessment.title, "attempt_started_at": to_utc_iso(attempt.started_at)}
         finally:
             db.close()
 
