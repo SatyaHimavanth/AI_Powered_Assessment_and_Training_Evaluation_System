@@ -1,3 +1,4 @@
+from uuid import UUID
 from typing import Any
 from sqlalchemy.orm import Session
 from api.timezone_helper import to_utc_iso
@@ -142,12 +143,13 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                 if q.type in (QuestionType.single_mcq, QuestionType.multi_mcq):
                     selected_ids = [s for s in user_ans.answer.split(",") if s]
                     if selected_ids:
-                        # convert to ints where possible
-                        try:
-                            sel_ints = [int(s) for s in selected_ids]
-                        except Exception:
-                            sel_ints = selected_ids
-                        selected_opts = db.query(QuestionOption).filter(QuestionOption.id.in_(sel_ints)).all()
+                        selected_opts = db.query(QuestionOption).filter(QuestionOption.id.in_(selected_ids)).all()
+                        if not selected_opts:
+                            try:
+                                uuid_ids = [UUID(s) for s in selected_ids]
+                                selected_opts = db.query(QuestionOption).filter(QuestionOption.id.in_(uuid_ids)).all()
+                            except Exception:
+                                pass
                         user_answer_text = ", ".join(o.option_text for o in selected_opts)
                     else:
                         user_answer_text = ""

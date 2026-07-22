@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.llms import get_chat_model
@@ -653,12 +654,21 @@ async def submit_practice_test(
                     existing_answer.score = score
                     existing_answer.feedback = feedback
                 else:
-                    db.add(PracticeAnswer(
-                        question_id=q.id,
-                        answer=user_answer,
-                        score=score,
-                        feedback=feedback,
-                    ))
+                    try:
+                        db.add(PracticeAnswer(
+                            question_id=q.id,
+                            answer=user_answer,
+                            score=score,
+                            feedback=feedback,
+                        ))
+                        db.flush()
+                    except IntegrityError:
+                        db.rollback()
+                        existing_answer = db.query(PracticeAnswer).filter(PracticeAnswer.question_id == q.id).first()
+                        if existing_answer:
+                            existing_answer.answer = user_answer
+                            existing_answer.score = score
+                            existing_answer.feedback = feedback
 
             # Calculate percentage
             test.score = round((total_score / total_questions) * 100, 1) if total_questions > 0 else 0

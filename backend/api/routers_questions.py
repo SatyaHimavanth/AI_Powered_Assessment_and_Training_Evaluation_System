@@ -667,7 +667,7 @@ async def delete_topic(
                 if mode == "cascade":
                     # Archive questions (keep topic_id so results can still show topic name)
                     db.query(Question).filter(Question.id.in_(q_ids)).update(
-                        {Question.is_archived: True}, synchronize_session=False
+                        {Question.is_archived: True}, synchronize_session='fetch'
                     )
                     topic.is_archived = True
                     db.commit()
@@ -680,7 +680,7 @@ async def delete_topic(
                     if not new_topic:
                         raise HTTPException(status_code=404, detail="Reassign-to topic not found")
                     # reassign questions
-                    db.query(Question).filter(Question.topic_id == topic_id).update({Question.topic_id: reassign_to}, synchronize_session=False)
+                    db.query(Question).filter(Question.topic_id == topic_id).update({Question.topic_id: reassign_to}, synchronize_session='fetch')
                     # archive old topic
                     topic.is_archived = True
                     db.commit()
@@ -829,7 +829,7 @@ async def update_question(
                     if not any(o.get("is_correct") for o in opts):
                         raise HTTPException(status_code=400, detail="At least one option must be marked correct")
                     # Remove existing
-                    db.query(QuestionOption).filter(QuestionOption.question_id == q.id).delete(synchronize_session=False)
+                    db.query(QuestionOption).filter(QuestionOption.question_id == q.id).delete(synchronize_session='fetch')
                     for opt in opts:
                         db.add(QuestionOption(question_id=q.id, option_text=opt.get("text"), is_correct=bool(opt.get("is_correct"))))
                 else:
@@ -842,10 +842,10 @@ async def update_question(
                     tcs = pdata.get("test_cases") or []
                     # Basic validation
                     for tc in tcs:
-                        if (tc.get("input") or "") is None or (tc.get("expected_output") or "") is None:
+                        if not tc.get("input") or not tc.get("expected_output"):
                             raise HTTPException(status_code=400, detail="Test cases must include input and expected_output")
                     # Delete existing and add new
-                    db.query(TestCase).filter(TestCase.question_id == q.id).delete(synchronize_session=False)
+                    db.query(TestCase).filter(TestCase.question_id == q.id).delete(synchronize_session='fetch')
                     for tc in tcs:
                         db.add(TestCase(question_id=q.id, input_data=tc.get("input") or "", expected_output=tc.get("expected_output") or "", is_sample=bool(tc.get("is_sample"))))
                 else:

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column, String, Text, Date, DateTime,
-    Integer, Float, Boolean, ForeignKey, Enum, JSON
+    Integer, Float, Boolean, ForeignKey, Enum, JSON, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -199,7 +199,7 @@ class Topic(Base):
     __tablename__ = "topics"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String)
+    name = Column(String, unique=True)
     description = Column(Text)
     is_archived = Column(Boolean, default=False)
 
@@ -332,6 +332,11 @@ class Attempt(Base):
 class Answer(Base):
     __tablename__ = "answers"
 
+    __table_args__ = (
+        UniqueConstraint('attempt_id', 'question_id', name='uq_answer_attempt_question'),
+        UniqueConstraint('attempt_id', 'assessment_item_id', name='uq_answer_attempt_item'),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     attempt_id = Column(UUID(as_uuid=True), ForeignKey("attempts.id"))
     question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"))
@@ -445,7 +450,7 @@ class PracticeAnswer(Base):
     __tablename__ = "practice_answers"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    question_id = Column(UUID(as_uuid=True), ForeignKey("practice_questions.id"), nullable=False)
+    question_id = Column(UUID(as_uuid=True), ForeignKey("practice_questions.id"), nullable=False, unique=True)
     answer = Column(Text, nullable=True)
     score = Column(Float, nullable=True)
     feedback = Column(Text, nullable=True)

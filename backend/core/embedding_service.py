@@ -15,8 +15,8 @@ from db.database import SessionLocal
 from db.models import QuestionEmbedding
 
 # Similarity thresholds (cosine similarity 0.0 - 1.0)
-THRESHOLD_HIGH_DUP = float(os.getenv("SIMILARITY_THRESHOLD_HIGH_DUP", "0.10"))
-THRESHOLD_REVIEW = float(os.getenv("SIMILARITY_THRESHOLD_REVIEW", "0.10"))
+THRESHOLD_HIGH_DUP = float(os.getenv("SIMILARITY_THRESHOLD_HIGH_DUP", "0.85"))
+THRESHOLD_REVIEW = float(os.getenv("SIMILARITY_THRESHOLD_REVIEW", "0.70"))
 
 
 def get_match_band(score: float) -> str:

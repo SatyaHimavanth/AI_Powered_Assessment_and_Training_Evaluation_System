@@ -9,6 +9,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.llms import get_chat_model
@@ -569,12 +570,19 @@ async def save_answer(
                 if existing:
                     existing.answer = body.answer
                 else:
-                    new_answer = Answer(
-                        attempt_id=attempt_id,
-                        assessment_item_id=body.question_id,
-                        answer=body.answer,
-                    )
-                    db.add(new_answer)
+                    try:
+                        new_answer = Answer(
+                            attempt_id=attempt_id,
+                            assessment_item_id=body.question_id,
+                            answer=body.answer,
+                        )
+                        db.add(new_answer)
+                        db.flush()
+                    except IntegrityError:
+                        db.rollback()
+                        existing = db.query(Answer).filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == body.question_id).first()
+                        if existing:
+                            existing.answer = body.answer
             else:
                 existing = (
                     db.query(Answer)
@@ -584,12 +592,19 @@ async def save_answer(
                 if existing:
                     existing.answer = body.answer
                 else:
-                    new_answer = Answer(
-                        attempt_id=attempt_id,
-                        question_id=body.question_id,
-                        answer=body.answer,
-                    )
-                    db.add(new_answer)
+                    try:
+                        new_answer = Answer(
+                            attempt_id=attempt_id,
+                            question_id=body.question_id,
+                            answer=body.answer,
+                        )
+                        db.add(new_answer)
+                        db.flush()
+                    except IntegrityError:
+                        db.rollback()
+                        existing = db.query(Answer).filter(Answer.attempt_id == attempt_id, Answer.question_id == body.question_id).first()
+                        if existing:
+                            existing.answer = body.answer
 
             db.commit()
             return {"status": "saved"}
@@ -647,8 +662,13 @@ async def submit_assessment(
                 raise HTTPException(status_code=400, detail="This attempt is already finalized")
 
             # Save answers (upsert - some may already exist from auto-save)
+            seen_items: set[str] = set()
             for ans in body.answers:
-                # detect per-assessment item
+                qid_str = str(ans.question_id)
+                if qid_str in seen_items:
+                    continue
+                seen_items.add(qid_str)
+
                 item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == ans.question_id).first()
                 if item:
                     existing_ans = (
@@ -680,12 +700,12 @@ async def submit_assessment(
                             answer=ans.answer,
                         )
                         db.add(answer)
+                db.flush()
 
             attempt.submitted_at = datetime.now(timezone.utc)
             attempt.status = AttemptStatus.completed
-            db.commit()
-            
-            # Create evaluation job instead of direct background task
+
+            # Create evaluation job in the same transaction
             eval_job = EvaluationJob(
                 attempt_id=attempt.id,
                 status=EvaluationJobStatus.pending,
@@ -722,7 +742,13 @@ async def abort_assessment(
                 raise HTTPException(status_code=400, detail="This attempt is already finalized")
 
             # Save partial answers (upsert - some may exist from auto-save)
+            seen_items: set[str] = set()
             for ans in body.answers:
+                qid_str = str(ans.question_id)
+                if qid_str in seen_items:
+                    continue
+                seen_items.add(qid_str)
+
                 if ans.answer.strip():
                     item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == ans.question_id).first()
                     if item:
@@ -755,12 +781,12 @@ async def abort_assessment(
                                 answer=ans.answer,
                             )
                             db.add(answer)
+                    db.flush()
 
             attempt.submitted_at = datetime.now(timezone.utc)
             attempt.status = AttemptStatus.missed  # marked incomplete
-            db.commit()
-            
-            # Create evaluation job instead of direct background task
+
+            # Create evaluation job in the same transaction
             eval_job = EvaluationJob(
                 attempt_id=attempt.id,
                 status=EvaluationJobStatus.pending,

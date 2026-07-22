@@ -1351,7 +1351,7 @@ async def start_interview(
                 feedback={},
             )
             db.add(session)
-            db.commit()
+            db.flush()
             db.refresh(session)
 
             opening = generate_opening_question(

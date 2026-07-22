@@ -48,10 +48,6 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
     Evaluate an attempt by processing all its answers.
     This function mirrors _evaluate_attempt logic but is called from job queue.
     """
-    attempt = db.query(Answer).filter(Answer.attempt_id == attempt_id).first()
-    if not attempt:
-        return
-
     from db.models import Attempt
     attempt_record = db.query(Attempt).filter(Attempt.id == attempt_id).first()
     if not attempt_record:
@@ -67,7 +63,7 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
     topic_totals = {}
     topic_counts = {}
 
-    db.query(TopicScore).filter(TopicScore.attempt_id == attempt_id).delete(synchronize_session=False)
+    db.query(TopicScore).filter(TopicScore.attempt_id == attempt_id).delete(synchronize_session='fetch')
 
     for ans in answers:
         # Support answers referencing either global Question or per-assessment AssessmentQuestionItem

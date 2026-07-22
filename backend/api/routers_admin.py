@@ -1074,13 +1074,13 @@ async def get_practice_access_requests(
                     "username": user.username,
                     "reason": req.reason,
                     "requested_days": req.requested_days,
-                    "requested_tests_per_day": (req.requested_tests_per_day if getattr(req, "requested_tests_per_day", None) else None),
+                    "requested_tests_per_day": req.requested_tests_per_day,
                     "status": req.status.value,
                     "requested_at": req.requested_at,
                     "approved_at": req.approved_at,
                     "expires_at": req.expires_at,
                     "days_granted": req.days_granted,
-                    "tests_per_day_granted": (req.tests_per_day_granted if getattr(req, "tests_per_day_granted", None) else None),
+                    "tests_per_day_granted": req.tests_per_day_granted,
                 })
             return out
         finally:
@@ -1809,8 +1809,8 @@ async def create_assessment_from_import(
                 "total_questions": len(created_question_ids),
                 "topics": [],
                 "batch_names": batch_names,
-                "start_time": None,
-                "end_time": None,
+                "start_time": to_utc_iso(assessment.start_time) if assessment.start_time else None,
+                "end_time": to_utc_iso(assessment.end_time) if assessment.end_time else None,
                 "created_at": to_utc_iso(assessment.created_at),
             }
         finally:

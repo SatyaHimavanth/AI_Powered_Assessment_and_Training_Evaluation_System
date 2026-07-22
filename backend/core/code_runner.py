@@ -271,7 +271,7 @@ def execute_python_code(code: str, stdin_input: str = "") -> ExecutionResult:
             text=True,
             timeout=EXECUTION_TIMEOUT,
             env={
-                **os.environ,
+                "PATH": os.environ.get("PATH", ""),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONIOENCODING": "utf-8",
             },
