@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel
 from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.auth import get_password_hash, require_admin
@@ -94,9 +95,10 @@ async def get_admin_dashboard_counters(
                 .count()
             )
             pending_assessments = (
-                db.query(Assignment)
-                .join(Assessment, Assignment.assessment_id == Assessment.id)
+                db.query(Assessment.id)
+                .join(Assignment, Assessment.id == Assignment.assessment_id)
                 .filter(Assessment.is_archived.is_(False))
+                .distinct()
                 .count()
             )
             in_progress_assessments = (
@@ -205,7 +207,11 @@ async def update_user(
                 user.contact_email = payload.contact_email
             if payload.is_active is not None:
                 user.is_active = payload.is_active
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(status_code=400, detail="Username/email/contact already in use (race)")
             return {"message": f"User '{user.username}' updated successfully."}
         finally:
             db.close()
@@ -317,10 +323,13 @@ async def reset_user_attempt(
             if not attempt:
                 raise HTTPException(status_code=404, detail="Attempt not found")
 
+            if attempt.status == AttemptStatus.in_progress:
+                raise HTTPException(status_code=400, detail="Cannot reset an in-progress attempt. Wait for the user to submit or abort first.")
+
             # Delete all related records first (to respect foreign key constraints)
-            db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt_id).delete()
-            db.query(TopicScore).filter(TopicScore.attempt_id == attempt_id).delete()
-            db.query(Answer).filter(Answer.attempt_id == attempt_id).delete()
+            db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt_id).delete(synchronize_session='fetch')
+            db.query(TopicScore).filter(TopicScore.attempt_id == attempt_id).delete(synchronize_session='fetch')
+            db.query(Answer).filter(Answer.attempt_id == attempt_id).delete(synchronize_session='fetch')
             
             # Now delete the attempt
             db.delete(attempt)
@@ -1112,7 +1121,7 @@ async def approve_practice_access(
             except Exception:
                 system_max = 3
             tests_per_day = None
-            if getattr(payload, "tests_per_day", None) is not None:
+            if payload.tests_per_day is not None:
                 try:
                     tests_per_day = max(1, min(int(payload.tests_per_day), system_max))
                 except Exception:
@@ -1272,7 +1281,11 @@ async def create_user_by_admin(
                 is_active=True,
             )
             db.add(user)
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(status_code=400, detail="A user with same username/email/contact already exists (race)")
             db.refresh(user)
             return {
                 "id": user.id,
@@ -1361,10 +1374,13 @@ async def approve_registration(
                 is_active=True,
             )
             db.add(user)
-
             req.status = RegistrationStatus.approved
             req.resolved_at = datetime.now(timezone.utc)
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(status_code=400, detail="A user with same username/email/contact already exists (race)")
 
             return {"message": f"User '{user.username}' created and registration approved."}
         finally:
@@ -1439,7 +1455,7 @@ async def list_users(
                     "contact_email": u.contact_email,
                     "name": u.name,
                     "account": u.account,
-                    "role": u.role.value if getattr(u, 'role', None) else None,
+                    "role": u.role.value,
                     "is_active": u.is_active,
                     "created_at": u.created_at,
                 })

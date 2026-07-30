@@ -80,12 +80,15 @@ def _uses_only_demo_objects(query: str) -> bool:
     if re.match(r"^show\b", q, re.I):
         return True
 
+    _no_strings = re.sub(r"'(?:[^']|'')*'", '', q)
+    _no_dq_strings = re.sub(r'"(?:[^"]|"")*"', '', _no_strings)
+
     schema_ref = re.compile(r"\b([a-z_][a-z0-9_]*)\s*\.", re.I)
-    for match in schema_ref.finditer(q):
+    for match in schema_ref.finditer(_no_dq_strings):
         if match.group(1).lower() in FORBIDDEN_SCHEMAS:
             return False
 
-    identifiers = {token.lower() for token in re.findall(r'"?([a-z_][a-z0-9_]*)"?', q, flags=re.I)}
+    identifiers = {token.lower() for token in re.findall(r'"?([a-z_][a-z0-9_]*)"?', _no_dq_strings, flags=re.I)}
     if identifiers & APP_TABLES:
         return False
     if identifiers & FORBIDDEN_CATALOG_TABLES:

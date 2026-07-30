@@ -20,6 +20,7 @@ from db.database import SessionLocal
 from db.models import (
     Answer,
     Assessment,
+    AssessmentQuestion,
     EvaluationJob,
     EvaluationJobStatus,
     EvaluationType,
@@ -59,7 +60,13 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
 
     answers = db.query(Answer).filter(Answer.attempt_id == attempt_id).all()
     total_score = 0.0
-    total_questions = 0
+    # Scores are percentages of every question selected for the assessment,
+    # not merely of questions for which the user sent an Answer row.
+    total_questions = (
+        db.query(AssessmentQuestion)
+        .filter(AssessmentQuestion.assessment_id == assessment.id)
+        .count()
+    )
     topic_totals = {}
     topic_counts = {}
 
@@ -76,8 +83,6 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
 
         if not question and not item:
             continue
-
-        total_questions += 1
 
         # determine topic grouping key and ensure we only create TopicScore for resolvable Topic IDs
         topic_key = None
@@ -111,7 +116,7 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
             else:
                 # item.options: list of dicts with id and is_correct
                 correct_ids = [str(o.get("id")) for o in (item.options or []) if o.get("is_correct")]
-            ans.score = 1.0 if sorted([ans.answer] if ans.answer else []) == sorted(correct_ids) else 0.0
+            ans.score = 1.0 if sorted((ans.answer or "").split(",")) == sorted(correct_ids) else 0.0
             ans.evaluated_by = EvaluationType.auto
             ans.feedback = "Correct" if ans.score == 1 else "Incorrect"
         elif q_type == QuestionType.multi_mcq:

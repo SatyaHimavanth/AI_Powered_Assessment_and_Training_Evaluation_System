@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 import re
 
 from core.auth import require_admin
-from db.database import SessionLocal
 from db.async_helpers import run_db_sync
+from db.database import SessionLocal
+from .results_helpers import build_attempt_results
 from db.models import (
     Answer,
     Assessment,
@@ -909,11 +910,6 @@ async def export_assessment_results(
     def _sync_work():
         db = SessionLocal()
         try:
-            try:
-                from .results_helpers import build_attempt_results
-            except Exception:
-                raise HTTPException(status_code=500, detail="Failed to load results helper")
-
             assessment = db.query(Assessment).filter(Assessment.id == assessment_id).first()
             if not assessment:
                 raise HTTPException(status_code=404, detail="Assessment not found")

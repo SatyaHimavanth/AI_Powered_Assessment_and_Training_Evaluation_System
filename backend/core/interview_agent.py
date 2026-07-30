@@ -70,11 +70,14 @@ def generate_opening_question(
         f"Role: {role}. Level: {level}. Difficulty: {difficulty}. "
         f"Focus areas (topics to cover): {focus}."
     )
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": prompt}]},
-        config={"configurable": {"thread_id": session_id}},
-    )
-    text = _extract_text_from_result(result).strip()
+    try:
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config={"configurable": {"thread_id": session_id}},
+        )
+        text = _extract_text_from_result(result).strip()
+    except Exception:
+        text = ""
     return text or "Tell me about a challenging technical problem you solved recently."
 
 
@@ -118,11 +121,14 @@ def evaluate_and_generate_followup(
         f"{next_default} "
         f"Candidate response: {candidate_response}"
     )
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": prompt}]},
-        config={"configurable": {"thread_id": session_id}},
-    )
-    raw = _extract_text_from_result(result).strip()
+    try:
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config={"configurable": {"thread_id": session_id}},
+        )
+        raw = _extract_text_from_result(result).strip()
+    except Exception:
+        raw = ""
 
     try:
         parsed = json.loads(raw)

@@ -3,6 +3,7 @@ import os
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from dotenv import load_dotenv
@@ -21,7 +22,6 @@ from core.auth import (
 from db.models import RegistrationRequest, RegistrationStatus, User
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
-from api.timezone_helper import as_utc_aware
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -79,7 +79,11 @@ async def register(payload: UserRegister):
             # Check if username/email already exists as an approved user
             existing_user = (
                 db.query(User)
-                .filter((User.username == payload.username) | (User.email == payload.email))
+                .filter(
+                    (User.username == payload.username)
+                    | (User.email == payload.email)
+                    | (User.contact_email == payload.contact_email)
+                )
                 .first()
             )
             if existing_user:
@@ -89,8 +93,11 @@ async def register(payload: UserRegister):
             existing_request = (
                 db.query(RegistrationRequest)
                 .filter(
-                    (RegistrationRequest.username == payload.username)
-                    | (RegistrationRequest.email == payload.email)
+                    or_(
+                        RegistrationRequest.username == payload.username,
+                        RegistrationRequest.email == payload.email,
+                        RegistrationRequest.contact_email == payload.contact_email,
+                    ),
                 )
                 .filter(RegistrationRequest.status == RegistrationStatus.pending)
                 .first()
@@ -99,21 +106,24 @@ async def register(payload: UserRegister):
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "A registration request is already pending for this username/email. "
+                        "A registration request is already pending for this username/email/contact. "
                         "Please wait for admin approval."
                     ),
                 )
 
-            # Check if rejected/expired within last 30 days
+            # Check if rejected/expired within the configured window
             recent_rejected = (
                 db.query(RegistrationRequest)
                 .filter(
-                    (RegistrationRequest.username == payload.username)
-                    | (RegistrationRequest.email == payload.email)
+                    or_(
+                        RegistrationRequest.username == payload.username,
+                        RegistrationRequest.email == payload.email,
+                        RegistrationRequest.contact_email == payload.contact_email,
+                    ),
                 )
                 .filter(RegistrationRequest.status == RegistrationStatus.rejected)
                 .filter(
-                    as_utc_aware(RegistrationRequest.resolved_at)
+                    RegistrationRequest.resolved_at
                     > datetime.now(timezone.utc) - timedelta(days=REGISTRATION_EXPIRY_DAYS)
                 )
                 .first()
@@ -122,8 +132,8 @@ async def register(payload: UserRegister):
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "Your previous registration was rejected. You can re-register after "
-                        "30 days from rejection."
+                        f"Your previous registration was rejected. You can re-register "
+                        f"after {REGISTRATION_EXPIRY_DAYS} days from rejection."
                     ),
                 )
 

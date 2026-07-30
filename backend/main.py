@@ -1,12 +1,14 @@
+import asyncio
 import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 # from fastapi.staticfiles import StaticFiles
 # from fastapi.responses import FileResponse
 
@@ -26,12 +28,17 @@ from core.auth import get_password_hash
 from core.evaluation_service import start_evaluation_job_consumer
 from core.setup_demo_db import create_demo_db_for_tests
 from core.vector_store import ensure_pgvector_ready
+from sqlalchemy import text
+
+from sqlalchemy import text
 from db.database import Base, SessionLocal, engine
 from db.models import Batch, BatchStatus, BatchUser, RegistrationRequest, RegistrationStatus, User, UserRole
 
 # ---------- Default credentials ---------- #
 DEFAULT_ADMIN_USERNAME = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
-DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
+DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD")
+if not DEFAULT_ADMIN_PASSWORD:
+    raise RuntimeError("DEFAULT_ADMIN_PASSWORD environment variable is required")
 DEFAULT_ADMIN_EMAIL = os.getenv("DEFAULT_ADMIN_EMAIL", "admin@assessment.com")
 DEFAULT_ADMIN_CONTACT_EMAIL = os.getenv("DEFAULT_ADMIN_CONTACT_EMAIL", "admin@assessment.com")
 DEFAULT_ADMIN_NAME = os.getenv("DEFAULT_ADMIN_NAME", "System Admin")
@@ -144,7 +151,9 @@ async def lifespan(app: FastAPI):
     print("[OK] Evaluation job consumer started")
 
     # Create demo db for postgres assessment
-    create_demo_db_for_tests()
+    is_demo = os.getenv("DEMO_MODE", "").lower() == "true"
+    if is_demo:
+        create_demo_db_for_tests()
 
     # Backfill embeddings for questions that don't have them yet
     import threading
@@ -162,12 +171,13 @@ app = FastAPI(
 )
 
 # CORS
+cors_origins = os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in cors_origins if o.strip()],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # # React assets
@@ -200,6 +210,56 @@ app.include_router(question_generation_router)
 # @app.get("/")
 # def root():
 #     return {"message": "AI Assessment System API is running"}
+
+
+@app.get("/health")
+async def health_check(
+    db: bool = Query(default=True, alias="db"),
+    llm: bool = Query(default=True, alias="llm"),
+):
+    """Health check endpoint. Default checks DB and LLM connectivity.
+
+    Query params: db=true/false, llm=true/false
+    """
+    results: dict[str, Any] = {}
+    overall = "healthy"
+
+    if db:
+        try:
+            session = SessionLocal()
+            session.execute(text("SELECT 1"))
+            session.close()
+            results["db"] = "healthy"
+        except Exception as e:
+            results["db"] = f"unhealthy: {e}"
+            overall = "degraded"
+
+    if llm:
+        try:
+            from app.llms import get_chat_model
+            loop = asyncio.get_event_loop()
+            model = await loop.run_in_executor(None, get_chat_model)
+
+            async def _ping():
+                return await loop.run_in_executor(None, model.invoke, "ping")
+
+            await asyncio.wait_for(_ping(), timeout=5)
+            results["llm"] = "healthy"
+        except RuntimeError as e:
+            if "Missing Azure OpenAI config" in str(e):
+                results["llm"] = "not_configured"
+            else:
+                results["llm"] = f"unhealthy: {e}"
+                overall = "degraded"
+        except asyncio.TimeoutError:
+            results["llm"] = "unhealthy: timeout"
+            overall = "degraded"
+        except Exception as e:
+            results["llm"] = f"unhealthy: {e}"
+            overall = "degraded"
+
+    status_code = 200 if overall == "healthy" else 503
+    return JSONResponse(status_code=status_code, content={"status": overall, "checks": results})
 
 
 @app.get("/speed-test")

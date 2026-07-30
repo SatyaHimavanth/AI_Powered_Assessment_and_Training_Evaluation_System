@@ -1639,7 +1639,7 @@ async def resume_interview(
                 session.completed_at = datetime.now(timezone.utc)
                 db.commit()
                 raise HTTPException(status_code=400, detail="Pause limit exceeded. Interview marked as missed")
-            if template.is_archived and not session.started_at:
+            if template.is_archived:
                 raise HTTPException(status_code=400, detail="Template archived and session cannot be resumed")
             session.status = InterviewSessionStatus.in_progress
             session.resumed_at = datetime.now(timezone.utc)

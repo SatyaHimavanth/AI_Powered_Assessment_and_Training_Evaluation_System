@@ -5,12 +5,13 @@ from io import BytesIO
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from app.llms import get_chat_model
 from core.auth import get_current_user
@@ -39,7 +40,6 @@ from db.models import (
     AssessmentQuestionItem,
 )
 from db.async_helpers import run_db_sync
-from db.database import SessionLocal
 from api.timezone_helper import as_utc_aware, to_utc_iso
 
 router = APIRouter(prefix="/user/assessments", tags=["user-assessments"])
@@ -88,6 +88,25 @@ def _completed_attempt_for_user_assessment(
         .all()
     )
     return max(completed_attempts, key=_attempt_sort_key) if completed_attempts else None
+
+
+def _assessment_question_link(
+    db: Session,
+    assessment_id: UUID,
+    question_id: UUID,
+) -> AssessmentQuestion | None:
+    """Return the assessment link for a question/item, if it belongs to the assessment."""
+    return (
+        db.query(AssessmentQuestion)
+        .filter(
+            AssessmentQuestion.assessment_id == assessment_id,
+            or_(
+                AssessmentQuestion.question_id == question_id,
+                AssessmentQuestion.assessment_item_id == question_id,
+            ),
+        )
+        .first()
+    )
 
 
 # ---------- Schemas ---------- #
@@ -558,10 +577,14 @@ async def save_answer(
             if attempt.status != AttemptStatus.in_progress:
                 raise HTTPException(status_code=400, detail="Attempt is not in progress")
 
-            # Upsert: update if exists, create if not
-            # Determine whether this question id is a per-assessment item or a global Question
-            item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == body.question_id).first()
-            if item:
+            # Only questions selected for this assessment may be answered.  This
+            # also prevents a user from injecting answers for another question.
+            question_link = _assessment_question_link(db, attempt.assessment_id, body.question_id)
+            if not question_link:
+                raise HTTPException(status_code=400, detail="Question does not belong to this assessment")
+
+            # Upsert: update if exists, create if not.
+            if question_link.assessment_item_id:
                 existing = (
                     db.query(Answer)
                     .filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == body.question_id)
@@ -645,7 +668,6 @@ async def save_violations(
 async def submit_assessment(
     attempt_id: UUID,
     body: SubmitAssessmentRequest,
-    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
 ):
     """Submit answers for an assessment attempt."""
@@ -661,6 +683,17 @@ async def submit_assessment(
             if attempt.status != AttemptStatus.in_progress:
                 raise HTTPException(status_code=400, detail="This attempt is already finalized")
 
+            assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
+            now_utc = datetime.now(timezone.utc)
+            if assessment.start_time and now_utc < as_utc_aware(assessment.start_time):
+                raise HTTPException(status_code=400, detail="Assessment has not started yet")
+            if assessment.end_time and now_utc > as_utc_aware(assessment.end_time):
+                raise HTTPException(status_code=400, detail="Assessment time window has ended")
+            if attempt.started_at:
+                time_elapsed = now_utc - as_utc_aware(attempt.started_at)
+                if time_elapsed > timedelta(minutes=assessment.duration):
+                    raise HTTPException(status_code=400, detail="Assessment time limit exceeded")
+
             # Save answers (upsert - some may already exist from auto-save)
             seen_items: set[str] = set()
             for ans in body.answers:
@@ -669,8 +702,11 @@ async def submit_assessment(
                     continue
                 seen_items.add(qid_str)
 
-                item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == ans.question_id).first()
-                if item:
+                question_link = _assessment_question_link(db, attempt.assessment_id, ans.question_id)
+                if not question_link:
+                    raise HTTPException(status_code=400, detail="Question does not belong to this assessment")
+
+                if question_link.assessment_item_id:
                     existing_ans = (
                         db.query(Answer)
                         .filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == ans.question_id)
@@ -725,7 +761,6 @@ async def submit_assessment(
 async def abort_assessment(
     attempt_id: UUID,
     body: SubmitAssessmentRequest,
-    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
 ):
     """Abort an assessment (tab violation limit exceeded). Saves partial answers."""
@@ -750,8 +785,11 @@ async def abort_assessment(
                 seen_items.add(qid_str)
 
                 if ans.answer.strip():
-                    item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == ans.question_id).first()
-                    if item:
+                    question_link = _assessment_question_link(db, attempt.assessment_id, ans.question_id)
+                    if not question_link:
+                        raise HTTPException(status_code=400, detail="Question does not belong to this assessment")
+
+                    if question_link.assessment_item_id:
                         existing_ans = (
                             db.query(Answer)
                             .filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == ans.question_id)

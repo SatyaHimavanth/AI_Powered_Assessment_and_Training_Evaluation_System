@@ -15,7 +15,14 @@ DATABASE_URL = os.environ.get(
 )
 
 # Synchronous engine & session (existing)
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=20,
+    max_overflow=10,
+    pool_timeout=30,
+    pool_recycle=1800,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -35,7 +42,10 @@ if not ASYNC_DATABASE_URL:
         # Fallback: reuse same URL (user should prefer setting DATABASE_URL_ASYNC)
         ASYNC_DATABASE_URL = DATABASE_URL
 
-async_engine = create_async_engine(ASYNC_DATABASE_URL, future=True)
+async_engine = create_async_engine(
+    ASYNC_DATABASE_URL, future=True, pool_size=20, max_overflow=10,
+    pool_timeout=30, pool_recycle=1800, pool_pre_ping=True,
+)
 
 AsyncSessionLocal = async_sessionmaker(bind=async_engine, expire_on_commit=False, class_=AsyncSession)
 

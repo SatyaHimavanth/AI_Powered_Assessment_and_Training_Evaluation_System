@@ -437,7 +437,7 @@ async def upload_questions(
     # Generate embeddings in background for newly imported questions
     new_questions = result.pop("_new_questions", [])
     if new_questions:
-        asyncio.get_event_loop().run_in_executor(
+        asyncio.get_running_loop().run_in_executor(
             None, _generate_embeddings_for_questions, new_questions
         )
 

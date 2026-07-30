@@ -296,7 +296,7 @@ async def start_generation(
     result = await run_db_sync(_create_batch)
 
     # Process in background
-    asyncio.get_event_loop().run_in_executor(
+    asyncio.get_running_loop().run_in_executor(
         None, process_generation_batch, result["id"]
     )
 
