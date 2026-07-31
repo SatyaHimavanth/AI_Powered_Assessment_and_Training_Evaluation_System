@@ -64,6 +64,8 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   const overallTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const micRef = useRef<SpeechToTextControlHandle | null>(null);
   const draftRef = useRef<string>("");
+  const submittingDraftRef = useRef(false);
+  const endingRef = useRef(false);
 
   // Keep draftRef in sync
   useEffect(() => { draftRef.current = draft; }, [draft]);
@@ -325,6 +327,8 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   }
 
   async function submitMessage(sessionId: string, text: string, auto = false) {
+    if (submittingDraftRef.current) return;
+    submittingDraftRef.current = true;
     setIsSubmittingDraft(true);
     try {
       const res = await api.post(`/interviews/${sessionId}/message`, { response_text: text });
@@ -340,6 +344,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
     } catch (err: any) {
       setError(err?.response?.data?.detail || "Failed to submit response");
     } finally {
+      submittingDraftRef.current = false;
       setIsSubmittingDraft(false);
     }
   }
@@ -355,7 +360,8 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   }
 
   async function endInterview() {
-    if (!sessionIdRef.current) return;
+    if (!sessionIdRef.current || endingRef.current) return;
+    endingRef.current = true;
     setLoading(true);
     try {
       await api.post(`/interviews/${sessionIdRef.current}/end`);
@@ -368,6 +374,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
     } catch (err: any) {
       setError(err?.response?.data?.detail || "Failed to end interview");
     } finally {
+      endingRef.current = false;
       setLoading(false);
     }
   }

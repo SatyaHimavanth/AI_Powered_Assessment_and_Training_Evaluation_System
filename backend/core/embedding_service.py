@@ -1,8 +1,8 @@
 """
 Embedding service for question similarity checking.
 
-Computes embeddings for questions and manages similarity searches
-using pgvector.
+Computes embeddings for questions and manages similarity searches using the
+configured pgvector or JSON storage backend.
 """
 
 import os
@@ -75,7 +75,7 @@ def store_question_embedding(
     text: str,
     embedding: List[float],
 ) -> UUID:
-    """Store an embedding in pgvector."""
+    """Store an embedding using the configured database column type."""
     import uuid as uuid_mod
 
     if len(embedding) != EMBEDDING_DIM:

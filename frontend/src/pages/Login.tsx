@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import api from "../api";
 
@@ -8,6 +8,7 @@ export default function Login() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const submittingRef = useRef(false);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -19,6 +20,8 @@ export default function Login() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setError("");
     setLoading(true);
     try {
@@ -36,6 +39,7 @@ export default function Login() {
       console.error(err);
       setError("Login failed");
     } finally {
+      submittingRef.current = false;
       setLoading(false);
     }
   };
@@ -65,10 +69,11 @@ export default function Login() {
 
           <form onSubmit={handleSubmit} className="space-y-5">
             <div>
-              <label className="block text-sm font-medium text-[var(--color-text)] mb-1.5">
+              <label htmlFor="username" className="block text-sm font-medium text-[var(--color-text)] mb-1.5">
                 Username
               </label>
               <input
+                id="username"
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
@@ -79,11 +84,12 @@ export default function Login() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-[var(--color-text)] mb-1.5">
+              <label htmlFor="password" className="block text-sm font-medium text-[var(--color-text)] mb-1.5">
                 Password
               </label>
               <div className="relative">
                 <input
+                  id="password"
                   type={showPassword ? "text" : "password"}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}

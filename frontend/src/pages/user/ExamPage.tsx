@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import api from "../../api";
+import api, { API_BASE } from "../../api";
 import CodingEditor from "../../components/CodingEditor";
 
 interface Option {
@@ -77,6 +77,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
   const escapeAttemptsRef = useRef(0);
   const examDataRef = useRef<ExamData | null>(null);
   const answersRef = useRef<Record<string, string>>({});
+  const timeLeftRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const savingQueueRef = useRef<Set<string>>(new Set());
@@ -87,6 +88,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
   useEffect(() => { escapeAttemptsRef.current = escapeAttempts; }, [escapeAttempts]);
   useEffect(() => { examDataRef.current = examData; }, [examData]);
   useEffect(() => { answersRef.current = answers; }, [answers]);
+  useEffect(() => { timeLeftRef.current = timeLeft; }, [timeLeft]);
 
   // ---- Network Speed Test ----
   const runSpeedTest = async () => {
@@ -96,8 +98,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
       // Download a known-size payload from the API to estimate real throughput.
       // The endpoint returns random bytes (default 500 KB) to prevent
       // transparent compression from inflating the measured speed.
-      const apiUrl = import.meta.env.VITE_API_URL || "";
-      const testUrl = `${apiUrl}/speed-test?size=524288&_t=${Date.now()}`;
+      const testUrl = `${API_BASE}/speed-test?size=524288&_t=${Date.now()}`;
       const startTime = performance.now();
       const response = await fetch(testUrl, { cache: "no-store" });
       const blob = await response.blob();
@@ -206,7 +207,6 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     if (submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
-    if (timerRef.current) clearInterval(timerRef.current);
 
     const data = examDataRef.current;
     if (!data) { submittingRef.current = false; setSubmitting(false); return; }
@@ -218,15 +218,17 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
 
     try {
       await api.post(`/user/assessments/submit/${data.attempt_id}`, { answers: answerList });
+      if (timerRef.current) clearInterval(timerRef.current);
       setPhase("submitted");
+      exitFullscreen();
     } catch {
-      setPhase("submitted");
+      if (timeLeftRef.current <= 0 && timerRef.current) clearInterval(timerRef.current);
+      setShowAutoSubmitModal(false);
+      setError("Submission failed. Check your connection and submit again.");
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
     }
-
-    exitFullscreen();
   }, [exitFullscreen]);
 
   const handleAbort = useCallback(async () => {
@@ -245,7 +247,9 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
 
     try {
       await api.post(`/user/assessments/abort/${data.attempt_id}`, { answers: answerList });
-    } catch { /* ignore */ }
+    } catch {
+      setError("The assessment was closed, but the server could not confirm that your answers were saved.");
+    }
 
     setPhase("aborted");
     exitFullscreen();
@@ -286,7 +290,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     setWarningType('violation');
     saveViolationsToServer(newCount);
 
-    if (newCount > 5) {
+    if (newCount >= 5) {
       // Abort exam
       handleAbort();
     } else {
@@ -451,7 +455,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
       document.removeEventListener("paste", onPaste);
       // cleanup (no size-based DevTools interval to clear)
     };
-  }, [phase, handleViolation, handleEscapeAttempt]);
+  }, [phase, handleViolation, handleEscapeAttempt, handleAbort]);
 
 
 
@@ -573,8 +577,8 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
             <ul className="text-xs text-amber-700 space-y-0.5 list-disc ml-3">
               <li>The exam will open in fullscreen mode</li>
               <li>Exiting fullscreen or switching tabs will trigger a warning</li>
-              <li>Pressing Escape is blocked (after 3 attempts your exam will abort)</li>
-              <li>After 3 violations, the exam will be automatically aborted</li>
+              <li>Pressing Escape is blocked (after 5 attempts your exam will abort)</li>
+              <li>After 5 violations, the exam will be automatically aborted</li>
               <li>You cannot re-enter the exam once you leave</li>
             </ul>
           </div>
@@ -652,9 +656,9 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
             </div>
             {warningType === 'escape' ? (
               <>
-                <h3 className="text-base font-semibold mb-1">Exit Blocked! ({escapeAttempts}/3)</h3>
+                <h3 className="text-base font-semibold mb-1">Exit Blocked! ({escapeAttempts}/5)</h3>
                 <p className="text-sm text-[var(--color-text-secondary)] mb-4">
-                  You cannot exit the exam by pressing Escape. After 3 attempts, your exam will be automatically terminated.
+                  You cannot exit the exam by pressing Escape. After 5 attempts, your exam will be automatically terminated.
                 </p>
               </>
             ) : (
@@ -725,6 +729,9 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
         </div>
       )}
 
+      {error && (
+        <div className="bg-red-700 px-6 py-2 text-center text-sm text-white">{error}</div>
+      )}
       {/* Top Bar */}
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -753,7 +760,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
           )}
           {escapeAttempts > 0 && (
             <span className="text-xs text-orange-400 font-medium">
-              Escape Attempts: {escapeAttempts}/3
+              Escape Attempts: {escapeAttempts}/5
             </span>
           )}
           <button

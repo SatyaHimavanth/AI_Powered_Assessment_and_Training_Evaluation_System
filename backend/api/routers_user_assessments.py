@@ -9,7 +9,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
@@ -43,6 +42,37 @@ from db.async_helpers import run_db_sync
 from api.timezone_helper import as_utc_aware, to_utc_iso
 
 router = APIRouter(prefix="/user/assessments", tags=["user-assessments"])
+
+
+def _upsert_answer(
+    db: Session,
+    attempt_id: UUID,
+    question_link,
+    question_id: UUID,
+    answer_text: str,
+) -> None:
+    if question_link.assessment_item_id:
+        existing = (
+            db.query(Answer)
+            .filter(
+                Answer.attempt_id == attempt_id,
+                Answer.assessment_item_id == question_id,
+            )
+            .first()
+        )
+        foreign_key = {"assessment_item_id": question_id}
+    else:
+        existing = (
+            db.query(Answer)
+            .filter(Answer.attempt_id == attempt_id, Answer.question_id == question_id)
+            .first()
+        )
+        foreign_key = {"question_id": question_id}
+
+    if existing:
+        existing.answer = answer_text
+    else:
+        db.add(Answer(attempt_id=attempt_id, answer=answer_text, **foreign_key))
 
 
 def _attempt_sort_key(attempt: Attempt) -> tuple[datetime, datetime, int, str]:
@@ -570,12 +600,24 @@ async def save_answer(
     def _sync_work():
         db = SessionLocal()
         try:
-            attempt = db.query(Attempt).filter(Attempt.id == attempt_id, Attempt.user_id == user.id).first()
+            attempt = (
+                db.query(Attempt)
+                .filter(Attempt.id == attempt_id, Attempt.user_id == user.id)
+                .with_for_update()
+                .first()
+            )
             if not attempt:
                 raise HTTPException(status_code=404, detail="Attempt not found")
 
             if attempt.status != AttemptStatus.in_progress:
                 raise HTTPException(status_code=400, detail="Attempt is not in progress")
+
+            assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
+            now_utc = datetime.now(timezone.utc)
+            if assessment.end_time and now_utc > as_utc_aware(assessment.end_time):
+                raise HTTPException(status_code=400, detail="Assessment time window has ended")
+            if attempt.started_at and now_utc - as_utc_aware(attempt.started_at) > timedelta(minutes=assessment.duration):
+                raise HTTPException(status_code=400, detail="Assessment time limit exceeded")
 
             # Only questions selected for this assessment may be answered.  This
             # also prevents a user from injecting answers for another question.
@@ -583,51 +625,7 @@ async def save_answer(
             if not question_link:
                 raise HTTPException(status_code=400, detail="Question does not belong to this assessment")
 
-            # Upsert: update if exists, create if not.
-            if question_link.assessment_item_id:
-                existing = (
-                    db.query(Answer)
-                    .filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == body.question_id)
-                    .first()
-                )
-                if existing:
-                    existing.answer = body.answer
-                else:
-                    try:
-                        new_answer = Answer(
-                            attempt_id=attempt_id,
-                            assessment_item_id=body.question_id,
-                            answer=body.answer,
-                        )
-                        db.add(new_answer)
-                        db.flush()
-                    except IntegrityError:
-                        db.rollback()
-                        existing = db.query(Answer).filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == body.question_id).first()
-                        if existing:
-                            existing.answer = body.answer
-            else:
-                existing = (
-                    db.query(Answer)
-                    .filter(Answer.attempt_id == attempt_id, Answer.question_id == body.question_id)
-                    .first()
-                )
-                if existing:
-                    existing.answer = body.answer
-                else:
-                    try:
-                        new_answer = Answer(
-                            attempt_id=attempt_id,
-                            question_id=body.question_id,
-                            answer=body.answer,
-                        )
-                        db.add(new_answer)
-                        db.flush()
-                    except IntegrityError:
-                        db.rollback()
-                        existing = db.query(Answer).filter(Answer.attempt_id == attempt_id, Answer.question_id == body.question_id).first()
-                        if existing:
-                            existing.answer = body.answer
+            _upsert_answer(db, attempt_id, question_link, body.question_id, body.answer)
 
             db.commit()
             return {"status": "saved"}
@@ -649,7 +647,12 @@ async def save_violations(
     def _sync_work():
         db = SessionLocal()
         try:
-            attempt = db.query(Attempt).filter(Attempt.id == attempt_id, Attempt.user_id == user.id).first()
+            attempt = (
+                db.query(Attempt)
+                .filter(Attempt.id == attempt_id, Attempt.user_id == user.id)
+                .with_for_update()
+                .first()
+            )
             if not attempt:
                 raise HTTPException(status_code=404, detail="Attempt not found")
             if attempt.status != AttemptStatus.in_progress:
@@ -676,7 +679,12 @@ async def submit_assessment(
     def _sync_work():
         db = SessionLocal()
         try:
-            attempt = db.query(Attempt).filter(Attempt.id == attempt_id, Attempt.user_id == user.id).first()
+            attempt = (
+                db.query(Attempt)
+                .filter(Attempt.id == attempt_id, Attempt.user_id == user.id)
+                .with_for_update()
+                .first()
+            )
             if not attempt:
                 raise HTTPException(status_code=404, detail="Attempt not found")
 
@@ -706,37 +714,7 @@ async def submit_assessment(
                 if not question_link:
                     raise HTTPException(status_code=400, detail="Question does not belong to this assessment")
 
-                if question_link.assessment_item_id:
-                    existing_ans = (
-                        db.query(Answer)
-                        .filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == ans.question_id)
-                        .first()
-                    )
-                    if existing_ans:
-                        existing_ans.answer = ans.answer
-                    else:
-                        answer = Answer(
-                            attempt_id=attempt_id,
-                            assessment_item_id=ans.question_id,
-                            answer=ans.answer,
-                        )
-                        db.add(answer)
-                else:
-                    existing_ans = (
-                        db.query(Answer)
-                        .filter(Answer.attempt_id == attempt_id, Answer.question_id == ans.question_id)
-                        .first()
-                    )
-                    if existing_ans:
-                        existing_ans.answer = ans.answer
-                    else:
-                        answer = Answer(
-                            attempt_id=attempt_id,
-                            question_id=ans.question_id,
-                            answer=ans.answer,
-                        )
-                        db.add(answer)
-                db.flush()
+                _upsert_answer(db, attempt_id, question_link, ans.question_id, ans.answer)
 
             attempt.submitted_at = datetime.now(timezone.utc)
             attempt.status = AttemptStatus.completed
@@ -769,7 +747,12 @@ async def abort_assessment(
     def _sync_work():
         db = SessionLocal()
         try:
-            attempt = db.query(Attempt).filter(Attempt.id == attempt_id, Attempt.user_id == user.id).first()
+            attempt = (
+                db.query(Attempt)
+                .filter(Attempt.id == attempt_id, Attempt.user_id == user.id)
+                .with_for_update()
+                .first()
+            )
             if not attempt:
                 raise HTTPException(status_code=404, detail="Attempt not found")
 
@@ -789,37 +772,7 @@ async def abort_assessment(
                     if not question_link:
                         raise HTTPException(status_code=400, detail="Question does not belong to this assessment")
 
-                    if question_link.assessment_item_id:
-                        existing_ans = (
-                            db.query(Answer)
-                            .filter(Answer.attempt_id == attempt_id, Answer.assessment_item_id == ans.question_id)
-                            .first()
-                        )
-                        if existing_ans:
-                            existing_ans.answer = ans.answer
-                        else:
-                            answer = Answer(
-                                attempt_id=attempt_id,
-                                assessment_item_id=ans.question_id,
-                                answer=ans.answer,
-                            )
-                            db.add(answer)
-                    else:
-                        existing_ans = (
-                            db.query(Answer)
-                            .filter(Answer.attempt_id == attempt_id, Answer.question_id == ans.question_id)
-                            .first()
-                        )
-                        if existing_ans:
-                            existing_ans.answer = ans.answer
-                        else:
-                            answer = Answer(
-                                attempt_id=attempt_id,
-                                question_id=ans.question_id,
-                                answer=ans.answer,
-                            )
-                            db.add(answer)
-                    db.flush()
+                    _upsert_answer(db, attempt_id, question_link, ans.question_id, ans.answer)
 
             attempt.submitted_at = datetime.now(timezone.utc)
             attempt.status = AttemptStatus.missed  # marked incomplete

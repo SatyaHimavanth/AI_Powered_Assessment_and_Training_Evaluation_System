@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import api from "../../api";
 import Toast from "../../components/Toast";
 
@@ -86,6 +86,7 @@ export default function Practice() {
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [currentQ, setCurrentQ] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const submitLockRef = useRef(false);
 
   // Result state
   const [resultData, setResultData] = useState<{ score: number | null; questions: ResultQuestion[] } | null>(null);
@@ -162,8 +163,15 @@ export default function Practice() {
         requested_tests_per_day: requestedTestsPerDay,
       });
       setMessage(res.data.message);
-      setAccessInfo({ has_access: false, expires_at: null, pending_request: true, requested_tests_per_day: requestedTestsPerDay, tests_per_day_granted: null } as any);
+      setAccessInfo({
+        has_access: false,
+        expires_at: null,
+        pending_request: true,
+        requested_tests_per_day: requestedTestsPerDay,
+        tests_per_day_granted: null,
+      });
       setShowAccessForm(false);
+      await loadData();
     } catch (err: unknown) {
       console.error(err);
       setMessage("Failed to request access");
@@ -196,7 +204,7 @@ export default function Practice() {
       setView("home");
       setMessage("Practice test is being generated...");
       // Refresh history/counts
-      try { await loadData(); } catch {};
+      await loadData();
     } catch (err: unknown) {
       console.error(err);
       setMessage(extractError(err, "Failed to create test"));
@@ -222,7 +230,8 @@ export default function Practice() {
   };
 
   const handleSubmitTest = async () => {
-    if (!testDetail) return;
+    if (!testDetail || submitLockRef.current) return;
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
       const answerPayload = testDetail.questions.map((q) => ({
@@ -237,6 +246,7 @@ export default function Practice() {
       console.error(err);
       setMessage("Failed to submit test");
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   };

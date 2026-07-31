@@ -8,7 +8,7 @@ A full-stack platform for managing assessments, training evaluations, AI-assiste
 | --- | --- |
 | Backend | Python 3.12+, FastAPI, SQLAlchemy, Uvicorn |
 | Frontend | React 19, TypeScript, Vite 8, Tailwind CSS v4 |
-| Database | PostgreSQL with pgvector |
+| Database | PostgreSQL with optional pgvector (JSON fallback available) |
 | LLM | Azure OpenAI via `langchain-openai` |
 | Auth | JWT access/refresh tokens, bcrypt |
 
@@ -17,7 +17,7 @@ A full-stack platform for managing assessments, training evaluations, AI-assiste
 - Python 3.12+
 - Node.js 18+
 - PostgreSQL 14+
-- pgvector installed on the PostgreSQL server
+- pgvector installed on the PostgreSQL server, or JSON fallback mode enabled
 - Azure OpenAI API access
 
 ## Quick Setup
@@ -35,7 +35,9 @@ Enable pgvector once in `assessment_db` if your app DB user cannot create extens
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-The backend also runs `CREATE EXTENSION IF NOT EXISTS vector` during startup. Startup will fail if pgvector is not installed on the PostgreSQL server or if the DB user lacks permission and the extension has not already been created.
+In the default mode, the backend also runs `CREATE EXTENSION IF NOT EXISTS
+vector` during startup. Use `EMBEDDING_STORAGE_BACKEND=json` when the extension
+is unavailable.
 
 ### 2. Backend Setup
 
@@ -57,6 +59,7 @@ Example backend `.env`:
 DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/assessment_db
 ASYNC_DATABASE_URL=postgresql+asyncpg://postgres:yourpassword@localhost:5432/assessment_db
 SECRET_KEY=your-secret-key-here
+CORS_ALLOWED_ORIGINS=http://localhost:5173
 
 AZURE_OPENAI_API_KEY=your-azure-openai-key
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
@@ -102,7 +105,7 @@ These are auto-created on first startup and can be overridden with environment v
 - Auto and LLM evaluation for MCQ, text, coding, and SQL questions.
 - AI-generated practice tests.
 - AI question generation with duplicate detection, staged review, archive, and unarchive-to-review flow.
-- pgvector-based similarity search for generated/imported question embeddings.
+- pgvector- or JSON-based similarity search for question embeddings.
 - SQL assessment sandbox using demo tables inside the main assessment database.
 
 ## Project Structure
@@ -127,7 +130,7 @@ backend/
     evaluation_service.py         # Background eval job consumer
     setup_demo_db.py              # Demo SQL schema/table setup
     sql_runner.py                 # Read-only SQL sandbox runner
-    vector_store.py               # pgvector setup and similarity query helpers
+    vector_store.py               # Embedding storage setup and similarity helpers
     embedding_service.py          # Embedding computation and storage
     question_generation.py        # LLM question generation pipeline
     embedding_backfill.py         # Startup backfill for missing embeddings
@@ -147,18 +150,30 @@ frontend/
   package.json
 ```
 
-## pgvector Embeddings
+## Embedding Storage
 
-Question embeddings are stored in PostgreSQL using the pgvector `vector` type. There is no FAISS or external vector-store fallback.
+Question embeddings use pgvector by default. When the PostgreSQL service does
+not provide the vector extension, set:
 
-On startup, the backend:
+```env
+EMBEDDING_STORAGE_BACKEND=json
+```
+
+JSON mode stores embeddings as JSON arrays and performs cosine similarity in
+the backend process. It is intended as a temporary fallback for small question
+banks; pgvector remains preferable for indexed, database-side similarity at
+scale. Select the backend before creating `question_embeddings`; changing an
+existing column between vector and JSON requires a database migration.
+
+In the default `pgvector` mode, startup:
 
 1. Runs `CREATE EXTENSION IF NOT EXISTS vector`.
 2. Creates missing tables.
 3. Ensures `question_embeddings.embedding` is `vector(EMBEDDING_DIM)`.
 4. Backfills embeddings for active questions that do not have one.
 
-If pgvector is unavailable, startup fails. Install pgvector on the PostgreSQL server and create the extension in `assessment_db`.
+If pgvector is unavailable in the default mode, startup fails. Either install
+the extension or select JSON mode.
 
 Relevant env vars:
 
@@ -206,7 +221,7 @@ Flow:
 
 1. Generate questions by topic, type, difficulty, and count.
 2. Compute embeddings for generated questions.
-3. Compare generated questions against the existing question bank with pgvector cosine similarity.
+3. Compare generated questions against the existing question bank with cosine similarity.
 4. Stage generated questions with match bands:
    - High duplicate
    - Review
@@ -234,3 +249,23 @@ Once the backend is running:
 
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+## Automated TestSuite
+
+`TestSuite/` is an isolated Python 3.12 `uv` project covering API contracts,
+authentication, authorization, CORS, multi-user assessment concurrency,
+full/partial/aborted attempts, learner-result accuracy, and Playwright browser
+workflows.
+
+Configure the variables shown in `TestSuite/.env.example`, start the frontend
+and backend, then run the complete suite:
+
+```powershell
+Set-Location TestSuite
+uv sync
+uv run python run_all.py
+```
+
+Stateful tests provision three temporary users, a topic, four questions, a
+batch, and an assessment through public APIs. Teardown deactivates or archives
+the generated records, so use a dedicated test database.

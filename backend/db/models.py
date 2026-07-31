@@ -14,6 +14,12 @@ from pgvector.sqlalchemy import VECTOR
 from db.database import Base
 
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+EMBEDDING_STORAGE_BACKEND = os.getenv("EMBEDDING_STORAGE_BACKEND", "pgvector").strip().lower()
+if EMBEDDING_STORAGE_BACKEND not in {"pgvector", "json"}:
+    raise ValueError("EMBEDDING_STORAGE_BACKEND must be 'pgvector' or 'json'")
+EMBEDDING_COLUMN_TYPE = (
+    VECTOR(EMBEDDING_DIM) if EMBEDDING_STORAGE_BACKEND == "pgvector" else JSON
+)
 
 
 # ---------------- ENUMS ---------------- #
@@ -660,6 +666,6 @@ class QuestionEmbedding(Base):
     question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"), nullable=True)
     staged_question_id = Column(UUID(as_uuid=True), ForeignKey("staged_questions.id"), nullable=True)
     embedding_text = Column(Text, nullable=False)
-    embedding = Column(VECTOR(EMBEDDING_DIM), nullable=False)
+    embedding = Column(EMBEDDING_COLUMN_TYPE, nullable=False)
     model_version = Column(String, default="text-embedding-3-small")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

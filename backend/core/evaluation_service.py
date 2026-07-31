@@ -341,61 +341,45 @@ def process_evaluation_jobs(poll_interval: int = 5, max_retries: int = 3):
     """
     logger.info("Evaluation job consumer started")
 
-    # On startup, recover any jobs stuck in "in_progress" (e.g., server crashed mid-evaluation)
-    try:
-        startup_db = SessionLocal()
-        stalled = (
-            startup_db.query(EvaluationJob)
-            .filter(EvaluationJob.status == EvaluationJobStatus.in_progress)
-            .all()
-        )
-        for job in stalled:
-            job.status = EvaluationJobStatus.pending
-            logger.info(f"Recovered stalled job {job.id} (was in_progress) -> pending")
-        if stalled:
-            startup_db.commit()
-        startup_db.close()
-    except Exception as e:
-        logger.error(f"Error recovering stalled jobs on startup: {e}")
-
     while True:
         db = None
         try:
             db = SessionLocal()
 
-            # Find pending jobs (oldest first)
-            pending_jobs = (
+            # Claim one job under a row lock so multiple backend containers
+            # cannot evaluate the same attempt.
+            job = (
                 db.query(EvaluationJob)
                 .filter(EvaluationJob.status == EvaluationJobStatus.pending)
                 .order_by(EvaluationJob.created_at.asc())
-                .limit(5)  # Process up to 5 jobs per cycle
-                .all()
+                .with_for_update(skip_locked=True)
+                .first()
             )
 
-            for job in pending_jobs:
+            if job:
+                job_id = job.id
+                attempt_id = job.attempt_id
                 try:
-                    logger.info(f"Processing evaluation job {job.id} for attempt {job.attempt_id}")
+                    logger.info(f"Processing evaluation job {job_id} for attempt {attempt_id}")
 
-                    # Update job status to in_progress
                     job.status = EvaluationJobStatus.in_progress
                     job.started_at = datetime.now(timezone.utc)
                     db.commit()
 
-                    # Evaluate the attempt
-                    evaluate_attempt_from_job(db, job.attempt_id)
+                    evaluate_attempt_from_job(db, attempt_id)
 
-                    # Mark job as completed
+                    job = db.query(EvaluationJob).filter(EvaluationJob.id == job_id).first()
                     job.status = EvaluationJobStatus.completed
                     job.completed_at = datetime.now(timezone.utc)
                     db.commit()
 
-                    logger.info(f"Evaluation job {job.id} completed successfully")
+                    logger.info(f"Evaluation job {job_id} completed successfully")
 
                 except Exception as e:
-                    logger.error(f"Error processing job {job.id}: {str(e)}")
+                    logger.error(f"Error processing job {job_id}: {str(e)}")
                     db.rollback()
 
-                    # Handle retry logic
+                    job = db.query(EvaluationJob).filter(EvaluationJob.id == job_id).first()
                     job.retry_count += 1
                     job.error_message = str(e)
 
@@ -410,12 +394,11 @@ def process_evaluation_jobs(poll_interval: int = 5, max_retries: int = 3):
 
                     db.commit()
 
-            # Close and recreate session to avoid stale connections
             db.close()
             db = None
 
-            # Sleep before next poll
-            time.sleep(poll_interval)
+            if not job:
+                time.sleep(poll_interval)
 
         except Exception as e:
             logger.error(f"Unexpected error in job consumer: {str(e)}")
