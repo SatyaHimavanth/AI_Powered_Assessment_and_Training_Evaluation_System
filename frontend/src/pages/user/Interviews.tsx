@@ -66,16 +66,22 @@ type SessionResultFull = {
   total_score: number | null;
   summary: string | null;
   transcript: { role: string; content: string; timestamp: string }[];
-  feedback: Record<string, any> | null;
+  feedback: Record<string, unknown> | null;
   evaluations: EvaluationItem[];
   topic_scores: TopicScore[];
 };
 
 const card = "bg-white rounded-[var(--radius)] shadow-[var(--shadow)] border border-[var(--color-border)]";
 
+function getApiError(error: unknown, fallback: string): string {
+  if (!error || typeof error !== "object") return fallback;
+  const response = (error as { response?: { data?: { detail?: unknown } } }).response;
+  return typeof response?.data?.detail === "string" ? response.data.detail : fallback;
+}
+
 interface InterviewsProps {
   onStartInterview?: (templateId: string) => void;
-  onResumeInterview?: (sessionId: string) => void;
+  onResumeInterview?: (sessionId: string, templateId: string) => void;
 }
 
 export default function Interviews({ onStartInterview, onResumeInterview }: InterviewsProps) {
@@ -112,8 +118,8 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
       const res = await api.post("/interviews/request-access", { template_id: templateId });
       setMessage(res.data?.message || "Request submitted");
       reload();
-    } catch (err: any) {
-      setMessage(err?.response?.data?.detail || "Failed to submit request");
+    } catch (err: unknown) {
+      setMessage(getApiError(err, "Failed to submit request"));
     } finally {
       setLoadingId(null);
     }
@@ -126,8 +132,8 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
       const res = await api.post("/interviews/request-retry", { template_id: templateId });
       setMessage(res.data?.message || "Retry request submitted");
       reload();
-    } catch (err: any) {
-      setMessage(err?.response?.data?.detail || "Failed to submit retry request");
+    } catch (err: unknown) {
+      setMessage(getApiError(err, "Failed to submit retry request"));
     } finally {
       setLoadingId(null);
     }
@@ -148,9 +154,9 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
     return session ? session.total_score !== null : true;
   }
 
-  function handleResume(sessionId: string) {
+  function handleResume(sessionId: string, templateId: string) {
     if (onResumeInterview) {
-      onResumeInterview(sessionId);
+      onResumeInterview(sessionId, templateId);
     }
   }
 
@@ -159,8 +165,8 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
     try {
       const res = await api.get(`/interviews/${sessionId}/results`);
       setResultsModal(res.data);
-    } catch (err: any) {
-      setMessage(err?.response?.data?.detail || "Failed to load results");
+    } catch (err: unknown) {
+      setMessage(getApiError(err, "Failed to load results"));
     } finally {
       setLoadingId(null);
     }
@@ -330,7 +336,7 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
                     )}
                     {(s.status === "in_progress" || s.status === "paused") && (
                       <button
-                        onClick={() => handleResume(s.id)}
+                        onClick={() => handleResume(s.id, s.template_id)}
                         className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-blue-50 text-blue-700 hover:bg-blue-100 cursor-pointer transition-colors"
                       >
                         Resume

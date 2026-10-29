@@ -6,10 +6,12 @@ configured pgvector or JSON storage backend.
 """
 
 import os
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
 
 from app.llms import get_embeddings_model
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from core.vector_store import EMBEDDING_DIM, search_question_embeddings
 from db.database import SessionLocal
 from db.models import QuestionEmbedding
@@ -80,21 +82,34 @@ def store_question_embedding(
 
     if len(embedding) != EMBEDDING_DIM:
         raise ValueError(f"Expected embedding dimension {EMBEDDING_DIM}, got {len(embedding)}")
+    if (question_id is None) == (staged_question_id is None):
+        raise ValueError("Exactly one of question_id or staged_question_id is required")
 
     db = SessionLocal()
     try:
-        emb_record = QuestionEmbedding(
+        unique_column = (
+            QuestionEmbedding.question_id
+            if question_id is not None
+            else QuestionEmbedding.staged_question_id
+        )
+        statement = pg_insert(QuestionEmbedding).values(
             id=uuid_mod.uuid4(),
             question_id=question_id,
             staged_question_id=staged_question_id,
             embedding_text=text,
             embedding=embedding,
-        )
-        db.add(emb_record)
+        ).on_conflict_do_update(
+            index_elements=[unique_column],
+            index_where=unique_column.is_not(None),
+            set_={
+                "embedding_text": text,
+                "embedding": embedding,
+                "created_at": datetime.now(timezone.utc),
+            },
+        ).returning(QuestionEmbedding.id)
+        embedding_id = db.execute(statement).scalar_one()
         db.commit()
-        db.refresh(emb_record)
-
-        return emb_record.id
+        return embedding_id
     finally:
         db.close()
 

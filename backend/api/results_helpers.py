@@ -1,7 +1,36 @@
 from uuid import UUID
 from typing import Any
 from sqlalchemy.orm import Session
+from fastapi import HTTPException
 from api.timezone_helper import to_utc_iso
+
+
+def classify_answer_status(answer_text: str | None, score: float | None) -> str:
+    """Give unanswered and unevaluated answers distinct report states."""
+    if not (answer_text or "").strip():
+        return "unattempted"
+    if score is None:
+        return "awaiting_evaluation"
+    if score >= 0.999:
+        return "correct"
+    if score > 0:
+        return "partial"
+    return "incorrect"
+
+
+def answer_score_label(answer_status: str, score: float | None) -> str | float:
+    """Format an answer score consistently in exported result sheets."""
+    if score is not None:
+        return score
+    return "Unattempted" if answer_status == "unattempted" else "Pending"
+
+
+def require_completed_attempt(attempt) -> None:
+    """Prevent result payloads (including answer keys) from escaping early."""
+    from db.models import AttemptStatus
+
+    if attempt.status != AttemptStatus.completed:
+        raise HTTPException(status_code=409, detail="Results are available after submission")
 
 
 def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
@@ -40,6 +69,7 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
     aq_links = (
         db.query(AssessmentQuestion)
         .filter(AssessmentQuestion.assessment_id == assessment.id)
+        .order_by(AssessmentQuestion.position.asc(), AssessmentQuestion.id.asc())
         .all()
     )
 
@@ -118,6 +148,7 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                 "correct_answer": correct_answer_text,
                 "is_correct": is_correct,
                 "score": score_val,
+                "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val),
                 "suggestion": (user_ans.feedback if user_ans and user_ans.feedback else None),
             })
         else:
@@ -175,11 +206,12 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                 "correct_answer": correct_answer_text,
                 "is_correct": is_correct,
                 "score": score_val,
+                "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val),
                 "suggestion": (user_ans.feedback if user_ans and user_ans.feedback else None),
             })
 
     total_questions = len(questions) + len(items)
-    answered = len(user_answers)
+    answered = sum(1 for answer in user_answers if (answer.answer or "").strip())
     score = attempt.score
 
     topic_scores: list[dict[str, Any]] = []

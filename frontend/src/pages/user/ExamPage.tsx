@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import api, { API_BASE } from "../../api";
 import CodingEditor from "../../components/CodingEditor";
+import { AnswerSaveQueue } from "../../answerSaveQueue";
+import { assessmentDeadlineEpoch } from "../../assessmentDeadline";
+import {
+  clearAssessmentDraft,
+  clearOtherAssessmentDrafts,
+  loadAssessmentDraft,
+  saveAssessmentDraft,
+} from "../../assessmentOfflineDraft";
 
 interface Option {
   id: string;
@@ -28,6 +36,8 @@ interface ExamData {
   attempt_id: string;
   assessment_title: string;
   duration: number;
+  assessment_end_time?: string | null;
+  time_remaining_seconds?: number | null;
   total_questions: number;
   questions: ExamQuestion[];
   saved_answers?: { question_id: string; answer: string }[];
@@ -37,10 +47,12 @@ interface ExamData {
 
 interface Props {
   assessmentId: string;
+  userKey: string;
   onExit: () => void;
 }
 
 type Phase = "speed-test" | "exam" | "submitted" | "aborted";
+const OFFLINE_LOCK_AFTER_MS = 5 * 60 * 1000;
 
 function SignalBars({ strength }: { strength: number }) {
   // strength: 0-3
@@ -53,7 +65,7 @@ function SignalBars({ strength }: { strength: number }) {
   );
 }
 
-export default function ExamPage({ assessmentId, onExit }: Props) {
+export default function ExamPage({ assessmentId, userKey, onExit }: Props) {
   const [phase, setPhase] = useState<Phase>("speed-test");
   const [speedMbps, setSpeedMbps] = useState<number | null>(null);
   const [speedTesting, setSpeedTesting] = useState(false);
@@ -62,6 +74,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
   const [currentQ, setCurrentQ] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [timeLeft, setTimeLeft] = useState(0);
+  const [deadlineEnabled, setDeadlineEnabled] = useState(false);
   const [violations, setViolations] = useState(0);
   const [escapeAttempts, setEscapeAttempts] = useState(0);
   const [showWarning, setShowWarning] = useState(false);
@@ -69,19 +82,120 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [signalStrength, setSignalStrength] = useState(3);
   const [error, setError] = useState("");
+  const [saveError, setSaveError] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
   const [showAutoSubmitModal, setShowAutoSubmitModal] = useState(false);
+  const [submittedWithAutosaveWarning, setSubmittedWithAutosaveWarning] = useState(false);
+  const [isOffline, setIsOffline] = useState(false);
+  const [offlineLocked, setOfflineLocked] = useState(false);
+  const [locallyExpired, setLocallyExpired] = useState(false);
+  const [pendingSubmit, setPendingSubmit] = useState(false);
 
   const violationsRef = useRef(0);
   const escapeAttemptsRef = useRef(0);
+  const lastFocusSignalAtRef = useRef(0);
   const examDataRef = useRef<ExamData | null>(null);
   const answersRef = useRef<Record<string, string>>({});
   const timeLeftRef = useRef(0);
+  const deadlineEpochRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const savingQueueRef = useRef<Set<string>>(new Set());
   const internalClipboardRef = useRef<string>("");
+  const answerSaveQueueRef = useRef<AnswerSaveQueue | null>(null);
+  const offlineSinceRef = useRef<number | null>(null);
+  const pendingSubmitRef = useRef(false);
+  const syncOfflineRef = useRef<(() => Promise<void>) | null>(null);
+  const exitFullscreenRef = useRef<(() => void) | null>(null);
+
+  const createAnswerSaveQueue = (attemptId: string) => new AnswerSaveQueue(async (questionId, value) => {
+      await api.post(`/user/assessments/save-answer?attempt_id=${attemptId}`, {
+        question_id: questionId,
+        answer: value,
+      });
+    });
+
+  const markOffline = useCallback(() => {
+    if (offlineSinceRef.current === null) offlineSinceRef.current = Date.now();
+    setIsOffline(true);
+  }, []);
+
+  const persistDraft = useCallback((data = examDataRef.current, nextAnswers = answersRef.current) => {
+    if (!data) return;
+    if (!userKey) {
+      setSaveError("Your account could not be identified for a safe offline draft. Keep this page open until answers sync.");
+      return;
+    }
+    const saved = saveAssessmentDraft({
+      userKey,
+      assessmentId,
+      attemptId: data.attempt_id,
+      updatedAt: Date.now(),
+      timeRemainingSeconds: timeLeftRef.current,
+      answers: nextAnswers,
+      pendingSubmit: pendingSubmitRef.current,
+      examData: data,
+    });
+    if (!saved) setSaveError("Browser storage is unavailable. Keep this page open until your answers sync.");
+  }, [assessmentId, userKey]);
+
+  const syncOfflineDraft = useCallback(async () => {
+    const data = examDataRef.current;
+    if (!data) return;
+    const answerList = data.questions.map((question) => ({
+      question_id: question.id,
+      answer: answersRef.current[question.id] || "",
+    }));
+    try {
+      const response = await api.post(`/user/assessments/offline-sync/${data.attempt_id}`, {
+        answers: answerList,
+      });
+      const status = response.data?.status;
+      if (status === "finished") {
+        clearAssessmentDraft(userKey, assessmentId, data.attempt_id);
+        setIsOffline(false);
+        offlineSinceRef.current = null;
+        setOfflineLocked(false);
+        setLocallyExpired(false);
+        setPendingSubmit(false);
+        pendingSubmitRef.current = false;
+        setSubmittedWithAutosaveWarning(false);
+        setPhase("submitted");
+        exitFullscreenRef.current?.();
+        return;
+      }
+      const remaining = Number(response.data?.time_remaining_seconds);
+      if (Number.isFinite(remaining)) {
+        deadlineEpochRef.current = assessmentDeadlineEpoch(remaining, data.assessment_end_time);
+        timeLeftRef.current = remaining;
+        setTimeLeft(remaining);
+      }
+      offlineSinceRef.current = null;
+      setIsOffline(false);
+      setOfflineLocked(false);
+      setLocallyExpired(false);
+      setError("");
+      setSaveError("");
+
+      if (pendingSubmitRef.current) {
+        await api.post(`/user/assessments/submit/${data.attempt_id}`, { answers: answerList });
+        clearAssessmentDraft(userKey, assessmentId, data.attempt_id);
+        pendingSubmitRef.current = false;
+        setPendingSubmit(false);
+        setSubmittedWithAutosaveWarning(false);
+        setPhase("submitted");
+        exitFullscreenRef.current?.();
+      } else {
+        persistDraft(data);
+      }
+    } catch {
+      markOffline();
+      setError("Could not sync yet. Keep this page open; your saved draft will retry when the connection returns.");
+    }
+  }, [assessmentId, markOffline, persistDraft, userKey]);
+  useEffect(() => {
+    syncOfflineRef.current = syncOfflineDraft;
+  }, [syncOfflineDraft]);
 
   // Keep refs in sync
   useEffect(() => { violationsRef.current = violations; }, [violations]);
@@ -131,6 +245,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     const checkConnection = () => {
       if (!navigator.onLine) {
         setSignalStrength(0);
+        markOffline();
         return;
       }
       // Use Network Information API if available
@@ -147,7 +262,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     checkConnection();
     const interval = setInterval(checkConnection, 3000);
     return () => clearInterval(interval);
-  }, [phase]);
+  }, [phase, markOffline]);
 
   // ---- Start Exam ----
   const startExam = async () => {
@@ -156,29 +271,52 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     try {
       const res = await api.post(`/user/assessments/start/${assessmentId}`);
       const data: ExamData = res.data;
+      answerSaveQueueRef.current = createAnswerSaveQueue(data.attempt_id);
       setExamData(data);
+      violationsRef.current = Number(data.tab_violations || 0);
+      setViolations(violationsRef.current);
 
       // Restore saved answers if resuming
+      const localDraft = userKey
+        ? loadAssessmentDraft<ExamData>(userKey, assessmentId, data.attempt_id)
+        : null;
+      if (userKey) clearOtherAssessmentDrafts(userKey, assessmentId, data.attempt_id);
+      const restored: Record<string, string> = {};
       if (data.saved_answers && data.saved_answers.length > 0) {
-        const restored: Record<string, string> = {};
         data.saved_answers.forEach((sa) => {
           restored[sa.question_id] = sa.answer;
         });
-        setAnswers(restored);
       }
-
-      // Adjust timer for elapsed time on resume
-      const totalSeconds = data.duration * 60;
-      const elapsed = data.time_elapsed_seconds || 0;
-      const remaining = Math.max(0, totalSeconds - elapsed);
-      setTimeLeft(remaining);
-
-      // Restore violations count on resume
-      if (data.tab_violations) {
-        setViolations(data.tab_violations);
+      if (localDraft) {
+        const allowedQuestionIds = new Set(data.questions.map((question) => question.id));
+        for (const [questionId, answer] of Object.entries(localDraft.answers)) {
+          if (allowedQuestionIds.has(questionId)) restored[questionId] = answer;
+        }
       }
+      answersRef.current = restored;
+      setAnswers(restored);
+      pendingSubmitRef.current = Boolean(localDraft?.pendingSubmit);
+      setPendingSubmit(pendingSubmitRef.current);
+
+      const serverRemaining = data.time_remaining_seconds;
+      const remaining = typeof serverRemaining === "number" && localDraft
+        ? Math.min(serverRemaining, localDraft.timeRemainingSeconds)
+        : serverRemaining;
+      const hasDeadline = typeof remaining === "number";
+      setDeadlineEnabled(hasDeadline);
+      deadlineEpochRef.current = hasDeadline
+        ? assessmentDeadlineEpoch(remaining, data.assessment_end_time)
+        : null;
+      timeLeftRef.current = hasDeadline ? remaining : 0;
+      setTimeLeft(hasDeadline ? remaining : 0);
+
 
       setPhase("exam");
+      examDataRef.current = data;
+      persistDraft(data, restored);
+      if (localDraft || pendingSubmitRef.current) {
+        window.setTimeout(() => { void syncOfflineRef.current?.(); }, 0);
+      }
       // Request fullscreen
       try {
         await document.documentElement.requestFullscreen();
@@ -187,7 +325,10 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
       }
     } catch (err: unknown) {
       console.error(err);
-      setError("Failed to start assessment");
+      if (navigator.onLine === false) markOffline();
+      const apiDetail = (err as { response?: { data?: { detail?: unknown } } })
+        .response?.data?.detail;
+      setError(typeof apiDetail === "string" ? apiDetail : "Failed to start assessment");
     } finally {
       setStarting(false);
     }
@@ -203,13 +344,44 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
     }
   }, []);
 
+  const flushAnswerSaves = useCallback(async () => {
+    try {
+      if (answerSaveQueueRef.current) await answerSaveQueueRef.current.flush();
+      setSaveError("");
+    } catch {
+      markOffline();
+      setSaveError("Some answers have not synced. Keep this page open; the saved draft will retry when the connection returns.");
+      throw new Error("One or more assessment answers could not be saved");
+    }
+  }, [markOffline]);
+
   const handleSubmit = useCallback(async () => {
     if (submittingRef.current) return;
+    if (isOffline || navigator.onLine === false) {
+      pendingSubmitRef.current = true;
+      setPendingSubmit(true);
+      setLocallyExpired((current) => current || timeLeftRef.current <= 0);
+      setError("Submission has not reached the server. Keep this page open; it will sync and submit when the connection returns.");
+      persistDraft();
+      markOffline();
+      return;
+    }
     submittingRef.current = true;
     setSubmitting(true);
 
     const data = examDataRef.current;
     if (!data) { submittingRef.current = false; setSubmitting(false); return; }
+
+    let autosaveFailed = false;
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+    try {
+      await flushAnswerSaves();
+    } catch {
+      autosaveFailed = true;
+    }
 
     const answerList = data.questions.map((q) => ({
       question_id: q.id,
@@ -218,113 +390,178 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
 
     try {
       await api.post(`/user/assessments/submit/${data.attempt_id}`, { answers: answerList });
+      clearAssessmentDraft(userKey, assessmentId, data.attempt_id);
+      pendingSubmitRef.current = false;
+      setPendingSubmit(false);
       if (timerRef.current) clearInterval(timerRef.current);
+      setSubmittedWithAutosaveWarning(autosaveFailed);
       setPhase("submitted");
       exitFullscreen();
     } catch {
+      markOffline();
+      if (timeLeftRef.current <= 0 || (deadlineEpochRef.current !== null && Date.now() >= deadlineEpochRef.current)) {
+        pendingSubmitRef.current = true;
+        setPendingSubmit(true);
+        setLocallyExpired(true);
+      }
+      persistDraft();
       if (timeLeftRef.current <= 0 && timerRef.current) clearInterval(timerRef.current);
       setShowAutoSubmitModal(false);
-      setError("Submission failed. Check your connection and submit again.");
+      setError(
+          deadlineEpochRef.current !== null && Date.now() >= deadlineEpochRef.current
+          ? "Your time has expired. Keep this page open and reconnect so your saved draft can sync before evaluation."
+          : "Submission failed. Check your connection and submit again."
+      );
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [exitFullscreen]);
+  }, [assessmentId, exitFullscreen, flushAnswerSaves, isOffline, markOffline, persistDraft, userKey]);
 
-  const handleAbort = useCallback(async () => {
-    if (submittingRef.current) return;
-    submittingRef.current = true;
-    setSubmitting(true);
-    if (timerRef.current) clearInterval(timerRef.current);
-
-    const data = examDataRef.current;
-    if (!data) { setPhase("aborted"); submittingRef.current = false; setSubmitting(false); return; }
-
-    const answerList = data.questions.map((q) => ({
-      question_id: q.id,
-      answer: answersRef.current[q.id] || "",
-    }));
-
-    try {
-      await api.post(`/user/assessments/abort/${data.attempt_id}`, { answers: answerList });
-    } catch {
-      setError("The assessment was closed, but the server could not confirm that your answers were saved.");
-    }
-
-    setPhase("aborted");
-    exitFullscreen();
-    submittingRef.current = false;
-    setSubmitting(false);
+  useEffect(() => {
+    exitFullscreenRef.current = exitFullscreen;
   }, [exitFullscreen]);
 
   // ---- Timer ----
   useEffect(() => {
-    if (phase !== "exam") return;
+    if (phase !== "exam" || offlineLocked || locallyExpired || !deadlineEnabled || deadlineEpochRef.current === null) return;
     timerRef.current = setInterval(() => {
-      setTimeLeft((prev) => {
-        if (prev <= 1) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          // Auto-submit on time up
-          setShowAutoSubmitModal(true);
-          void handleSubmit();
-          return 0;
+      const deadline = deadlineEpochRef.current;
+      if (deadline === null) return;
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      timeLeftRef.current = remaining;
+      setTimeLeft(remaining);
+      if (remaining === 0) {
+        if (timerRef.current) clearInterval(timerRef.current);
+        setShowAutoSubmitModal(true);
+        if (isOffline || navigator.onLine === false) {
+          pendingSubmitRef.current = true;
+          setPendingSubmit(true);
+          setLocallyExpired(true);
+          persistDraft();
+          markOffline();
         }
-        return prev - 1;
-      });
+        void handleSubmit();
+      } else {
+        setTimeLeft(remaining);
+        persistDraft();
+      }
     }, 1000);
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [phase, handleSubmit]);
+  }, [phase, deadlineEnabled, offlineLocked, locallyExpired, handleSubmit, isOffline, markOffline, persistDraft]);
+
+  // The server checkpoints active time on each heartbeat. Leaving this page
+  // pauses the session; missed heartbeats are bounded by the server lease.
+  useEffect(() => {
+    const attemptId = examData?.attempt_id;
+    if (phase !== "exam" || !attemptId) return;
+    const heartbeat = setInterval(() => {
+      void api.post(`/user/assessments/heartbeat/${attemptId}`).then((response) => {
+        const remaining = Number(response.data?.time_remaining_seconds);
+        if (Number.isFinite(remaining)) {
+          const currentData = examDataRef.current;
+          deadlineEpochRef.current = currentData
+            ? assessmentDeadlineEpoch(remaining, currentData.assessment_end_time)
+            : Date.now() + remaining * 1000;
+          timeLeftRef.current = remaining;
+          setTimeLeft(remaining);
+        }
+        if (offlineSinceRef.current !== null || response.data?.status === "finished") {
+          void syncOfflineRef.current?.();
+        }
+      }).catch(() => {
+        markOffline();
+      });
+    }, 5000);
+    const onOnline = () => { void syncOfflineRef.current?.(); };
+    const onOffline = () => { markOffline(); };
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      clearInterval(heartbeat);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+      void api.post(`/user/assessments/pause/${attemptId}`).catch(() => {
+        // Heartbeat lease bounds time if a best-effort pause cannot reach the server.
+      });
+    };
+  }, [phase, examData?.attempt_id, markOffline]);
+
+  useEffect(() => {
+    if (phase !== "exam") return;
+    const timer = window.setInterval(() => {
+      const offlineSince = offlineSinceRef.current;
+      if (offlineSince === null || Date.now() - offlineSince < OFFLINE_LOCK_AFTER_MS) return;
+      if (!offlineLocked) {
+        setOfflineLocked(true);
+        if (deadlineEpochRef.current !== null) {
+          deadlineEpochRef.current = Date.now() + timeLeftRef.current * 1000;
+        }
+        persistDraft();
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [phase, offlineLocked, persistDraft]);
 
   // ---- Fullscreen / Tab Violations ----
-  const saveViolationsToServer = useCallback((count: number) => {
-    const data = examDataRef.current;
-    if (!data) return;
-    api.post(`/user/assessments/save-violations?attempt_id=${data.attempt_id}&violations=${count}`)
-      .catch(() => { /* silent */ });
-  }, []);
+  const sendIntegrityEvent = useCallback((eventType: string) => {
+    const attemptId = examDataRef.current?.attempt_id;
+    if (!attemptId) return Promise.resolve(null);
+    // The event UUID survives HTTP retries at the server's idempotency boundary.
+    const payload = {
+      event_id: crypto.randomUUID(),
+      event_type: eventType,
+      answers: Object.entries(answersRef.current).map(([question_id, answer]) => ({ question_id, answer })),
+    };
+    return api.post(`/user/assessments/save-violations?attempt_id=${attemptId}`, payload).catch(() =>
+      api.post(`/user/assessments/save-violations?attempt_id=${attemptId}`, payload),
+    ).catch(() => {
+      markOffline();
+      return null;
+    });
+  }, [markOffline]);
 
-  const handleViolation = useCallback(() => {
+  const handleViolation = useCallback((eventType: "focus_lost" | "fullscreen_exit" = "focus_lost") => {
     if (phase !== "exam") return;
+    // visibilitychange, blur, and fullscreenchange often describe one action.
+    // Coalesce them so one browser action counts as one exit event.
+    const now = Date.now();
+    if (now - lastFocusSignalAtRef.current < 1500) return;
+    lastFocusSignalAtRef.current = now;
     const newCount = violationsRef.current + 1;
+    violationsRef.current = newCount;
     setViolations(newCount);
     setWarningType('violation');
-    saveViolationsToServer(newCount);
 
-    if (newCount >= 5) {
-      // Abort exam
-      handleAbort();
-    } else {
-      setShowWarning(true);
-      // Re-enter fullscreen
-      try {
-        document.documentElement.requestFullscreen();
-      } catch { /* ignore */ }
+    setShowWarning(true);
+    void sendIntegrityEvent(eventType).then((response) => {
+      if (response?.data?.status === "aborted") {
+        setPhase("aborted");
+        exitFullscreenRef.current?.();
+      }
+    });
+    // Re-enter fullscreen after the warning; the server applies the configured
+    // five-event limit using deduplicated, attempt-owned event IDs.
+    if (document.fullscreenEnabled) {
+      void document.documentElement.requestFullscreen().catch(() => {});
     }
-  }, [phase, handleAbort, saveViolationsToServer]);
+  }, [phase, sendIntegrityEvent]);
 
   // ---- Escape Key Handler ----
   const handleEscapeAttempt = useCallback(() => {
     if (phase !== "exam") return;
     const newCount = escapeAttemptsRef.current + 1;
+    sendIntegrityEvent("escape_key");
     setEscapeAttempts(newCount);
     setWarningType('escape');
-    saveViolationsToServer(violationsRef.current + newCount);
 
-    if (newCount >= 5) {
-      // Auto-abort after 5 escape attempts
-      handleAbort();
-    } else {
-      setShowWarning(true);
-      // Immediately re-enter fullscreen (in case browser allowed ESC to exit)
-      setTimeout(() => {
-        try {
-          if (!document.fullscreenElement) {
-            document.documentElement.requestFullscreen();
-          }
-        } catch { /* ignore */ }
-      }, 50);
+    setShowWarning(true);
+    // Escape can be a browser/assistive-technology action. Do not end the
+    // assessment based on this client-side signal.
+    if (document.fullscreenEnabled && !document.fullscreenElement) {
+      void document.documentElement.requestFullscreen().catch(() => {});
     }
-  }, [phase, handleAbort, saveViolationsToServer]);
+  }, [phase, sendIntegrityEvent]);
 
   useEffect(() => {
     if (phase !== "exam") return;
@@ -345,7 +582,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
         }, 50);
         
         // Only count as violation if not an escape attempt
-        handleViolation();
+        handleViolation("fullscreen_exit");
       }
     };
     const onBlur = () => {
@@ -366,8 +603,10 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
         ((e.metaKey || e.ctrlKey) && e.altKey && key === "i")
       ) {
         e.preventDefault();
-        // Immediately abort the exam if DevTools is opened
-        handleAbort();
+        // Browser key events are advisory only and cannot prove misconduct.
+        sendIntegrityEvent("devtools_shortcut");
+        setWarningType('violation');
+        setShowWarning(true);
         return;
       }
 
@@ -455,32 +694,22 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
       document.removeEventListener("paste", onPaste);
       // cleanup (no size-based DevTools interval to clear)
     };
-  }, [phase, handleViolation, handleEscapeAttempt, handleAbort]);
+  }, [phase, handleViolation, handleEscapeAttempt, sendIntegrityEvent]);
 
 
 
   // ---- Answer handling with auto-save ----
-  const saveAnswerToServer = useCallback((questionId: string, value: string) => {
-    const data = examDataRef.current;
-    if (!data) return;
-    // Fire and forget - don't block the UI
-    api.post(`/user/assessments/save-answer?attempt_id=${data.attempt_id}`, {
-      question_id: questionId,
-      answer: value,
-    }).catch(() => { /* silent fail - will be saved on final submit */ });
-  }, []);
-
   const setAnswer = (questionId: string, value: string) => {
-    setAnswers((prev) => ({ ...prev, [questionId]: value }));
+    const nextAnswers = { ...answersRef.current, [questionId]: value };
+    answersRef.current = nextAnswers;
+    setAnswers(nextAnswers);
+    persistDraft(examDataRef.current, nextAnswers);
 
     // Debounced auto-save: save after 500ms of inactivity per question
-    savingQueueRef.current.add(questionId);
+    answerSaveQueueRef.current?.enqueue(questionId, value);
     if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
     saveTimeoutRef.current = setTimeout(() => {
-      savingQueueRef.current.forEach((qId) => {
-        saveAnswerToServer(qId, answersRef.current[qId] || "");
-      });
-      savingQueueRef.current.clear();
+      void flushAnswerSaves().catch(() => undefined);
     }, 500);
   };
 
@@ -577,8 +806,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
             <ul className="text-xs text-amber-700 space-y-0.5 list-disc ml-3">
               <li>The exam will open in fullscreen mode</li>
               <li>Exiting fullscreen or switching tabs will trigger a warning</li>
-              <li>Pressing Escape is blocked (after 5 attempts your exam will abort)</li>
-              <li>After 5 violations, the exam will be automatically aborted</li>
+              <li>Fullscreen and focus changes may show a reminder</li>
               <li>You cannot re-enter the exam once you leave</li>
             </ul>
           </div>
@@ -601,6 +829,11 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
               </div>
               <h2 className="text-lg font-semibold mb-2">Assessment Submitted</h2>
               <p className="text-sm text-[var(--color-text-secondary)]">Your answers have been recorded successfully.</p>
+              {submittedWithAutosaveWarning && (
+                <p role="alert" className="mt-3 text-sm text-amber-800">
+                  One or more autosaves failed before submission. Check your results to confirm each answer was recorded.
+                </p>
+              )}
             </>
           ) : (
             <>
@@ -630,6 +863,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
   if (!examData) return null;
 
   const question = examData.questions[currentQ];
+  const answersLocked = submitting || offlineLocked || locallyExpired || pendingSubmit;
   const answeredCount = Object.keys(answers).filter((k) => answers[k].trim()).length;
   const sectionOrder: string[] = [];
   const questionsBySection: Record<string, number[]> = {};
@@ -645,6 +879,24 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col">
+      {isOffline && !offlineLocked && !locallyExpired && (
+        <div role="status" className="bg-amber-100 px-5 py-2 text-sm text-amber-950">
+          Connection lost. Answers are being saved on this device and the timer continues for up to five minutes. Keep this page open.
+        </div>
+      )}
+      {(offlineLocked || (locallyExpired && isOffline)) && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-5">
+          <section role="alert" aria-live="assertive" className="max-w-lg rounded-xl bg-white p-7 text-center text-gray-900 shadow-2xl">
+            <h2 className="text-xl font-semibold">{locallyExpired ? "Assessment time has ended" : "Assessment paused while offline"}</h2>
+            <p className="mt-3 text-sm leading-6 text-gray-700">
+              {pendingSubmit
+                ? "Your answers are saved on this device. Keep this page open and reconnect so they can be synced and submitted."
+                : "Answers are locked and the assessment timer is paused. Keep this page open; when the connection returns, your draft will sync and the same attempt can resume if time remains."}
+            </p>
+            <p className="mt-3 text-sm font-medium text-red-700">Do not refresh or close this page.</p>
+          </section>
+        </div>
+      )}
       {/* Warning Modal */}
       {showWarning && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
@@ -656,16 +908,16 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
             </div>
             {warningType === 'escape' ? (
               <>
-                <h3 className="text-base font-semibold mb-1">Exit Blocked! ({escapeAttempts}/5)</h3>
+                <h3 className="text-base font-semibold mb-1">Reminder ({escapeAttempts})</h3>
                 <p className="text-sm text-[var(--color-text-secondary)] mb-4">
-                  You cannot exit the exam by pressing Escape. After 5 attempts, your exam will be automatically terminated.
+                  Your assessment remains active. Use the assessment controls to submit when you are ready.
                 </p>
               </>
             ) : (
               <>
-                <h3 className="text-base font-semibold mb-1">Warning! ({violations}/5)</h3>
+            <h3 className="text-base font-semibold mb-1">Assessment exit warning ({violations}/5)</h3>
                 <p className="text-sm text-[var(--color-text-secondary)] mb-4">
-                  Leaving the exam window is not allowed. After 5 violations your exam will be automatically terminated.
+                  A focus or fullscreen exit counts toward the five-event limit. The fifth event ends the attempt and saves your synced answers.
                 </p>
               </>
             )}
@@ -732,6 +984,11 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
       {error && (
         <div className="bg-red-700 px-6 py-2 text-center text-sm text-white">{error}</div>
       )}
+      {saveError && (
+        <div role="alert" className="bg-amber-100 px-6 py-2 text-center text-sm text-amber-900">
+          {saveError}
+        </div>
+      )}
       {/* Top Bar */}
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -747,8 +1004,8 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
               {signalStrength === 0 ? "Offline" : signalStrength === 1 ? "Weak" : signalStrength === 2 ? "Fair" : "Good"}
             </span>
           </div>
-          <div className={`text-sm font-mono font-semibold px-3 py-1 rounded ${timeLeft < 60 ? "bg-red-600 animate-pulse" : timeLeft < 300 ? "bg-amber-600" : "bg-gray-700"}`}>
-            {formatTime(timeLeft)}
+          <div className={`text-sm font-mono font-semibold px-3 py-1 rounded ${deadlineEnabled && timeLeft < 60 ? "bg-red-600 animate-pulse" : deadlineEnabled && timeLeft < 300 ? "bg-amber-600" : "bg-gray-700"}`}>
+            {deadlineEnabled ? formatTime(timeLeft) : "No time limit"}
           </div>
           <span className="text-xs text-gray-400">
             {answeredCount}/{examData.total_questions} answered
@@ -760,12 +1017,12 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
           )}
           {escapeAttempts > 0 && (
             <span className="text-xs text-orange-400 font-medium">
-              Escape Attempts: {escapeAttempts}/5
+              Escape reminders: {escapeAttempts}
             </span>
           )}
           <button
             onClick={() => setShowSubmitConfirm(true)}
-            disabled={submitting}
+            disabled={answersLocked}
             className="h-9 px-4 text-sm font-medium rounded bg-green-600 hover:bg-green-500 disabled:opacity-50 cursor-pointer"
           >
             {submitting ? "Submitting..." : "Submit Assessment"}
@@ -832,6 +1089,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
         <main className="flex-1 flex overflow-hidden min-h-0">
           {question.type === "coding" ? (
             <CodingEditor
+              key={question.id}
               questionId={question.id}
               questionText={question.question}
               difficulty={question.difficulty}
@@ -842,6 +1100,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
               onChange={(code) => setAnswer(question.id, code)}
               disablePaste={phase === "exam"}
               onPasteAttempt={() => handleViolation()}
+              readOnly={answersLocked}
             />
           ) : (
           <div className="flex-1 p-8 overflow-y-auto">
@@ -889,6 +1148,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
                         type={question.type === "single_mcq" ? "radio" : "checkbox"}
                         name={`q-${question.id}`}
                         checked={isSelected}
+                        disabled={answersLocked}
                         onChange={() => {
                           if (question.type === "single_mcq") {
                             setAnswer(question.id, opt.id);
@@ -911,6 +1171,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
               <textarea
                 value={answers[question.id] || ""}
                 onChange={(e) => setAnswer(question.id, e.target.value)}
+                disabled={answersLocked}
                 placeholder="Type your answer here..."
                 className="w-full h-48 p-4 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white placeholder:text-gray-500 resize-none focus:border-[var(--color-primary)] focus:outline-none"
               />
@@ -925,7 +1186,7 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
       <footer className="bg-gray-800 border-t border-gray-700 px-6 py-3 flex items-center justify-between">
         <button
           onClick={() => setCurrentQ(Math.max(0, currentQ - 1))}
-          disabled={currentQ === 0}
+          disabled={currentQ === 0 || answersLocked}
           className="h-9 px-4 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
         >
           Previous
@@ -934,7 +1195,8 @@ export default function ExamPage({ assessmentId, onExit }: Props) {
           {currentQ < examData.questions.length - 1 ? (
             <button
               onClick={goToNextQuestionInSection}
-              className="h-9 px-4 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 cursor-pointer"
+              disabled={answersLocked}
+              className="h-9 px-4 text-sm font-medium rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
             >
               Next
             </button>

@@ -26,11 +26,16 @@ interface InterviewSession {
   started_at: string | null;
   completed_at: string | null;
   total_score: number | null;
+  remaining_seconds?: number | null;
 }
 
 interface SessionResult {
   id: string;
+  attempt_number?: number;
   status: string;
+  pause_count?: number;
+  started_at: string | null;
+  remaining_seconds: number | null;
   transcript: { role: string; content: string; timestamp: string }[];
 }
 
@@ -41,6 +46,41 @@ interface Props {
 }
 
 type Phase = "details" | "interview" | "completed";
+
+function interruptKey(sessionId: string) {
+  return `interview_interrupt_${sessionId}`;
+}
+
+function markPotentialInterrupt(sessionId: string | null) {
+  if (!sessionId) return;
+  try {
+    window.localStorage.setItem(interruptKey(sessionId), "1");
+  } catch (error) {
+    console.warn("Could not persist interview interruption marker", error);
+  }
+}
+
+function clearPotentialInterrupt(sessionId: string | null) {
+  if (!sessionId) return;
+  try {
+    window.localStorage.removeItem(interruptKey(sessionId));
+  } catch (error) {
+    console.warn("Could not clear interview interruption marker", error);
+  }
+}
+
+function apiErrorDetail(error: unknown, fallback: string): string {
+  if (error && typeof error === "object" && "response" in error) {
+    const response = error.response;
+    if (response && typeof response === "object" && "data" in response) {
+      const data = response.data;
+      if (data && typeof data === "object" && "detail" in data && typeof data.detail === "string") {
+        return data.detail;
+      }
+    }
+  }
+  return fallback;
+}
 
 export default function InterviewPage({ templateId, sessionId: resumeSessionId, onExit }: Props) {
   const [phase, setPhase] = useState<Phase>(resumeSessionId ? "interview" : "details");
@@ -66,36 +106,20 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   const draftRef = useRef<string>("");
   const submittingDraftRef = useRef(false);
   const endingRef = useRef(false);
+  const endInterviewRef = useRef<() => Promise<void>>(async () => {});
+  const submitDraftRef = useRef<(auto: boolean) => Promise<void>>(async () => {});
+  const submitMessageRef = useRef<(sessionId: string, text: string, auto: boolean) => Promise<void>>(async () => {});
+  const reportInterruptRef = useRef<(sessionId: string) => Promise<void>>(async () => {});
 
   // Keep draftRef in sync
   useEffect(() => { draftRef.current = draft; }, [draft]);
-
-  const interruptKey = (sessionId: string) => `interview_interrupt_${sessionId}`;
-
-  const markPotentialInterrupt = (sessionId: string | null) => {
-    if (!sessionId) return;
-    try {
-      window.localStorage.setItem(interruptKey(sessionId), "1");
-    } catch {
-      // ignore
-    }
-  };
-
-  const clearPotentialInterrupt = (sessionId: string | null) => {
-    if (!sessionId) return;
-    try {
-      window.localStorage.removeItem(interruptKey(sessionId));
-    } catch {
-      // ignore
-    }
-  };
 
   useEffect(() => {
     const loadTemplate = async () => {
       try {
         const res = await api.get("/interviews/templates");
-        const templates = Array.isArray(res.data) ? res.data : [];
-        const t = templates.find((x: any) => x.id === templateId);
+        const templates = Array.isArray(res.data) ? res.data as InterviewTemplate[] : [];
+        const t = templates.find((item) => item.id === templateId);
         if (t) {
           setTemplate(t);
         } else {
@@ -108,29 +132,51 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       }
     };
     loadTemplate();
-  }, [templateId]);
+  }, [templateId, resumeSessionId]);
+
+  async function loadSessionResult(sessionId: string) {
+    const res = await api.get(`/interviews/${sessionId}/results`);
+    setSessionResult(res.data);
+    return res.data as SessionResult;
+  }
 
   // If resuming, load existing session and enter interview phase (wait for template)
   useEffect(() => {
     if (!resumeSessionId || !template) return;
     const resumeExisting = async () => {
       try {
-        // Report any pending interrupt from previous disconnection
+        // Report any pending interrupt from previous disconnection.
         const key = interruptKey(resumeSessionId);
         if (window.localStorage.getItem(key)) {
-          await api.post(`/interviews/${resumeSessionId}/interrupt`).catch(() => {});
+          await api.post(`/interviews/${resumeSessionId}/interrupt`);
           window.localStorage.removeItem(key);
         }
-        // Resume the session on the backend
-        await api.post(`/interviews/${resumeSessionId}/resume`).catch(() => {});
-        await loadSessionResult(resumeSessionId);
+        const result = await loadSessionResult(resumeSessionId);
+        const transcript = Array.isArray(result.transcript) ? result.transcript : [];
+        const pendingAnswer = transcript[transcript.length - 1];
+        if (pendingAnswer?.role === "user" && typeof pendingAnswer.content === "string") {
+          setDraft(pendingAnswer.content);
+          setError("Your last answer was saved but could not be evaluated. Retry it to continue.");
+        }
+        if (result.status === "paused") {
+          await api.post(`/interviews/${resumeSessionId}/resume`);
+        } else if (result.status !== "in_progress" && result.status !== "started") {
+          setPhase("completed");
+          return;
+        }
         sessionIdRef.current = resumeSessionId;
-        setSession({ id: resumeSessionId, template_id: templateId, template_title: template.title, status: "in_progress", attempt_number: 1, pause_count: 0, max_pauses_allowed: template.max_pauses_allowed, started_at: null, completed_at: null, total_score: null });
-        // Set overall timer from template duration
-        setOverallSecondsLeft(template.duration_minutes * 60);
+        setSession({ id: resumeSessionId, template_id: templateId, template_title: template.title, status: "in_progress", attempt_number: result.attempt_number ?? 1, pause_count: result.pause_count ?? 0, max_pauses_allowed: template.max_pauses_allowed, started_at: result.started_at, completed_at: null, total_score: null });
+        const elapsed = result.started_at
+          ? Math.floor((Date.now() - new Date(result.started_at).getTime()) / 1000)
+          : template.duration_minutes * 60;
+        setOverallSecondsLeft(result.remaining_seconds ?? Math.max(0, template.duration_minutes * 60 - elapsed));
         setPhase("interview");
         markPotentialInterrupt(resumeSessionId);
-        try { await document.documentElement.requestFullscreen(); } catch {}
+        try {
+          await document.documentElement.requestFullscreen();
+        } catch (fullscreenError) {
+          console.info("Fullscreen is unavailable; interview can continue", fullscreenError);
+        }
       } catch {
         setError("Failed to resume interview");
       } finally {
@@ -138,16 +184,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       }
     };
     resumeExisting();
-  }, [resumeSessionId, template]);
-
-  const loadSessionResult = async (sessionId: string) => {
-    try {
-      const res = await api.get(`/interviews/${sessionId}/results`);
-      setSessionResult(res.data);
-    } catch {
-      setSessionResult(null);
-    }
-  };
+  }, [resumeSessionId, template, templateId]);
 
   const startInterview = async () => {
     if (!template) return;
@@ -159,18 +196,22 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
     }
     setLoading(true);
     try {
-      const res = await api.post("/interviews/start", { template_id: template.id });
+      const res = await api.post(
+        "/interviews/start",
+        { template_id: template.id },
+        { timeout: 180_000 },
+      );
       const newSession: InterviewSession = res.data;
       setSession(newSession);
       sessionIdRef.current = newSession.id;
       setDraft("");
       setEditSecondsLeft(null);
-      setOverallSecondsLeft(template.duration_minutes * 60);
+      setOverallSecondsLeft(newSession.remaining_seconds ?? template.duration_minutes * 60);
       await loadSessionResult(newSession.id);
       setPhase("interview");
       markPotentialInterrupt(newSession.id);
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || "Failed to start interview");
+    } catch (err: unknown) {
+      setError(apiErrorDetail(err, "Failed to start interview"));
       // Exit fullscreen if start failed
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
@@ -182,13 +223,13 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
   // Overall interview timer countdown
   useEffect(() => {
-    if (phase !== "interview" || overallSecondsLeft <= 0) return;
+    if (phase !== "interview") return;
     overallTimerRef.current = window.setInterval(() => {
       setOverallSecondsLeft((prev) => {
         if (prev <= 1) {
           if (overallTimerRef.current) window.clearInterval(overallTimerRef.current);
           // Time's up - end interview
-          void endInterview();
+          void endInterviewRef.current();
           return 0;
         }
         return prev - 1;
@@ -197,11 +238,12 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
     return () => {
       if (overallTimerRef.current) window.clearInterval(overallTimerRef.current);
     };
-  }, [phase, overallSecondsLeft > 0]);
+  }, [phase]);
 
   // Edit window timer (starts when mic stops, 3 minutes)
+  const isEditTimerActive = editSecondsLeft !== null;
   useEffect(() => {
-    if (editSecondsLeft === null) {
+    if (!isEditTimerActive) {
       if (editTimerRef.current) {
         window.clearInterval(editTimerRef.current);
         editTimerRef.current = null;
@@ -215,9 +257,9 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
           editTimerRef.current = null;
           // Auto-submit when edit window expires
           if ((draftRef.current || "").trim()) {
-            void submitDraft(true);
+            void submitDraftRef.current(true);
           } else {
-            void submitMessage(sessionIdRef.current || "", "No response provided.", true);
+            void submitMessageRef.current(sessionIdRef.current || "", "No response provided.", true);
           }
           return null;
         }
@@ -230,7 +272,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
         editTimerRef.current = null;
       }
     };
-  }, [editSecondsLeft !== null]); // only restart when timer starts/stops
+  }, [isEditTimerActive]); // only restart when timer starts/stops
 
   // Handle mic stopped -> start edit window
   const handleMicStopped = () => {
@@ -292,14 +334,14 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
     const onOnline = () => {
       if (sessionIdRef.current) {
-        void reportInterrupt(sessionIdRef.current);
+        void reportInterruptRef.current(sessionIdRef.current);
       }
     };
 
     const onFullscreenChange = () => {
       if (!document.fullscreenElement && sessionIdRef.current && phase === "interview") {
         // User exited fullscreen — record as interrupt/pause
-        void reportInterrupt(sessionIdRef.current);
+        void reportInterruptRef.current(sessionIdRef.current);
       }
     };
 
@@ -331,7 +373,11 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
     submittingDraftRef.current = true;
     setIsSubmittingDraft(true);
     try {
-      const res = await api.post(`/interviews/${sessionId}/message`, { response_text: text });
+      const res = await api.post(
+        `/interviews/${sessionId}/message`,
+        { response_text: text },
+        { timeout: 180_000 },
+      );
       const fromAuto = auto ? " (auto-submitted)" : "";
       console.log(`Response submitted${fromAuto}. Score: ${res.data?.score ?? "N/A"}`);
       setDraft("");
@@ -341,8 +387,8 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       if (!ttsEnabled) {
         setEditSecondsLeft(180);
       }
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || "Failed to submit response");
+    } catch (err: unknown) {
+      setError(apiErrorDetail(err, "Failed to submit response"));
     } finally {
       submittingDraftRef.current = false;
       setIsSubmittingDraft(false);
@@ -371,18 +417,45 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
       }
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || "Failed to end interview");
+    } catch (err: unknown) {
+      setError(apiErrorDetail(err, "Failed to end interview"));
     } finally {
       endingRef.current = false;
       setLoading(false);
     }
   }
 
+  useEffect(() => {
+    endInterviewRef.current = endInterview;
+    submitDraftRef.current = submitDraft;
+    submitMessageRef.current = submitMessage;
+    reportInterruptRef.current = reportInterrupt;
+  });
+
   if (loading && phase === "details") {
     return (
       <div className="fixed inset-0 bg-white flex items-center justify-center">
         <p className="text-sm text-gray-500">Loading...</p>
+      </div>
+    );
+  }
+
+  if (phase === "interview" && (!session || !sessionResult)) {
+    return (
+      <div className="fixed inset-0 bg-white flex items-center justify-center p-6">
+        <div className="max-w-md text-center">
+          <p className="text-sm text-red-700" role="alert">
+            {error || (loading ? "Loading interview session..." : "Interview session is unavailable.")}
+          </p>
+          {!loading && (
+            <button
+              onClick={onExit}
+              className="mt-5 h-10 px-5 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
+            >
+              Return to interviews
+            </button>
+          )}
+        </div>
       </div>
     );
   }

@@ -1,9 +1,9 @@
 import os
-import csv
-import io
 import uuid
+from io import BytesIO
 from collections.abc import Iterator
 
+from openpyxl import Workbook
 import pytest
 import requests
 
@@ -43,6 +43,7 @@ def _login(client: requests.Session, api_url: str, username: str, password: str)
     response = client.post(
         f"{api_url}/auth/login",
         json={"username": username, "password": password},
+        headers={"X-Token-Response": "bearer"},
         timeout=10,
     )
     if response.status_code != 200:
@@ -102,7 +103,10 @@ def provisioned_assessment(
     suffix = uuid.uuid4().hex[:10]
     topic_name = f"testsuite_topic_{suffix}"
     batch_name = f"testsuite_batch_{suffix}"
+    assessment_title = f"TestSuite concurrency assessment {suffix}"
+    mixed_assessment_title = f"TestSuite mixed assessment {suffix}"
     assessment_id = None
+    mixed_assessment_id = None
     batch_id = None
     topic_id = None
     created_users = []
@@ -133,41 +137,54 @@ def provisioned_assessment(
             }
         )
 
-    csv_buffer = io.StringIO()
-    writer = csv.DictWriter(
-        csv_buffer,
-        fieldnames=[
-            "type",
-            "difficulty",
-            "question",
-            "option_a",
-            "option_b",
-            "correct_options",
-        ],
-    )
-    writer.writeheader()
+    workbook = Workbook()
+    questions_sheet = workbook.active
+    questions_sheet.title = "questions"
+    questions_sheet.append([
+        "type", "difficulty", "question", "option_a", "option_b",
+        "option_c", "correct_options", "reference_answer", "default_code",
+    ])
     for index in range(4):
-        writer.writerow(
-            {
-                "type": "single_mcq",
-                "difficulty": "easy",
-                "question": f"TestSuite concurrency question {suffix}-{index}?",
-                "option_a": "Correct",
-                "option_b": "Incorrect",
-                "correct_options": "A",
-            }
-        )
+        questions_sheet.append([
+            "single_mcq", "easy", f"TestSuite concurrency question {suffix}-{index}?",
+            "Correct", "Incorrect", None, "A", None, None,
+        ])
+    questions_sheet.append([
+        "single_mcq", "medium", f"TestSuite mixed question {suffix}-wrong-answer",
+        "Expected answer", "Wrong answer", None, "A", None, None,
+    ])
+    questions_sheet.append([
+        "multi_mcq", "easy", f"TestSuite mixed question {suffix}-multi-select",
+        "First correct", "Incorrect", "Second correct", "A|C", None, None,
+    ])
+    questions_sheet.append([
+        "coding", "easy", f"TestSuite mixed question {suffix}-coding",
+        None, None, None, None, "Read two integers and print their sum.",
+        "# --- EDITABLE START ---\n# Write your solution here\n# --- EDITABLE END ---",
+    ])
+    questions_sheet.append([
+        "text", "easy", f"TestSuite mixed question {suffix}-text",
+        None, None, None, None,
+        "An operating system manages hardware, memory, processes, and files.", None,
+    ])
+    test_cases_sheet = workbook.create_sheet("test_cases")
+    test_cases_sheet.append(["question_number", "input", "expected_output", "is_sample"])
+    test_cases_sheet.append([7, "2 3", "5", True])
+    test_cases_sheet.append([7, "4 4", "8", False])
+    xlsx_buffer = BytesIO()
+    workbook.save(xlsx_buffer)
+    xlsx_bytes = xlsx_buffer.getvalue()
 
     try:
         uploaded = api_client.post(
             f"{api_url}/questions/upload",
             headers=admin_headers,
             params={"topic_name": topic_name},
-            files={"file": ("questions.csv", csv_buffer.getvalue(), "text/csv")},
+            files={"file": ("questions.xlsx", xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
             timeout=30,
         )
         assert uploaded.status_code == 200, uploaded.text
-        assert uploaded.json()["imported"] == 4
+        assert uploaded.json()["imported"] == 8
 
         topics = api_client.get(
             f"{api_url}/questions/topics", headers=admin_headers, timeout=10
@@ -203,8 +220,8 @@ def provisioned_assessment(
             f"{api_url}/assessments/create",
             headers=admin_headers,
             json={
-                "title": f"TestSuite concurrency assessment {suffix}",
-                "description": "Automatically provisioned and archived by TestSuite",
+                "title": assessment_title,
+                "description": "Automatically provisioned and removed by TestSuite",
                 "duration": 30,
                 "negative_marking": False,
                 "topics": [
@@ -216,12 +233,34 @@ def provisioned_assessment(
                         "section_name": "Concurrency",
                     }
                 ],
-                "batch_ids": [batch_id],
+                # Exercise direct recipient assignment independently of batches.
+                "user_ids": [user["id"] for user in created_users],
             },
             timeout=30,
         )
         assert assessment.status_code == 200, assessment.text
         assessment_id = assessment.json()["id"]
+
+        mixed_assessment = api_client.post(
+            f"{api_url}/assessments/create",
+            headers=admin_headers,
+            json={
+                "title": mixed_assessment_title,
+                "description": "Mixed question types for answer and evaluation coverage",
+                "duration": 30,
+                "negative_marking": False,
+                "topics": [
+                    {"topic_id": topic_id, "question_type": "single_mcq", "difficulty": "medium", "question_count": 1, "section_name": "Objective"},
+                    {"topic_id": topic_id, "question_type": "multi_mcq", "difficulty": "easy", "question_count": 1, "section_name": "Objective"},
+                    {"topic_id": topic_id, "question_type": "coding", "difficulty": "easy", "question_count": 1, "section_name": "Coding"},
+                    {"topic_id": topic_id, "question_type": "text", "difficulty": "easy", "question_count": 1, "section_name": "Written response"},
+                ],
+                "user_ids": [user["id"] for user in created_users],
+            },
+            timeout=30,
+        )
+        assert mixed_assessment.status_code == 200, mixed_assessment.text
+        mixed_assessment_id = mixed_assessment.json()["id"]
 
         for user in created_users:
             tokens = _login(
@@ -236,29 +275,47 @@ def provisioned_assessment(
 
         yield {
             "assessment_id": assessment_id,
+            "assessment_title": assessment_title,
+            "mixed_assessment_id": mixed_assessment_id,
+            "mixed_assessment_title": mixed_assessment_title,
+            "batch_id": batch_id,
+            "topic_id": topic_id,
             "users": created_users,
             "admin_headers": admin_headers,
         }
     finally:
-        if assessment_id:
-            api_client.delete(
-                f"{api_url}/assessments/{assessment_id}",
+        fixture_deleted = False
+        if assessment_id or mixed_assessment_id:
+            cleanup_assessment_id = assessment_id or mixed_assessment_id
+            cleanup = api_client.delete(
+                f"{api_url}/admin/testsuite/fixtures/{cleanup_assessment_id}",
                 headers=admin_headers,
-                timeout=10,
+                timeout=30,
             )
-        if batch_id:
+            fixture_deleted = cleanup.status_code == 200
+            if not fixture_deleted:
+                # Older or non-local servers intentionally do not expose the
+                # hard-delete route; retain their archival safety behavior.
+                for current_assessment_id in (assessment_id, mixed_assessment_id):
+                    if current_assessment_id:
+                        api_client.delete(
+                            f"{api_url}/assessments/{current_assessment_id}",
+                            headers=admin_headers,
+                            timeout=10,
+                        )
+        if batch_id and not fixture_deleted:
             api_client.delete(
                 f"{api_url}/batches/{batch_id}",
                 headers=admin_headers,
                 timeout=10,
             )
-        if topic_id:
+        if topic_id and not fixture_deleted:
             api_client.delete(
                 f"{api_url}/questions/topics/{topic_id}",
                 headers=admin_headers,
                 timeout=10,
             )
-        for user in created_users:
+        for user in (created_users if not fixture_deleted else []):
             api_client.post(
                 f"{api_url}/admin/users/{user['id']}/toggle-active",
                 headers=admin_headers,

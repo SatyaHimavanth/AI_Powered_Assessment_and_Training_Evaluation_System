@@ -63,7 +63,7 @@ def test_my_scenario(ctx):
 ## Prerequisites
 
 - Python 3.12+
-- PostgreSQL running at the URL in `DATABASE_URL` (default `postgresql://postgres:password@localhost:5432/assessment_db`)
+- PostgreSQL with pgvector running at the URL in `DATABASE_URL` (production requires an explicit URL)
 - Backend server running and reachable at `BASE_URL` (default `http://localhost:8000`)
 
 ## Setup
@@ -78,11 +78,19 @@ python -m venv .venv
 # Install dependencies
 pip install -e .
 
-# Or if psycopg2 fails to build, install the binary variant instead:
+# Apply database schema migrations before starting the API
+python -m db.migrate
+
+# If psycopg2 fails to build, install the binary variant instead:
 pip install psycopg2-binary
 
-# Start the backend server
+# Local development starts the background worker alongside the API by default.
+# Set RUN_WORKER_IN_API=false to run a separate `python -m worker` process instead.
 python main.py
+
+# With Docker Compose (including production deployments using this Compose file),
+# `backend-worker` is a managed service and starts automatically with the stack:
+# docker compose up -d --build
 ```
 
 ## Running Tests

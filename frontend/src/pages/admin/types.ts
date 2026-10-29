@@ -63,6 +63,7 @@ export interface AssessmentListItem {
   is_archived?: boolean;
   total_questions: number;
   batch_names: string[];
+  individual_user_count?: number;
   start_time: string | null;
   end_time: string | null;
   created_at: string;
@@ -78,6 +79,7 @@ export interface AssessmentResult {
   total_questions: number;
   topics: { topic_name: string; question_type: string; difficulty: string; question_count: number; selected_count: number; section_name?: string }[];
   batch_names: string[];
+  individual_user_count?: number;
   start_time: string | null;
   end_time: string | null;
   created_at: string;

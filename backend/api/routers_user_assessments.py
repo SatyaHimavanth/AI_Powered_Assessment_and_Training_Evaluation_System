@@ -5,15 +5,17 @@ from io import BytesIO
 from typing import List
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from app.llms import get_chat_model
 from core.auth import get_current_user
+from core.evaluation_service import finalize_attempt_at_deadline, queue_attempt_evaluation
+from core.assessment_timing import checkpoint_active_time, remaining_active_seconds, start_active_session
 from db.database import SessionLocal
 from db.models import (
     Answer,
@@ -21,7 +23,9 @@ from db.models import (
     AssessmentQuestion,
     AssessmentQuestionSection,
     Assignment,
+    AssessmentUserAssignment,
     Attempt,
+    AttemptIntegrityEvent,
     AttemptStatus,
     BatchUser,
     Batch,
@@ -40,8 +44,10 @@ from db.models import (
 )
 from db.async_helpers import run_db_sync
 from api.timezone_helper import as_utc_aware, to_utc_iso
+from api.results_helpers import answer_score_label
 
 router = APIRouter(prefix="/user/assessments", tags=["user-assessments"])
+MAX_ASSESSMENT_EXIT_EVENTS = 5
 
 
 def _upsert_answer(
@@ -185,10 +191,12 @@ class StartAttemptResponse(BaseModel):
     attempt_id: UUID
     assessment_title: str
     duration: int
+    assessment_end_time: str | None = None
     total_questions: int
     questions: List[QuestionOut]
     saved_answers: List[SavedAnswerOut] = []
     time_elapsed_seconds: int = 0
+    time_remaining_seconds: int | None = None
     tab_violations: int = 0
 
 
@@ -199,6 +207,13 @@ class SubmitAnswerRequest(BaseModel):
 
 class SubmitAssessmentRequest(BaseModel):
     answers: List[SubmitAnswerRequest]
+
+
+class IntegrityEventRequest(BaseModel):
+    event_id: UUID
+    event_type: str
+    answers: List[SubmitAnswerRequest] = Field(default_factory=list)
+    model_config = {"extra": "forbid"}
 
 
 class SubmitResponse(BaseModel):
@@ -267,7 +282,7 @@ async def get_my_batches(
 async def get_my_assessments(
     user: User = Depends(get_current_user),
 ):
-    """Get all assessments assigned to the current user via their batches."""
+    """Get assessments assigned directly or through the user's batches."""
     
     def _sync_work():
         db = SessionLocal()
@@ -275,18 +290,15 @@ async def get_my_assessments(
             # Get user's batch IDs (include archived batches so users keep access to assigned assessments)
             batch_links = db.query(BatchUser).filter(BatchUser.user_id == user.id).all()
             batch_ids = [bl.batch_id for bl in batch_links]
-
-            if not batch_ids:
-                return []
-
-            # Get assignments for those batches
-            assignments = (
-                db.query(Assignment)
-                .filter(Assignment.batch_id.in_(batch_ids))
+            assessment_ids = {
+                assignment.assessment_id
+                for assignment in db.query(AssessmentUserAssignment)
+                .filter(AssessmentUserAssignment.user_id == user.id)
                 .all()
-            )
-
-            assessment_ids = list(set(a.assessment_id for a in assignments))
+            }
+            if batch_ids:
+                assignments = db.query(Assignment).filter(Assignment.batch_id.in_(batch_ids)).all()
+                assessment_ids.update(assignment.assessment_id for assignment in assignments)
             if not assessment_ids:
                 return []
 
@@ -375,15 +387,17 @@ async def start_assessment(
             # Check user is assigned to this assessment
             batch_links = db.query(BatchUser).filter(BatchUser.user_id == user.id).all()
             batch_ids = [bl.batch_id for bl in batch_links]
-            assigned = (
-                db.query(Assignment)
-                .filter(
+            directly_assigned = db.query(AssessmentUserAssignment.id).filter(
+                AssessmentUserAssignment.assessment_id == assessment_id,
+                AssessmentUserAssignment.user_id == user.id,
+            ).first()
+            assigned_through_batch = False
+            if batch_ids:
+                assigned_through_batch = db.query(Assignment.id).filter(
                     Assignment.assessment_id == assessment_id,
                     Assignment.batch_id.in_(batch_ids),
-                )
-                .first()
-            )
-            if not assigned:
+                ).first() is not None
+            if not directly_assigned and not assigned_through_batch:
                 raise HTTPException(status_code=403, detail="You are not assigned to this assessment")
 
             # Check if already attempted. Prefer any completed attempt first so
@@ -395,16 +409,23 @@ async def start_assessment(
             if getattr(assessment, "is_archived", False) and not existing:
                 raise HTTPException(status_code=403, detail="Assessment is archived and cannot be started")
             if existing:
-                # Allow resumption if in_progress and within duration window
+                # Resume any active attempt until the assessment's shared end time.
                 if existing.status == AttemptStatus.in_progress:
                     now_utc = datetime.now(timezone.utc)
-                    time_elapsed = (now_utc - as_utc_aware(existing.started_at)) if existing.started_at else timedelta.max
-                    if time_elapsed < timedelta(minutes=assessment.duration):
+                    if finalize_attempt_at_deadline(existing, assessment, now_utc):
+                        queue_attempt_evaluation(db, existing.id)
+                        db.commit()
+                        raise HTTPException(
+                            status_code=400,
+                            detail="The assessment has ended. Your saved answers are being evaluated.",
+                        )
+                    if not assessment.end_time or now_utc < as_utc_aware(assessment.end_time):
+                        start_active_session(existing, now_utc)
                         # Return existing attempt data for resumption
                         aq_links = (
                             db.query(AssessmentQuestion)
                             .filter(AssessmentQuestion.assessment_id == assessment_id)
-                            .order_by(AssessmentQuestion.id.asc())
+                            .order_by(AssessmentQuestion.position.asc(), AssessmentQuestion.id.asc())
                             .all()
                         )
                         section_links = (
@@ -470,23 +491,31 @@ async def start_assessment(
                         saved = db.query(Answer).filter(Answer.attempt_id == existing.id).all()
                         saved_answers_out = [SavedAnswerOut(question_id=(a.assessment_item_id or a.question_id), answer=a.answer or "") for a in saved]
 
-                        # Calculate time already elapsed
-                        elapsed = int((now_utc - as_utc_aware(existing.started_at)).total_seconds()) if existing.started_at else 0
+                        remaining = remaining_active_seconds(existing, assessment.duration or 60, now_utc)
+                        elapsed = max(0, int(assessment.duration or 0) * 60 - remaining)
 
                         return StartAttemptResponse(
                             attempt_id=existing.id,
                             assessment_title=assessment.title,
                             duration=assessment.duration,
+                            assessment_end_time=to_utc_iso(assessment.end_time) if assessment.end_time else None,
                             total_questions=len(questions_out),
                             questions=questions_out,
                             saved_answers=saved_answers_out,
                             time_elapsed_seconds=elapsed,
+                            time_remaining_seconds=remaining,
                             tab_violations=existing.tab_violations or 0,
                         )
                     else:
-                        # Attempt expired (>30 minutes), mark as missed and create new one
-                        existing.status = AttemptStatus.missed
-                        db.commit()
+                        # Keep the scheduled close authoritative even if the
+                        # timestamp changes between the checks above.
+                        if finalize_attempt_at_deadline(existing, assessment, now_utc):
+                            queue_attempt_evaluation(db, existing.id)
+                            db.commit()
+                        raise HTTPException(
+                            status_code=400,
+                            detail="The assessment has ended. Your saved answers are being evaluated.",
+                        )
                 else:
                     # Already completed or marked as missed
                     raise HTTPException(status_code=400, detail="You have already attempted this assessment")
@@ -495,7 +524,7 @@ async def start_assessment(
             now = datetime.now(timezone.utc)
             if assessment.start_time and now < as_utc_aware(assessment.start_time):
                 raise HTTPException(status_code=400, detail="Assessment has not started yet")
-            if assessment.end_time and now > as_utc_aware(assessment.end_time):
+            if assessment.end_time and now >= as_utc_aware(assessment.end_time):
                 raise HTTPException(status_code=400, detail="Assessment time window has ended")
 
             # Create attempt
@@ -504,17 +533,20 @@ async def start_assessment(
                 assessment_id=assessment_id,
                 started_at=now,
                 status=AttemptStatus.in_progress,
+                active_seconds=0,
+                active_started_at=now,
+                active_heartbeat_at=now,
             )
             db.add(attempt)
             db.commit()
             db.refresh(attempt)
 
             # Get questions for this assessment in insertion order.
-            # This preserves section-wise sequence as selected during assessment creation.
+            # The persisted position keeps the selected question sequence stable.
             aq_links = (
                 db.query(AssessmentQuestion)
                 .filter(AssessmentQuestion.assessment_id == assessment_id)
-                .order_by(AssessmentQuestion.id.asc())
+                .order_by(AssessmentQuestion.position.asc(), AssessmentQuestion.id.asc())
                 .all()
             )
 
@@ -579,12 +611,64 @@ async def start_assessment(
                 attempt_id=attempt.id,
                 assessment_title=assessment.title,
                 duration=assessment.duration,
+                assessment_end_time=to_utc_iso(assessment.end_time) if assessment.end_time else None,
                 total_questions=len(questions_out),
                 questions=questions_out,
+                time_remaining_seconds=max(0, int(assessment.duration or 0) * 60),
             )
         finally:
             db.close()
 
+    return await run_db_sync(_sync_work)
+
+
+@router.post("/heartbeat/{attempt_id}")
+async def assessment_heartbeat(attempt_id: UUID, user: User = Depends(get_current_user)):
+    """Checkpoint active time and return the server-authoritative remaining budget."""
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            attempt = db.query(Attempt).filter(
+                Attempt.id == attempt_id, Attempt.user_id == user.id
+            ).with_for_update().first()
+            if not attempt:
+                raise HTTPException(status_code=404, detail="Attempt not found")
+            if attempt.status != AttemptStatus.in_progress:
+                return {"status": "finished", "time_remaining_seconds": 0}
+            assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
+            now = datetime.now(timezone.utc)
+            if finalize_attempt_at_deadline(attempt, assessment, now):
+                queue_attempt_evaluation(db, attempt.id)
+                db.commit()
+                return {"status": "finished", "time_remaining_seconds": 0}
+            start_active_session(attempt, now)
+            remaining = remaining_active_seconds(attempt, assessment.duration or 60, now)
+            db.commit()
+            return {"status": "active", "time_remaining_seconds": remaining}
+        finally:
+            db.close()
+    return await run_db_sync(_sync_work)
+
+
+@router.post("/pause/{attempt_id}")
+async def pause_assessment(attempt_id: UUID, user: User = Depends(get_current_user)):
+    """Checkpoint then pause when the user leaves the assessment page."""
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            attempt = db.query(Attempt).filter(
+                Attempt.id == attempt_id, Attempt.user_id == user.id
+            ).with_for_update().first()
+            if not attempt or attempt.status != AttemptStatus.in_progress:
+                return {"status": "finished"}
+            now = datetime.now(timezone.utc)
+            checkpoint_active_time(attempt, now)
+            attempt.active_started_at = None
+            attempt.active_heartbeat_at = None
+            db.commit()
+            return {"status": "paused"}
+        finally:
+            db.close()
     return await run_db_sync(_sync_work)
 
 
@@ -614,10 +698,10 @@ async def save_answer(
 
             assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
             now_utc = datetime.now(timezone.utc)
-            if assessment.end_time and now_utc > as_utc_aware(assessment.end_time):
+            if finalize_attempt_at_deadline(attempt, assessment, now_utc):
+                queue_attempt_evaluation(db, attempt.id)
+                db.commit()
                 raise HTTPException(status_code=400, detail="Assessment time window has ended")
-            if attempt.started_at and now_utc - as_utc_aware(attempt.started_at) > timedelta(minutes=assessment.duration):
-                raise HTTPException(status_code=400, detail="Assessment time limit exceeded")
 
             # Only questions selected for this assessment may be answered.  This
             # also prevents a user from injecting answers for another question.
@@ -638,11 +722,13 @@ async def save_answer(
 @router.post("/save-violations")
 async def save_violations(
     attempt_id: UUID,
-    violations: int,
+    body: IntegrityEventRequest,
     user: User = Depends(get_current_user),
 ):
-    """Persist the current violation count for an in-progress attempt."""
-    
+    """Persist one idempotent advisory signal; never infer misconduct from it."""
+    allowed = {"focus_lost", "fullscreen_exit", "escape_key", "devtools_shortcut"}
+    if body.event_type not in allowed:
+        raise HTTPException(status_code=422, detail="Unsupported integrity event type")
 
     def _sync_work():
         db = SessionLocal()
@@ -658,9 +744,48 @@ async def save_violations(
             if attempt.status != AttemptStatus.in_progress:
                 raise HTTPException(status_code=400, detail="Attempt is not in progress")
 
-            attempt.tab_violations = violations
+            assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
+            if finalize_attempt_at_deadline(attempt, assessment):
+                queue_attempt_evaluation(db, attempt.id)
+                db.commit()
+                return {"status": "expired", "violations": int(attempt.tab_violations or 0)}
+
+            existing = db.query(AttemptIntegrityEvent.id).filter(
+                AttemptIntegrityEvent.attempt_id == attempt.id,
+                AttemptIntegrityEvent.event_id == body.event_id,
+            ).first()
+            if existing:
+                return {"status": "duplicate", "violations": int(attempt.tab_violations or 0)}
+            seen_question_ids: set[str] = set()
+            for answer in body.answers:
+                key = str(answer.question_id)
+                if key in seen_question_ids:
+                    continue
+                seen_question_ids.add(key)
+                question_link = _assessment_question_link(
+                    db, attempt.assessment_id, answer.question_id
+                )
+                if not question_link:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Question does not belong to this assessment",
+                    )
+                _upsert_answer(db, attempt.id, question_link, answer.question_id, answer.answer)
+            db.add(AttemptIntegrityEvent(
+                attempt_id=attempt.id, event_id=body.event_id, event_type=body.event_type,
+            ))
+            if body.event_type in {"focus_lost", "fullscreen_exit"}:
+                attempt.tab_violations = int(attempt.tab_violations or 0) + 1
+            if int(attempt.tab_violations or 0) >= MAX_ASSESSMENT_EXIT_EVENTS:
+                attempt.status = AttemptStatus.missed
+                attempt.submitted_at = datetime.now(timezone.utc)
+                attempt.active_started_at = None
+                attempt.active_heartbeat_at = None
+                queue_attempt_evaluation(db, attempt.id)
+                db.commit()
+                return {"status": "aborted", "violations": attempt.tab_violations}
             db.commit()
-            return {"status": "saved", "violations": violations}
+            return {"status": "saved", "violations": attempt.tab_violations}
         finally:
             db.close()
 
@@ -689,22 +814,37 @@ async def submit_assessment(
                 raise HTTPException(status_code=404, detail="Attempt not found")
 
             if attempt.status != AttemptStatus.in_progress:
+                if attempt.status == AttemptStatus.completed:
+                    existing_job = db.query(EvaluationJob).filter(
+                        EvaluationJob.attempt_id == attempt.id
+                    ).first()
+                    if existing_job:
+                        status = (
+                            "evaluating"
+                            if existing_job.status in {
+                                EvaluationJobStatus.pending,
+                                EvaluationJobStatus.in_progress,
+                            }
+                            else existing_job.status.value
+                        )
+                        return {"message": "Assessment was already finalized.", "status": status}
                 raise HTTPException(status_code=400, detail="This attempt is already finalized")
 
             assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
             now_utc = datetime.now(timezone.utc)
             if assessment.start_time and now_utc < as_utc_aware(assessment.start_time):
                 raise HTTPException(status_code=400, detail="Assessment has not started yet")
-            if assessment.end_time and now_utc > as_utc_aware(assessment.end_time):
-                raise HTTPException(status_code=400, detail="Assessment time window has ended")
-            if attempt.started_at:
-                time_elapsed = now_utc - as_utc_aware(attempt.started_at)
-                if time_elapsed > timedelta(minutes=assessment.duration):
-                    raise HTTPException(status_code=400, detail="Assessment time limit exceeded")
+            expired = finalize_attempt_at_deadline(attempt, assessment, now_utc)
+            deadline_reached = bool(assessment.end_time and now_utc >= as_utc_aware(assessment.end_time))
+            duration_reached = remaining_active_seconds(
+                attempt, assessment.duration or 60, now_utc
+            ) <= 0
 
             # Save answers (upsert - some may already exist from auto-save)
             seen_items: set[str] = set()
-            for ans in body.answers:
+            # A request arriving after the deadline must finalize only answers
+            # already persisted by autosave; the late request body is ignored.
+            for ans in ([] if deadline_reached or duration_reached else body.answers):
                 qid_str = str(ans.question_id)
                 if qid_str in seen_items:
                     continue
@@ -716,15 +856,14 @@ async def submit_assessment(
 
                 _upsert_answer(db, attempt_id, question_link, ans.question_id, ans.answer)
 
-            attempt.submitted_at = datetime.now(timezone.utc)
-            attempt.status = AttemptStatus.completed
+            if not expired:
+                attempt.submitted_at = datetime.now(timezone.utc)
+                attempt.status = AttemptStatus.completed
+                attempt.active_started_at = None
+                attempt.active_heartbeat_at = None
 
             # Create evaluation job in the same transaction
-            eval_job = EvaluationJob(
-                attempt_id=attempt.id,
-                status=EvaluationJobStatus.pending,
-            )
-            db.add(eval_job)
+            queue_attempt_evaluation(db, attempt.id)
             db.commit()
 
             return {"message": "Assessment submitted successfully. Evaluation started.", "status": "evaluating"}
@@ -733,6 +872,83 @@ async def submit_assessment(
 
     result = await run_db_sync(_sync_work)
     return SubmitResponse(**result)
+
+
+@router.post("/offline-sync/{attempt_id}")
+async def sync_offline_assessment_answers(
+    attempt_id: UUID,
+    body: SubmitAssessmentRequest,
+    user: User = Depends(get_current_user),
+):
+    """Idempotently sync one attempt's local draft, including the bounded expiry grace."""
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            attempt = db.query(Attempt).filter(
+                Attempt.id == attempt_id,
+                Attempt.user_id == user.id,
+            ).with_for_update().first()
+            if not attempt:
+                raise HTTPException(status_code=404, detail="Attempt not found")
+
+            now = datetime.now(timezone.utc)
+            job = db.query(EvaluationJob).filter(
+                EvaluationJob.attempt_id == attempt.id
+            ).with_for_update().first()
+
+            if attempt.status == AttemptStatus.completed:
+                grace_deadline = attempt.sync_deadline_at
+                if grace_deadline is None or as_utc_aware(grace_deadline) <= now:
+                    # A retry after a committed sync must be harmless. Do not
+                    # permit late writes after the sync window has closed.
+                    if job:
+                        return {"status": "finished", "time_remaining_seconds": 0}
+                    raise HTTPException(status_code=400, detail="Offline sync window has ended")
+                if job and job.status != EvaluationJobStatus.pending:
+                    raise HTTPException(status_code=409, detail="Evaluation has already started")
+            elif attempt.status == AttemptStatus.in_progress:
+                assessment = db.query(Assessment).filter(
+                    Assessment.id == attempt.assessment_id
+                ).first()
+                if not assessment:
+                    raise HTTPException(status_code=404, detail="Assessment not found")
+                if finalize_attempt_at_deadline(attempt, assessment, now):
+                    job = queue_attempt_evaluation(db, attempt.id)
+            else:
+                raise HTTPException(status_code=400, detail="Attempt is not available for sync")
+
+            seen_items: set[str] = set()
+            for answer in body.answers:
+                question_key = str(answer.question_id)
+                if question_key in seen_items:
+                    continue
+                seen_items.add(question_key)
+                question_link = _assessment_question_link(
+                    db, attempt.assessment_id, answer.question_id
+                )
+                if not question_link:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Question does not belong to this assessment",
+                    )
+                _upsert_answer(
+                    db, attempt.id, question_link, answer.question_id, answer.answer
+                )
+
+            if attempt.status == AttemptStatus.completed:
+                attempt.sync_deadline_at = None
+                queue_attempt_evaluation(db, attempt.id)
+                db.commit()
+                return {"status": "finished", "time_remaining_seconds": 0}
+
+            start_active_session(attempt, now)
+            remaining = remaining_active_seconds(attempt, assessment.duration or 60, now)
+            db.commit()
+            return {"status": "active", "time_remaining_seconds": remaining}
+        finally:
+            db.close()
+
+    return await run_db_sync(_sync_work)
 
 
 @router.post("/abort/{attempt_id}", response_model=SubmitResponse)
@@ -759,6 +975,12 @@ async def abort_assessment(
             if attempt.status != AttemptStatus.in_progress:
                 raise HTTPException(status_code=400, detail="This attempt is already finalized")
 
+            assessment = db.query(Assessment).filter(Assessment.id == attempt.assessment_id).first()
+            if finalize_attempt_at_deadline(attempt, assessment):
+                queue_attempt_evaluation(db, attempt.id)
+                db.commit()
+                return {"message": "Assessment window ended. Saved answers are being evaluated.", "status": "evaluating"}
+
             # Save partial answers (upsert - some may exist from auto-save)
             seen_items: set[str] = set()
             for ans in body.answers:
@@ -778,11 +1000,7 @@ async def abort_assessment(
             attempt.status = AttemptStatus.missed  # marked incomplete
 
             # Create evaluation job in the same transaction
-            eval_job = EvaluationJob(
-                attempt_id=attempt.id,
-                status=EvaluationJobStatus.pending,
-            )
-            db.add(eval_job)
+            queue_attempt_evaluation(db, attempt.id)
             db.commit()
 
             return {"message": "Assessment aborted due to violations", "status": "incomplete"}
@@ -805,6 +1023,7 @@ class AnswerReviewItem(BaseModel):
     correct_answer: str
     is_correct: bool
     score: float | None
+    answer_status: str
     suggestion: str | None
 
 
@@ -845,6 +1064,8 @@ async def get_my_results(
             )
             if not attempt:
                 raise HTTPException(status_code=404, detail="No attempt found for this assessment")
+            from .results_helpers import require_completed_attempt
+            require_completed_attempt(attempt)
 
             try:
                 from .results_helpers import build_attempt_results
@@ -883,8 +1104,8 @@ async def export_my_results(
             )
             if not attempt:
                 raise HTTPException(status_code=404, detail="No attempt found for this assessment")
-            if attempt.status != AttemptStatus.completed:
-                raise HTTPException(status_code=400, detail="Results export is only available for completed assessments")
+            from .results_helpers import require_completed_attempt
+            require_completed_attempt(attempt)
 
             assessment = db.query(Assessment).filter(Assessment.id == assessment_id).first()
             if not assessment:
@@ -949,7 +1170,7 @@ async def export_my_results(
             answer.get("question_text"),
             answer.get("your_answer"),
             answer.get("correct_answer"),
-            answer.get("score") if answer.get("score") is not None else "Pending",
+            answer_score_label(answer.get("answer_status", "awaiting_evaluation"), answer.get("score")),
             answer.get("suggestion") or "",
         ])
 

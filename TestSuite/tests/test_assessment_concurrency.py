@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import time
+import uuid
 
 import pytest
 import requests
@@ -119,10 +120,8 @@ def test_start_save_and_submit_are_race_safe(
         api_url,
         "/user/assessments/save-violations",
         users[2]["headers"],
-        params={
-            "attempt_id": aborted_attempt["attempt_id"],
-            "violations": 5,
-        },
+        params={"attempt_id": aborted_attempt["attempt_id"]},
+        json={"event_id": str(uuid.uuid4()), "event_type": "focus_lost"},
     )
     assert violations.status_code == 200, violations.text
     aborted = _post(

@@ -14,6 +14,10 @@ ADMIN_CONTACT_EMAIL = os.environ.get("TEST_ADMIN_CONTACT_EMAIL", "admin@assessme
 ADMIN_NAME = os.environ.get("TEST_ADMIN_NAME", "System Admin")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/assessment_db")
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://", "postgresql+psycopg2://", 1
+    )
 
 
 @pytest.fixture(scope="session")
@@ -43,6 +47,7 @@ def admin_token(api_client):
         resp = api_client.post(
             f"{BASE_URL}/auth/login",
             json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+            headers={"X-Token-Response": "bearer"},
             timeout=10,
         )
         if resp.status_code == 200:

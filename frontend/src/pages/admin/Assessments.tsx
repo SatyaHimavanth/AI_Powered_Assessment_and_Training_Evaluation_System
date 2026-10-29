@@ -1,17 +1,24 @@
 import { useState, useEffect, useCallback } from "react";
 import type { ChangeEvent } from "react";
 import api from "../../api";
-import type { TopicInfo, TopicConfig, AssessmentListItem, AssessmentResult, BatchInfo } from "./types";
+import type { TopicInfo, TopicConfig, AssessmentListItem, AssessmentResult, BatchInfo, UserInfo } from "./types";
 import { card, inputClass, selectClass, btnPrimary } from "./types";
 
 
 interface Props {
   topics: TopicInfo[];
   batches: BatchInfo[];
+  users: UserInfo[];
   setMessage: (msg: string) => void;
 }
 
-export default function Assessments({ topics, batches, setMessage }: Props) {
+interface ImportPreview {
+  sections?: { name: string; count: number }[];
+  total_questions?: number;
+  total?: number;
+}
+
+export default function Assessments({ topics, batches, users, setMessage }: Props) {
   const [assessments, setAssessments] = useState<AssessmentListItem[]>([]);
   const [assessmentTitle, setAssessmentTitle] = useState("");
   const [assessmentDesc, setAssessmentDesc] = useState("");
@@ -20,6 +27,9 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
   const [topicConfigs, setTopicConfigs] = useState<TopicConfig[]>([]);
   const [selectedBatchIds, setSelectedBatchIds] = useState<string[]>([]);
   const [batchSearch, setBatchSearch] = useState("");
+  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
+  const [userSearch, setUserSearch] = useState("");
+  const [assignmentMode, setAssignmentMode] = useState<"batches" | "users">("batches");
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
   const [creatingAssessment, setCreatingAssessment] = useState(false);
@@ -30,7 +40,7 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
   const [useImport, setUseImport] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importId, setImportId] = useState<string | null>(null);
-  const [importPreview, setImportPreview] = useState<any | null>(null);
+  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
   const [importErrors, setImportErrors] = useState<string[] | null>(null);
 
   // Inline form error (shown below Generate button)
@@ -166,7 +176,7 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
       });
       const data = res.data || {};
       setImportId(data.import_id || data.id || null);
-      setImportPreview(data.preview || data);
+      setImportPreview((data.preview || data) as ImportPreview);
       setImportErrors(data.errors || null);
       setMessage("Import uploaded and validated");
     } catch (err: unknown) {
@@ -203,10 +213,28 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
       return batch.name.toLowerCase().includes(batchQuery) || description.includes(batchQuery);
     })
     .slice(0, 6);
+  const visibleUsers = users.filter((user) => user.is_active && user.role === "user");
+  const selectedUsers = visibleUsers.filter((user) => selectedUserIds.includes(user.id));
+  const userQuery = userSearch.trim().toLowerCase();
+  const userSuggestions = visibleUsers
+    .filter((user) => !selectedUserIds.includes(user.id))
+    .filter((user) => !userQuery || `${user.name} ${user.username} ${user.email}`.toLowerCase().includes(userQuery))
+    .slice(0, 8);
 
   const handleBatchSelect = (batchId: string) => {
     toggleBatch(batchId);
     setBatchSearch("");
+  };
+
+  const toggleUser = (userId: string) => {
+    setSelectedUserIds((previous) => previous.includes(userId)
+      ? previous.filter((id) => id !== userId)
+      : [...previous, userId]);
+  };
+
+  const switchAssignmentMode = (mode: "batches" | "users") => {
+    if (mode === assignmentMode) return;
+    setAssignmentMode(mode);
   };
 
   const handleCreateAssessment = async () => {
@@ -282,10 +310,15 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
       return;
     }
 
-    // Ensure at least one selected batch is valid/visible
-    const batchIdsToUse = selectedBatchIds.filter((id) => visibleBatches.some((b) => b.id === id));
-    if (batchIdsToUse.length === 0) {
-      setFormError("Select at least one batch to assign this assessment.");
+    // Keep only currently active recipients and prevent creating an unassigned assessment.
+    const batchIdsToUse = assignmentMode === "batches"
+      ? selectedBatchIds.filter((id) => visibleBatches.some((b) => b.id === id))
+      : [];
+    const userIdsToUse = assignmentMode === "users"
+      ? selectedUserIds.filter((id) => visibleUsers.some((user) => user.id === id))
+      : [];
+    if (batchIdsToUse.length === 0 && userIdsToUse.length === 0) {
+      setFormError("Select at least one batch or user to assign this assessment.");
       return;
     }
 
@@ -305,6 +338,7 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
           duration: assessmentDuration,
           negative_marking: negativeMarking,
           batch_ids: batchIdsToUse,
+          user_ids: userIdsToUse,
           start_time: toUtcIso(startTime),
           end_time: toUtcIso(endTime),
         });
@@ -324,6 +358,7 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
           negative_marking: negativeMarking,
           topics: topicConfigs,
           batch_ids: batchIdsToUse,
+          user_ids: userIdsToUse,
           start_time: toUtcIso(startTime),
           end_time: toUtcIso(endTime),
         });
@@ -337,6 +372,8 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
         setTopicConfigs([]);
         setSelectedBatchIds([]);
         setBatchSearch("");
+        setSelectedUserIds([]);
+        setUserSearch("");
         setStartTime("");
         setEndTime("");
         setAvailableCounts({});
@@ -399,7 +436,13 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
     <div className="space-y-6">
       {/* Create Assessment */}
       <div className={`${card} p-6`}>
-        <h2 className="text-sm font-semibold mb-4">Create Assessment</h2>
+        <h2 className="text-sm font-semibold mb-1">Create Assessment</h2>
+        <p className="text-xs text-[var(--color-text-secondary)] mb-4">Set up the assessment content, choose its audience, then confirm the schedule.</p>
+        <ol className="mb-5 grid grid-cols-3 gap-2" aria-label="Assessment setup steps">
+          {["1. Content", "2. Audience", "3. Schedule & review"].map((step) => (
+            <li key={step} className="rounded-md bg-gray-50 px-3 py-2 text-xs font-medium text-[var(--color-text-secondary)]">{step}</li>
+          ))}
+        </ol>
 
         <div className="space-y-4">
           <div className="grid grid-cols-3 gap-4">
@@ -414,7 +457,7 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Duration (min)</label>
+              <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Duration (active minutes)</label>
               <input
                 type="number"
                 value={assessmentDuration}
@@ -443,7 +486,7 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
               onChange={(e) => setNegativeMarking(e.target.checked)}
               className="h-4 w-4 accent-[var(--color-primary)]"
             />
-            <span>Enable negative marking for multi MCQ partial scoring</span>
+            <span>Negative marking: a wrong answered objective question loses 1 point; blanks have no penalty</span>
           </label>
 
           {/* Start/End Time */}
@@ -465,11 +508,40 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
                 onChange={(e) => setEndTime(e.target.value)}
                 className={`${inputClass} w-full`}
               />
+              <p className="mt-1 text-xs text-[var(--color-text-secondary)]">The scheduled end closes every active attempt. Each user also gets the configured duration while they are in the assessment; leaving pauses their timer.</p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <div className="text-sm font-medium text-[var(--color-text-secondary)]">Assign To</div>
+            <div
+              role="tablist"
+              aria-label="Assessment assignment target"
+              className="inline-flex items-center bg-gray-100 rounded-full p-1"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={assignmentMode === "batches"}
+                onClick={() => switchAssignmentMode("batches")}
+                className={`px-3 py-1 rounded-full text-sm ${assignmentMode === "batches" ? "bg-white shadow text-[var(--color-text)]" : "text-[var(--color-text-secondary)]"}`}
+              >
+                Batches
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={assignmentMode === "users"}
+                onClick={() => switchAssignmentMode("users")}
+                className={`px-3 py-1 rounded-full text-sm ${assignmentMode === "users" ? "bg-white shadow text-[var(--color-text)]" : "text-[var(--color-text-secondary)]"}`}
+              >
+                Users
+              </button>
             </div>
           </div>
 
           {/* Batch Selection */}
-          <div>
+          {assignmentMode === "batches" && <div>
             <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-2">Assign to Batches</label>
             {visibleBatches.length === 0 ? (
               <p className="text-xs text-[var(--color-text-secondary)]">No batches available. Create a batch first.</p>
@@ -539,7 +611,71 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
                 )}
               </div>
             )}
-          </div>
+          </div>}
+
+          {assignmentMode === "users" && <div>
+            <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-2">Assign to Individual Users</label>
+            {visibleUsers.length === 0 ? (
+              <p className="text-xs text-[var(--color-text-secondary)]">No active candidate accounts are available.</p>
+            ) : (
+              <div className="space-y-2">
+                <div className="min-h-10 w-full px-3 py-2 border border-[var(--color-border)] rounded-[var(--radius-sm)] bg-white focus-within:border-[var(--color-primary)] focus-within:ring-2 focus-within:ring-blue-100">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedUsers.map((user) => (
+                      <span
+                        key={user.id}
+                        className="inline-flex items-center gap-2 h-8 px-3 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium border border-emerald-200"
+                      >
+                        <span>{user.name} (@{user.username})</span>
+                        <button
+                          type="button"
+                          onClick={() => toggleUser(user.id)}
+                          className="text-emerald-700 hover:text-emerald-900 cursor-pointer"
+                          aria-label={`Remove ${user.name}`}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                    <input
+                      type="search"
+                      value={userSearch}
+                      onChange={(e) => setUserSearch(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          if (userSuggestions.length > 0) toggleUser(userSuggestions[0].id);
+                        }
+                      }}
+                      placeholder={selectedUsers.length === 0 ? "Search and add candidates..." : "Add another candidate..."}
+                      className="flex-1 min-w-[220px] h-8 bg-transparent text-sm outline-none placeholder:text-gray-400"
+                      aria-label="Search candidates to assign"
+                    />
+                  </div>
+                </div>
+                {userSuggestions.length > 0 ? (
+                  <div className="border border-[var(--color-border)] rounded-[var(--radius-sm)] bg-white shadow-sm overflow-hidden max-h-56 overflow-y-auto">
+                    {userSuggestions.map((user) => (
+                      <button
+                        key={user.id}
+                        type="button"
+                        onClick={() => toggleUser(user.id)}
+                        className="w-full px-3 py-2 text-left hover:bg-gray-50 cursor-pointer transition-colors"
+                      >
+                        <span className="block text-sm font-medium text-[var(--color-text)]">{user.name} (@{user.username})</span>
+                        <span className="block text-xs text-[var(--color-text-secondary)]">{user.email}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : userQuery ? (
+                  <p className="text-xs text-[var(--color-text-secondary)]">No matching candidates found.</p>
+                ) : null}
+                <p className="text-xs text-[var(--color-text-secondary)]">
+                  Choose individual candidate accounts for this assessment.
+                </p>
+              </div>
+            )}
+          </div>}
           
           <div className="flex items-center gap-4 mb-3">
             <div className="inline-flex items-center gap-3">
@@ -580,40 +716,47 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
             )}
           </div>
 
-          {/* Topic Configurations or Excel import */}
+          {/* Sections or Excel import */}
           {!useImport ? (
             <div>
               <div className="flex items-center justify-between mb-3">
-                <label className="text-xs font-medium text-[var(--color-text-secondary)]">Topic Configurations</label>
+                <label className="text-xs font-medium text-[var(--color-text-secondary)]">Sections</label>
                 <button
+                  type="button"
                   onClick={addTopicConfig}
                   className="inline-flex items-center gap-1.5 h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-blue-50 text-[var(--color-primary)] hover:bg-blue-100 cursor-pointer transition-colors"
                 >
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
                   </svg>
-                  Add Topic
+                  Add Section
                 </button>
               </div>
 
               {topicConfigs.length === 0 ? (
                 <div className="border border-dashed border-[var(--color-border)] rounded-[var(--radius-sm)] p-6 text-center">
                   <p className="text-sm text-[var(--color-text-secondary)]">
-                    No topics added yet. Click "Add Topic" to configure question selection.
+                    No sections added yet. Click "Add Section" to configure question selection.
                   </p>
                 </div>
               ) : (
                 <div className="space-y-3">
                   {topicConfigs.map((tc, idx) => (
-                    <div key={idx} className="border border-[var(--color-border)] rounded-[var(--radius-sm)] p-4 relative group">
-                      <button
-                        onClick={() => removeTopicConfig(idx)}
-                        className="absolute top-3 right-3 w-6 h-6 flex items-center justify-center rounded text-[var(--color-text-secondary)] hover:bg-red-50 hover:text-[var(--color-danger)] cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                      </button>
+                    <div key={idx} className="border border-[var(--color-border)] rounded-[var(--radius-sm)] p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-xs font-semibold text-[var(--color-text-secondary)]">Section {idx + 1}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeTopicConfig(idx)}
+                          aria-label={`Delete section ${tc.section_name?.trim() || idx + 1}`}
+                          title="Delete section"
+                          className="w-8 h-8 flex items-center justify-center rounded-md border border-red-200 bg-red-50 text-red-600 hover:bg-red-100 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 cursor-pointer transition-colors"
+                        >
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M4 7h16M10 11v6m4-6v6M5 7l1 13h12l1-13M9 7V4h6v3" />
+                          </svg>
+                        </button>
+                      </div>
                       <div className="grid grid-cols-5 gap-3">
                         <div>
                           <label className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Section</label>
@@ -710,8 +853,8 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
                     <p className="font-medium text-[var(--color-text)] mb-2">Preview</p>
                     {Array.isArray(importPreview.sections) ? (
                       <ul className="list-disc ml-4 space-y-1">
-                        {importPreview.sections.map((s: any, i: number) => (
-                          <li key={i}>{s.name}: {s.count} questions</li>
+                        {importPreview.sections.map((section, i) => (
+                          <li key={i}>{section.name}: {section.count} questions</li>
                         ))}
                       </ul>
                     ) : (
@@ -731,6 +874,16 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
               </div>
             </div>
           )}
+
+          <div className="rounded-[var(--radius-sm)] border border-blue-100 bg-blue-50/60 p-4" aria-label="Assessment review">
+            <p className="text-sm font-semibold">Review before creating</p>
+            <div className="mt-2 grid gap-2 text-xs text-[var(--color-text-secondary)] sm:grid-cols-2">
+              <p><span className="font-medium text-[var(--color-text)]">Content:</span> {useImport ? `${importPreview?.total_questions ?? importPreview?.total ?? "No"} imported questions` : `${topicConfigs.reduce((total, section) => total + Math.max(0, Number(section.question_count) || 0), 0)} requested questions across ${topicConfigs.length} section(s)`}</p>
+              <p><span className="font-medium text-[var(--color-text)]">Audience:</span> {assignmentMode === "batches" ? `${selectedBatches.length} batch(es)` : `${selectedUsers.length} individual user(s)`}</p>
+              <p><span className="font-medium text-[var(--color-text)]">Active duration:</span> {assessmentDuration} minutes</p>
+              <p><span className="font-medium text-[var(--color-text)]">Schedule:</span> {startTime ? new Date(startTime).toLocaleString() : "Start time not set"} — {endTime ? new Date(endTime).toLocaleString() : "End time not set"}</p>
+            </div>
+          </div>
 
           <div>
             <button
@@ -761,6 +914,9 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
               <p><span className="font-medium text-[var(--color-text)]">Negative Marking:</span> {lastCreated.negative_marking ? "Enabled" : "Disabled"}</p>
               {lastCreated.batch_names.length > 0 && (
                 <p><span className="font-medium text-[var(--color-text)]">Batches:</span> {lastCreated.batch_names.join(", ")}</p>
+              )}
+              {(lastCreated.individual_user_count ?? 0) > 0 && (
+                <p><span className="font-medium text-[var(--color-text)]">Individual users:</span> {lastCreated.individual_user_count}</p>
               )}
               {lastCreated.start_time && (
                 <p><span className="font-medium text-[var(--color-text)]">Window:</span> {new Date(lastCreated.start_time).toLocaleString()} - {lastCreated.end_time ? new Date(lastCreated.end_time).toLocaleString() : "No end"}</p>
@@ -840,6 +996,9 @@ export default function Assessments({ topics, batches, setMessage }: Props) {
                     </span>
                     {a.batch_names.length > 0 && (
                       <span className="text-xs text-purple-600">Batches: {a.batch_names.join(", ")}</span>
+                    )}
+                    {(a.individual_user_count ?? 0) > 0 && (
+                      <span className="text-xs text-emerald-700">Individual users: {a.individual_user_count}</span>
                     )}
                     {a.start_time && (
                       <span className="text-xs text-[var(--color-text-secondary)]">

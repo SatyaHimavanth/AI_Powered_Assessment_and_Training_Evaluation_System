@@ -11,6 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from core.auth import require_admin
+from core.uploads import read_upload_limited
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
 from db.models import (
@@ -267,7 +268,7 @@ async def upload_questions(
         raise HTTPException(status_code=400, detail="No file provided")
 
     filename = file.filename.lower()
-    content = await file.read()
+    content = await read_upload_limited(file, 10 * 1024 * 1024)
 
     # uses module-level `run_db_sync` and `SessionLocal`
 

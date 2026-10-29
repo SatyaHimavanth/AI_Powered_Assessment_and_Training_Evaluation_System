@@ -14,8 +14,11 @@ RUN npm run build
 # Production stage - serve with nginx
 FROM nginx:alpine
 
+RUN apk add --no-cache ca-certificates
 COPY --from=build /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/templates/default.conf.template
+ENV PORT=80
+ENV BACKEND_UPSTREAM=http://backend:8000
 
 EXPOSE 80
 

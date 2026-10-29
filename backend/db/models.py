@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column, String, Text, Date, DateTime,
-    Integer, Float, Boolean, ForeignKey, Enum, JSON, UniqueConstraint
+    Integer, Float, Boolean, ForeignKey, Enum, JSON, UniqueConstraint,
+    CheckConstraint, Index
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -161,6 +162,16 @@ class User(Base):
     attempts = relationship("Attempt", back_populates="user")
 
 
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+
+    jti = Column(String(36), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class RegistrationRequest(Base):
     __tablename__ = "registration_requests"
 
@@ -194,8 +205,10 @@ class BatchUser(Base):
     __tablename__ = "batch_users"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"))
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
+    __table_args__ = (UniqueConstraint("batch_id", "user_id", name="uq_batch_users_batch_user"),)
+
+    batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
 
     batch = relationship("Batch", back_populates="users")
     user = relationship("User", back_populates="batches")
@@ -275,9 +288,14 @@ class Assessment(Base):
 class AssessmentTopic(Base):
     __tablename__ = "assessment_topics"
 
+    __table_args__ = (UniqueConstraint(
+        "assessment_id", "topic_id", "question_type", "difficulty",
+        name="uq_assessment_topics_config",
+    ),)
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
-    topic_id = Column(UUID(as_uuid=True), ForeignKey("topics.id"))
+    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"), nullable=False)
+    topic_id = Column(UUID(as_uuid=True), ForeignKey("topics.id"), nullable=False)
     question_type = Column(Enum(QuestionType))
     difficulty = Column(Enum(Difficulty))
     question_count = Column(Integer)
@@ -288,10 +306,19 @@ class AssessmentTopic(Base):
 class AssessmentQuestion(Base):
     __tablename__ = "assessment_questions"
 
+    __table_args__ = (
+        CheckConstraint(
+            "(question_id IS NULL) <> (assessment_item_id IS NULL)",
+            name="ck_assessment_questions_exactly_one_source",
+        ),
+        UniqueConstraint("assessment_id", "position", name="uq_assessment_questions_position"),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
+    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"), nullable=False)
     question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"))
     assessment_item_id = Column(UUID(as_uuid=True), ForeignKey("assessment_question_items.id"), nullable=True)
+    position = Column(Integer, nullable=False, default=0, server_default="0")
 
     assessment = relationship("Assessment", back_populates="questions")
 
@@ -299,8 +326,17 @@ class AssessmentQuestion(Base):
 class AssessmentQuestionSection(Base):
     __tablename__ = "assessment_question_sections"
 
+    __table_args__ = (
+        CheckConstraint(
+            "(question_id IS NULL) <> (assessment_item_id IS NULL)",
+            name="ck_assessment_question_sections_exactly_one_source",
+        ),
+        UniqueConstraint("assessment_id", "question_id", name="uq_assessment_sections_global"),
+        UniqueConstraint("assessment_id", "assessment_item_id", name="uq_assessment_sections_item"),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
+    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"), nullable=False)
     question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"))
     assessment_item_id = Column(UUID(as_uuid=True), ForeignKey("assessment_question_items.id"), nullable=True)
     section_name = Column(String, default="General")
@@ -309,9 +345,14 @@ class AssessmentQuestionSection(Base):
 class Assignment(Base):
     __tablename__ = "assignments"
 
+    __table_args__ = (
+        UniqueConstraint("assessment_id", "batch_id", name="uq_assignments_assessment_batch"),
+        Index("ix_assignments_batch_id", "batch_id"),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
-    batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"))
+    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"), nullable=False)
+    batch_id = Column(UUID(as_uuid=True), ForeignKey("batches.id"), nullable=False)
     assigned_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     due_date = Column(DateTime(timezone=True))
 
@@ -319,14 +360,36 @@ class Assignment(Base):
     batch = relationship("Batch", back_populates="assignments")
 
 
+class AssessmentUserAssignment(Base):
+    """Direct assessment recipients, alongside existing batch assignments."""
+    __tablename__ = "assessment_user_assignments"
+    __table_args__ = (
+        UniqueConstraint("assessment_id", "user_id", name="uq_assessment_user_assignments_target"),
+        Index("ix_assessment_user_assignments_user_id", "user_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+
 class Attempt(Base):
     __tablename__ = "attempts"
 
+    __table_args__ = (
+        Index("ix_attempts_user_status_started", "user_id", "status", "started_at"),
+        Index("ix_attempts_assessment_status", "assessment_id", "status"),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"))
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    assessment_id = Column(UUID(as_uuid=True), ForeignKey("assessments.id"), nullable=False)
     started_at = Column(DateTime(timezone=True))
     submitted_at = Column(DateTime(timezone=True))
+    active_seconds = Column(Float, nullable=False, default=0)
+    active_started_at = Column(DateTime(timezone=True), nullable=True)
+    active_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    sync_deadline_at = Column(DateTime(timezone=True), nullable=True)
     score = Column(Float)
     status = Column(Enum(AttemptStatus))
     tab_violations = Column(Integer, default=0)
@@ -335,16 +398,39 @@ class Attempt(Base):
     answers = relationship("Answer", back_populates="attempt")
 
 
+class AttemptIntegrityEvent(Base):
+    """Idempotent, advisory client signals associated with an attempt."""
+    __tablename__ = "attempt_integrity_events"
+    __table_args__ = (
+        UniqueConstraint("attempt_id", "event_id", name="uq_attempt_integrity_event_id"),
+        CheckConstraint(
+            "event_type IN ('focus_lost', 'fullscreen_exit', 'escape_key', 'devtools_shortcut')",
+            name="ck_attempt_integrity_event_type",
+        ),
+        Index("ix_attempt_integrity_events_attempt_created", "attempt_id", "created_at"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    attempt_id = Column(UUID(as_uuid=True), ForeignKey("attempts.id", ondelete="CASCADE"), nullable=False)
+    event_id = Column(UUID(as_uuid=True), nullable=False)
+    event_type = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
 class Answer(Base):
     __tablename__ = "answers"
 
     __table_args__ = (
         UniqueConstraint('attempt_id', 'question_id', name='uq_answer_attempt_question'),
         UniqueConstraint('attempt_id', 'assessment_item_id', name='uq_answer_attempt_item'),
+        CheckConstraint(
+            "(question_id IS NULL) <> (assessment_item_id IS NULL)",
+            name="ck_answers_exactly_one_source",
+        ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    attempt_id = Column(UUID(as_uuid=True), ForeignKey("attempts.id"))
+    attempt_id = Column(UUID(as_uuid=True), ForeignKey("attempts.id"), nullable=False)
     question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"))
     assessment_item_id = Column(UUID(as_uuid=True), ForeignKey("assessment_question_items.id"), nullable=True)
     answer = Column(Text)
@@ -366,6 +452,8 @@ class TopicScore(Base):
 
 class EvaluationJob(Base):
     __tablename__ = "evaluation_jobs"
+
+    __table_args__ = (Index("ix_evaluation_jobs_status_created", "status", "created_at"),)
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     attempt_id = Column(UUID(as_uuid=True), ForeignKey("attempts.id"), unique=True)
@@ -417,6 +505,8 @@ class PracticeTestStatus(str, enum.Enum):
 class PracticeTest(Base):
     __tablename__ = "practice_tests"
 
+    __table_args__ = (Index("ix_practice_tests_user_created", "user_id", "created_at"),)
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     job_title = Column(String, nullable=False)
@@ -431,6 +521,7 @@ class PracticeTest(Base):
     submitted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     error_message = Column(Text, nullable=True)
+    generation_claimed_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     user = relationship("User")
     questions = relationship("PracticeQuestion", back_populates="practice_test", order_by="PracticeQuestion.position")
@@ -438,6 +529,8 @@ class PracticeTest(Base):
 
 class PracticeQuestion(Base):
     __tablename__ = "practice_questions"
+
+    __table_args__ = (Index("ix_practice_questions_test_position", "practice_test_id", "position"),)
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     practice_test_id = Column(UUID(as_uuid=True), ForeignKey("practice_tests.id"), nullable=False)
@@ -554,6 +647,11 @@ class InterviewAssignment(Base):
 class InterviewSession(Base):
     __tablename__ = "interview_sessions"
 
+    __table_args__ = (
+        Index("ix_interview_sessions_user_status_created", "user_id", "status", "created_at"),
+        Index("ix_interview_sessions_template_status_created", "template_id", "status", "created_at"),
+    )
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     template_id = Column(UUID(as_uuid=True), ForeignKey("interview_templates.id"), nullable=False)
@@ -616,6 +714,8 @@ class MatchBand(str, enum.Enum):
 class QuestionGenerationBatch(Base):
     __tablename__ = "question_generation_batches"
 
+    __table_args__ = (Index("ix_generation_batches_status_created", "status", "created_at"),)
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     admin_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     filename = Column(String, nullable=True)
@@ -639,6 +739,8 @@ class QuestionGenerationBatch(Base):
 class StagedQuestion(Base):
     __tablename__ = "staged_questions"
 
+    __table_args__ = (Index("ix_staged_questions_batch_status_created", "batch_id", "status", "created_at"),)
+
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     batch_id = Column(UUID(as_uuid=True), ForeignKey("question_generation_batches.id"), nullable=False)
     question_type = Column(Enum(QuestionType), nullable=False)
@@ -661,6 +763,15 @@ class StagedQuestion(Base):
 
 class QuestionEmbedding(Base):
     __tablename__ = "question_embeddings"
+
+    __table_args__ = (
+        CheckConstraint(
+            "(question_id IS NULL) <> (staged_question_id IS NULL)",
+            name="ck_question_embeddings_exactly_one_owner",
+        ),
+        UniqueConstraint("question_id", name="uq_question_embeddings_question"),
+        UniqueConstraint("staged_question_id", name="uq_question_embeddings_staged"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     question_id = Column(UUID(as_uuid=True), ForeignKey("questions.id"), nullable=True)

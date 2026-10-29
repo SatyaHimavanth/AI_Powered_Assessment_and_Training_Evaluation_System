@@ -127,14 +127,6 @@ export default function AdminHome() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const navigate = useNavigate();
 
-  useEffect(() => {
-    const role = localStorage.getItem("role");
-    if (role !== "admin") {
-      navigate("/login");
-      return;
-    }
-  }, [navigate]);
-
   // Reload relevant data whenever the active tab changes
   useEffect(() => {
     switch (activeTab) {
@@ -157,6 +149,7 @@ export default function AdminHome() {
       case "assessments":
         loadTopics();
         loadBatches();
+        loadUsers();
         break;
       case "batches":
         loadBatches();
@@ -236,8 +229,12 @@ export default function AdminHome() {
     }
   }
 
-  const handleLogout = () => {
-    localStorage.clear();
+  const handleLogout = async () => {
+    try {
+      await api.post("/auth/logout");
+    } catch {
+      // Clear local session even when the server is unreachable.
+    }
     navigate("/login");
   };
 
@@ -333,12 +330,12 @@ export default function AdminHome() {
         <div className="p-8 max-w-[1200px]">
           <Toast message={message} onClose={() => setMessage("")} />
 
-          {activeTab === "dashboard" && <Dashboard users={users} pending={pending} topics={topics} batches={batches} counts={dashboardCounts} />}
+          {activeTab === "dashboard" && <Dashboard users={users} pending={pending} topics={topics} batches={batches} counts={dashboardCounts} onNavigate={setActiveTab} />}
           {activeTab === "approvals" && <Approvals pending={pending} setMessage={setMessage} reload={reloadAfterApprovals} />}
           {activeTab === "users" && <Users users={users} batches={batches} setMessage={setMessage} reloadUsers={loadUsers} />}
           {activeTab === "questions" && <Questions topics={topics} setMessage={setMessage} reloadTopics={loadTopics} />}
           {activeTab === "generate" && <QuestionGeneration topics={topics} setMessage={setMessage} />}
-          {activeTab === "assessments" && <Assessments topics={topics} batches={batches} setMessage={setMessage} />}
+          {activeTab === "assessments" && <Assessments topics={topics} batches={batches} users={users} setMessage={setMessage} />}
           {activeTab === "batches" && <Batches batches={batches} users={users} setMessage={setMessage} reloadBatches={loadBatches} />}
           {activeTab === "results" && <Results batches={batches} />}
           {activeTab === "interviews" && <Interviews setMessage={setMessage} />}

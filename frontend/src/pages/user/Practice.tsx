@@ -45,22 +45,22 @@ export default function Practice() {
   const [history, setHistory] = useState<PracticeTestInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [dataLoadError, setDataLoadError] = useState("");
+  const loadDataRequestRef = useRef<Promise<void> | null>(null);
 
   const extractError = (err: unknown, fallback: string) => {
-    const anyErr = err as any;
-    try {
-      if (anyErr?.response?.data) {
-        const data = anyErr.response.data;
-        if (typeof data.detail === "string") return data.detail;
-        if (Array.isArray(data.detail)) return data.detail.join(", ");
-        if (typeof data.message === "string") return data.message;
-        if (typeof data === "string") return data;
-        return JSON.stringify(data);
-      }
-      if (anyErr?.message) return anyErr.message;
-    } catch (e) {
-      // ignore parsing errors
+    const errorObject = err && typeof err === "object"
+      ? err as { response?: { data?: unknown }; message?: unknown }
+      : {};
+    const data = errorObject.response?.data;
+    if (typeof data === "string") return data;
+    if (data && typeof data === "object") {
+      const payload = data as { detail?: unknown; message?: unknown };
+      if (typeof payload.detail === "string") return payload.detail;
+      if (Array.isArray(payload.detail)) return payload.detail.map(String).join(", ");
+      if (typeof payload.message === "string") return payload.message;
     }
+    if (typeof errorObject.message === "string") return errorObject.message;
     return fallback;
   };
 
@@ -87,6 +87,8 @@ export default function Practice() {
   const [currentQ, setCurrentQ] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const submitLockRef = useRef(false);
+  const answerSaveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const answerSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
 
   // Result state
   const [resultData, setResultData] = useState<{ score: number | null; questions: ResultQuestion[] } | null>(null);
@@ -94,6 +96,8 @@ export default function Practice() {
 
   useEffect(() => {
     loadData();
+    // This is the one-time mount load; explicit refresh actions call loadData directly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const todayCount = useMemo(() => {
@@ -123,31 +127,40 @@ export default function Practice() {
             setTodayTest(res.data);
             clearInterval(interval);
           }
-        } catch { /* ignore */ }
+        } catch {
+          setMessage("Could not refresh practice generation status. Retrying automatically…");
+        }
       }, 3000);
       return () => clearInterval(interval);
     }
   }, [todayTest?.status]);
 
-  async function loadData() {
+  function loadData(): Promise<void> {
+    if (loadDataRequestRef.current) return loadDataRequestRef.current;
     setLoading(true);
-    try {
-      const accessRes = await api.get("/practice/access");
-      setAccessInfo(accessRes.data);
+    const request = (async () => {
+      try {
+        const accessRes = await api.get("/practice/access");
+        setAccessInfo(accessRes.data);
+        setDataLoadError("");
 
-      if (accessRes.data.has_access) {
-        const [todayRes, historyRes] = await Promise.all([
-          api.get("/practice/today"),
-          api.get("/practice/history"),
-        ]);
-        setTodayTest(todayRes.data);
-        setHistory(historyRes.data || []);
+        if (accessRes.data.has_access) {
+          const [todayRes, historyRes] = await Promise.all([
+            api.get("/practice/today"),
+            api.get("/practice/history"),
+          ]);
+          setTodayTest(todayRes.data);
+          setHistory(historyRes.data || []);
+        }
+      } catch (err: unknown) {
+        setDataLoadError(extractError(err, "Could not load practice data. Please retry."));
+      } finally {
+        setLoading(false);
+        loadDataRequestRef.current = null;
       }
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
+    })();
+    loadDataRequestRef.current = request;
+    return request;
   }
 
   const handleRequestAccess = async () => {
@@ -219,7 +232,7 @@ export default function Practice() {
       await api.post(`/practice/${todayTest.id}/start`);
       const res = await api.get(`/practice/${todayTest.id}`);
       setTestDetail({ id: res.data.id, questions: res.data.questions });
-      setAnswers({});
+      setAnswers(res.data.saved_answers || {});
       setCurrentQ(0);
       setView("test");
       setTodayTest({ ...todayTest, status: "in_progress" });
@@ -229,22 +242,48 @@ export default function Practice() {
     }
   };
 
+  const handleAnswerChange = (questionId: string, answer: string) => {
+    setAnswers((previous) => ({ ...previous, [questionId]: answer }));
+    const pendingTimer = answerSaveTimersRef.current.get(questionId);
+    if (pendingTimer) clearTimeout(pendingTimer);
+    const timer = setTimeout(() => {
+      if (!testDetail) return;
+      const save = () => api.put(`/practice/${testDetail.id}/answer`, {
+        question_id: questionId,
+        answer,
+      });
+      answerSaveQueueRef.current = answerSaveQueueRef.current
+        .catch(() => undefined)
+        .then(save)
+        .catch(() => setMessage("Some answers are not saved yet. Keep this page open and retry before submitting."));
+      answerSaveTimersRef.current.delete(questionId);
+    }, 400);
+    answerSaveTimersRef.current.set(questionId, timer);
+  };
+
   const handleSubmitTest = async () => {
     if (!testDetail || submitLockRef.current) return;
     submitLockRef.current = true;
     setSubmitting(true);
     try {
+      answerSaveTimersRef.current.forEach((timer) => clearTimeout(timer));
+      answerSaveTimersRef.current.clear();
+      await answerSaveQueueRef.current.catch(() => undefined);
       const answerPayload = testDetail.questions.map((q) => ({
         question_id: q.id,
         answer: answers[q.id] || "",
       }));
-      const res = await api.post(`/practice/${testDetail.id}/submit`, { answers: answerPayload });
+      const res = await api.post(
+        `/practice/${testDetail.id}/submit`,
+        { answers: answerPayload },
+        { timeout: 180_000 },
+      );
       setMessage(res.data.message);
       setView("home");
       loadData();
     } catch (err: unknown) {
       console.error(err);
-      setMessage("Failed to submit test");
+      setMessage(extractError(err, "Submission could not be completed. Your answers remain saved; retry submission."));
     } finally {
       submitLockRef.current = false;
       setSubmitting(false);
@@ -279,23 +318,38 @@ export default function Practice() {
   };
 
   const setMcqAnswer = (questionId: string, optionText: string, isMulti: boolean) => {
-    setAnswers((prev) => {
-      if (!isMulti) {
-        return { ...prev, [questionId]: optionText };
-      }
-      const current = prev[questionId] || "";
-      const parts = current ? current.split("|||") : [];
-      if (parts.includes(optionText)) {
-        return { ...prev, [questionId]: parts.filter((p) => p !== optionText).join("|||") };
-      }
-      return { ...prev, [questionId]: [...parts, optionText].join("|||") };
-    });
+    if (!isMulti) {
+      handleAnswerChange(questionId, optionText);
+      return;
+    }
+    const current = answers[questionId] || "";
+    const parts = current ? current.split("|||") : [];
+    const next = parts.includes(optionText)
+      ? parts.filter((part) => part !== optionText).join("|||")
+      : [...parts, optionText].join("|||");
+    handleAnswerChange(questionId, next);
   };
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="animate-spin w-8 h-8 border-3 border-blue-600 border-t-transparent rounded-full" />
+      </div>
+    );
+  }
+
+  if (dataLoadError) {
+    return (
+      <div className={`${card} mx-auto max-w-xl p-8 text-center`} role="alert">
+        <h2 className="mb-2 text-lg font-semibold text-gray-900">Practice data could not be loaded</h2>
+        <p className="mb-5 text-sm text-red-700">{dataLoadError}</p>
+        <button
+          type="button"
+          onClick={() => { void loadData(); }}
+          className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-blue-700"
+        >
+          Retry
+        </button>
       </div>
     );
   }
@@ -505,7 +559,7 @@ export default function Practice() {
           {q.type === "text" && (
             <textarea
               value={answers[q.id] || ""}
-              onChange={(e) => setAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))}
+              onChange={(e) => handleAnswerChange(q.id, e.target.value)}
               rows={5}
               placeholder="Type your answer here..."
               className="w-full px-4 py-3 border border-gray-200 rounded-lg text-sm focus:border-blue-500 focus:outline-none resize-none"
@@ -838,7 +892,23 @@ export default function Practice() {
                 </>
               )}
               {todayTest.status === "failed" && (
-                <p className="text-sm text-red-600">Generation failed. Please try again tomorrow.</p>
+                <div className="flex items-center gap-3">
+                  <p className="text-sm text-red-600">Generation failed.</p>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await api.post(`/practice/${todayTest.id}/retry-generation`);
+                        setTodayTest({ ...todayTest, status: "generating" });
+                        setMessage("Practice test generation restarted...");
+                      } catch (err: unknown) {
+                        setMessage(extractError(err, "Could not restart generation"));
+                      }
+                    }}
+                    className="px-3 py-1.5 border border-red-300 text-red-700 text-sm rounded-lg hover:bg-red-50 cursor-pointer"
+                  >
+                    Retry generation
+                  </button>
+                </div>
               )}
               {canCreateMore && (
                 <button

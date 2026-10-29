@@ -1,26 +1,12 @@
-"""
-Sandboxed Python Code Execution Service
+"""Candidate Python execution through the configured runner."""
 
-Executes user code in an isolated subprocess with resource limits.
-Designed to be swappable with cloud-based sandboxes:
-- Amazon Bedrock AgentCore Code Interpreter
-- Azure Container Apps dynamic sessions
-- Bearly Code Interpreter
-
-Current implementation: Local subprocess with timeout + memory limits.
-"""
-
-import subprocess
-import tempfile
-import os
-import sys
 from dataclasses import dataclass
 import ast
-from typing import Tuple, List, Dict, Any
+import os
+from typing import Dict, Any
 
-from core.logger import get_logger
-
-logger = get_logger(__name__)
+from core.python_runner_queue import PythonRunnerUnavailable, execute_in_sandbox
+from core.local_python_runner import execute_in_local_venv
 
 
 # --- Embedded static Python analyzer (copied from scripts/python_danger_testing.py)
@@ -218,95 +204,45 @@ class ExecutionResult:
 
 
 def execute_python_code(code: str, stdin_input: str = "") -> ExecutionResult:
-    """
-    Execute Python code in an isolated subprocess.
+    """Run candidate source using the configured execution mode.
 
-    Args:
-        code: The Python source code to execute
-        stdin_input: Input to feed to stdin
-
-    Returns:
-        ExecutionResult with stdout, stderr, exit_code, timed_out
+    ``local`` is a compatibility mode, not a security sandbox: it executes in
+    a subprocess under the backend account and can access that account's files
+    and network despite the resource and environment limits.
     """
-    # Write code to a temp file
-    tmp_file = None
+    if len(code.encode("utf-8")) > 50_000:
+        return ExecutionResult("", "Code exceeds 50000 bytes", -1, False)
+    analysis = analyze_python_code(code)
+    if not analysis["safe"]:
+        messages = [
+            str(item.get("warning") or item) for item in analysis["warnings"][:5]
+        ]
+        return ExecutionResult("", "Submission rejected by static safety checks: " + "; ".join(messages), -1, False)
     try:
-        # Static safety check using embedded analyzer
-        try:
-            analysis = analyze_python_code(code)
-            is_safe = bool(analysis.get("safe", True))
-            warnings = analysis.get("warnings", [])
-            # normalize warnings to strings
-            safety_warnings = []
-            for w in warnings:
-                if isinstance(w, dict):
-                    safety_warnings.append(f"Line {w.get('line', '?')}: {w.get('warning')}")
-                else:
-                    safety_warnings.append(str(w))
-        except Exception as e:
-            logger.error(f"analyze_python_code failed: {e}")
-            is_safe = True
-            safety_warnings = []
+        mode = os.environ.get("PYTHON_RUNNER_MODE", "local").strip().lower()
+        if mode == "local":
+            result = execute_in_local_venv(code, stdin_input)
+        elif mode == "queue":
+            result = execute_in_sandbox(code, stdin_input)
+        else:
+            raise PythonRunnerUnavailable("PYTHON_RUNNER_MODE must be 'local' or 'queue'")
+    except PythonRunnerUnavailable as exc:
+        return ExecutionResult("", f"Python execution unavailable: {exc}", -1, False)
+    return ExecutionResult(
+        stdout=str(result.get("stdout") or "")[:10_000],
+        stderr=str(result.get("stderr") or "")[:10_000],
+        exit_code=int(result.get("exit_code", -1)),
+        timed_out=bool(result.get("timed_out", False)),
+    )
 
-        if not is_safe:
-            # Build stderr containing warnings
-            stderr_msg = "Dangerous code rejected: " + "; ".join(safety_warnings) if safety_warnings else "Dangerous code rejected"
-            return ExecutionResult(
-                stdout="",
-                stderr=stderr_msg,
-                exit_code=-1,
-                timed_out=False,
-            )
-        tmp_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, encoding="utf-8"
-        )
-        tmp_file.write(code)
-        tmp_file.close()
 
-        # Execute in subprocess with resource limits
-        result = subprocess.run(
-            [sys.executable, "-u", tmp_file.name],
-            input=stdin_input,
-            capture_output=True,
-            text=True,
-            timeout=EXECUTION_TIMEOUT,
-            env={
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONIOENCODING": "utf-8",
-            },
-            cwd=tempfile.gettempdir(),
-        )
-
-        return ExecutionResult(
-            stdout=result.stdout[:MAX_OUTPUT_SIZE],
-            stderr=result.stderr[:MAX_OUTPUT_SIZE],
-            exit_code=result.returncode,
-            timed_out=False,
-        )
-
-    except subprocess.TimeoutExpired:
-        return ExecutionResult(
-            stdout="",
-            stderr=f"Execution timed out after {EXECUTION_TIMEOUT} seconds",
-            exit_code=-1,
-            timed_out=True,
-        )
-    except Exception as e:
-        logger.error(f"Code execution error: {e}")
-        return ExecutionResult(
-            stdout="",
-            stderr=str(e),
-            exit_code=-1,
-            timed_out=False,
-        )
-    finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            try:
-                os.unlink(tmp_file.name)
-            except OSError:
-                pass
-
+def ensure_execution_available(result: dict) -> None:
+    error = str(result.get("error") or "")
+    if any(
+        marker in error.lower()
+        for marker in ("execution unavailable", "runner is not configured")
+    ):
+        raise RuntimeError("Coding evaluation is unavailable until a Python runner is configured")
 
 def run_test_case(code: str, input_data: str, expected_output: str) -> dict:
     """

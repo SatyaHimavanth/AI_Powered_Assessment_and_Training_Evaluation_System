@@ -18,7 +18,9 @@ def test_invalid_login_does_not_issue_tokens(api_client, api_url):
 
 
 def test_login_identity_and_refresh(api_client, api_url, user_tokens):
-    assert {"access_token", "refresh_token", "role"} <= user_tokens.keys()
+    assert {"access_token", "role"} <= user_tokens.keys()
+    assert "refresh_token" not in user_tokens
+    assert api_client.cookies.get("assessment_refresh")
     me = api_client.get(
         f"{api_url}/auth/me",
         headers={"Authorization": f"Bearer {user_tokens['access_token']}"},
@@ -29,7 +31,7 @@ def test_login_identity_and_refresh(api_client, api_url, user_tokens):
 
     refreshed = api_client.post(
         f"{api_url}/auth/refresh",
-        json={"refresh_token": user_tokens["refresh_token"]},
+        headers={"X-Token-Response": "bearer"},
         timeout=10,
     )
     assert refreshed.status_code == 200

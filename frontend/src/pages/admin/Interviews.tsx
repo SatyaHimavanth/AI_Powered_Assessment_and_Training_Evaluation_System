@@ -89,7 +89,6 @@ export default function Interviews({ setMessage }: Props) {
   // Fetch users from server when search has 3+ chars
   useEffect(() => {
     if (userSearch.trim().length < 3) {
-      setAllUsers([]);
       return;
     }
     const timeout = setTimeout(() => {
@@ -172,8 +171,9 @@ export default function Interviews({ setMessage }: Props) {
       }
       setSelectedUserIds([]);
       setSelectedBatchId("");
-    } catch (err: any) {
-      setMessage(err?.response?.data?.detail || "Failed to assign interview");
+    } catch (err: unknown) {
+      const detail = err && typeof err === "object" ? (err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail : null;
+      setMessage(typeof detail === "string" ? detail : "Failed to assign interview");
     } finally {
       setAssigning(false);
     }

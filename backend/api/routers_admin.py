@@ -12,9 +12,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.auth import get_password_hash, require_admin
+from core.uploads import read_upload_limited
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
 from api.timezone_helper import as_utc_aware, parse_to_utc_aware, to_utc_iso
+from api.results_helpers import answer_score_label, classify_answer_status
 from db.models import (
     Batch,
     BatchUser,
@@ -39,11 +41,14 @@ from db.models import (
     AssessmentQuestionItem,
     AssessmentTopic,
     Assignment,
+    AssessmentUserAssignment,
     Difficulty,
     QuestionType,
     TopicScore,
     Answer,
     AttemptStatus,
+    AttemptIntegrityEvent,
+    QuestionEmbedding,
     InterviewAccessRequest,
     InterviewAccessStatus,
     InterviewSession,
@@ -54,6 +59,140 @@ import re
 import os
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+def _validate_retest_state(attempt, evaluation_job, has_unevaluated_answers: bool) -> None:
+    """Allow retests for missed attempts and fully evaluated completed attempts."""
+    if attempt.status == AttemptStatus.missed:
+        # A missed attempt is terminal. Locking the job in the route serializes
+        # this with the worker; do not delete a job currently being evaluated.
+        if evaluation_job and evaluation_job.status == EvaluationJobStatus.in_progress:
+            raise HTTPException(status_code=409, detail="The missed attempt is still being evaluated. Try again when evaluation stops.")
+        return
+    if attempt.status != AttemptStatus.completed:
+        raise HTTPException(status_code=409, detail="Only missed or completed attempts can be retested.")
+    if not evaluation_job or evaluation_job.status != EvaluationJobStatus.completed:
+        raise HTTPException(status_code=409, detail="The attempt must finish evaluation before it can be retested.")
+    if attempt.score is None or has_unevaluated_answers:
+        raise HTTPException(status_code=409, detail="The attempt still has unevaluated answers.")
+
+
+@router.delete("/testsuite/fixtures/{assessment_id}", include_in_schema=False)
+async def delete_testsuite_fixture(
+    assessment_id: UUID,
+    _admin: User = Depends(require_admin),
+):
+    """Hard-delete only a locally-created TestSuite assessment fixture.
+
+    Normal assessment deletion is intentionally archival to preserve audit
+    history. This narrowly-scoped cleanup endpoint is available only in local
+    and test environments and validates the generated TestSuite identifiers
+    before deleting the associated records.
+    """
+    if os.getenv("APP_ENV", "development").lower() not in {
+        "development", "dev", "local", "test", "testing"
+    }:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    def _sync_work():
+        db = SessionLocal()
+        try:
+            assessment = db.query(Assessment).filter(Assessment.id == assessment_id).first()
+            if not assessment:
+                return {"message": "TestSuite fixture already removed"}
+            match = re.fullmatch(r"TestSuite (?:concurrency|mixed) assessment ([0-9a-f]{10})", assessment.title or "")
+            if not match:
+                raise HTTPException(status_code=400, detail="Assessment is not a TestSuite fixture")
+
+            suffix = match.group(1)
+            fixture_assessments = db.query(Assessment).filter(Assessment.title.in_([
+                f"TestSuite concurrency assessment {suffix}",
+                f"TestSuite mixed assessment {suffix}",
+            ])).all()
+            fixture_assessment_ids = [row.id for row in fixture_assessments]
+            topic = db.query(Topic).filter(Topic.name == f"testsuite_topic_{suffix}").first()
+            batch = db.query(Batch).filter(Batch.name == f"testsuite_batch_{suffix}").first()
+            users = db.query(User).filter(
+                User.username.like(f"testsuite_user_{suffix}_%"),
+                User.account == "automated-tests",
+            ).all()
+            if not topic or not batch or len(users) != 3:
+                raise HTTPException(status_code=409, detail="Fixture ownership could not be verified")
+
+            user_ids = [user.id for user in users]
+            batch_user_ids = {
+                row.user_id for row in db.query(BatchUser).filter(BatchUser.batch_id == batch.id).all()
+            }
+            if batch_user_ids != set(user_ids):
+                raise HTTPException(status_code=409, detail="Fixture batch membership could not be verified")
+            directly_assigned_user_ids = {
+                row.user_id for row in db.query(AssessmentUserAssignment.user_id)
+                .filter(AssessmentUserAssignment.assessment_id == assessment.id).all()
+            }
+            if directly_assigned_user_ids != set(user_ids):
+                raise HTTPException(status_code=409, detail="Fixture individual assignments could not be verified")
+            test_questions = db.query(Question).filter(
+                Question.topic_id == topic.id,
+                or_(
+                    Question.question.like(f"TestSuite concurrency question {suffix}-%"),
+                    Question.question.like(f"TestSuite mixed question {suffix}-%"),
+                ),
+            ).all()
+            expected_question_count = 8 if len(fixture_assessments) == 2 else 4
+            if len(test_questions) != expected_question_count:
+                raise HTTPException(status_code=409, detail="Fixture questions could not be verified")
+            question_ids = [question.id for question in test_questions]
+
+            attempts = db.query(Attempt).filter(Attempt.assessment_id.in_(fixture_assessment_ids)).all()
+            attempt_ids = [attempt.id for attempt in attempts]
+            in_progress_jobs = db.query(EvaluationJob).filter(
+                EvaluationJob.attempt_id.in_(attempt_ids),
+                EvaluationJob.status == EvaluationJobStatus.in_progress,
+            ).count() if attempt_ids else 0
+            if in_progress_jobs:
+                raise HTTPException(status_code=409, detail="Wait for active fixture evaluation to finish")
+
+            if attempt_ids:
+                db.query(AttemptIntegrityEvent).filter(AttemptIntegrityEvent.attempt_id.in_(attempt_ids)).delete(synchronize_session=False)
+                db.query(Answer).filter(Answer.attempt_id.in_(attempt_ids)).delete(synchronize_session=False)
+                db.query(TopicScore).filter(TopicScore.attempt_id.in_(attempt_ids)).delete(synchronize_session=False)
+                db.query(EvaluationJob).filter(EvaluationJob.attempt_id.in_(attempt_ids)).delete(synchronize_session=False)
+                db.query(Attempt).filter(Attempt.id.in_(attempt_ids)).delete(synchronize_session=False)
+
+            db.query(AssessmentQuestionSection).filter(AssessmentQuestionSection.assessment_id.in_(fixture_assessment_ids)).delete(synchronize_session=False)
+            db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id.in_(fixture_assessment_ids)).delete(synchronize_session=False)
+            db.query(AssessmentTopic).filter(AssessmentTopic.assessment_id.in_(fixture_assessment_ids)).delete(synchronize_session=False)
+            db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.assessment_id.in_(fixture_assessment_ids)).delete(synchronize_session=False)
+            db.query(Assignment).filter(Assignment.assessment_id.in_(fixture_assessment_ids)).delete(synchronize_session=False)
+            db.query(AssessmentUserAssignment).filter(
+                AssessmentUserAssignment.assessment_id.in_(fixture_assessment_ids)
+            ).delete(synchronize_session=False)
+            db.query(Assessment).filter(Assessment.id.in_(fixture_assessment_ids)).delete(synchronize_session=False)
+
+            db.query(BatchUser).filter(
+                (BatchUser.batch_id == batch.id) | (BatchUser.user_id.in_(user_ids))
+            ).delete(synchronize_session=False)
+            db.delete(batch)
+
+            db.query(QuestionEmbedding).filter(QuestionEmbedding.question_id.in_(question_ids)).delete(synchronize_session=False)
+            db.query(QuestionOption).filter(QuestionOption.question_id.in_(question_ids)).delete(synchronize_session=False)
+            from db.models import TestCase
+            db.query(TestCase).filter(TestCase.question_id.in_(question_ids)).delete(synchronize_session=False)
+            db.query(Question).filter(Question.id.in_(question_ids)).delete(synchronize_session=False)
+            db.delete(topic)
+
+            from db.models import RefreshSession
+            db.query(RefreshSession).filter(RefreshSession.user_id.in_(user_ids)).delete(synchronize_session=False)
+            db.query(User).filter(User.id.in_(user_ids)).delete(synchronize_session=False)
+            db.commit()
+            return {"message": "TestSuite fixture and its attempts, jobs, users, and content were deleted"}
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    return await run_db_sync(_sync_work)
 
 
 class MessageResponse(BaseModel):
@@ -314,19 +453,29 @@ async def reset_user_attempt(
     attempt_id: UUID,
     _admin: User = Depends(require_admin),
 ):
-    """Admin endpoint to reset a user's attempt, allowing them to retake the assessment."""
+    """Clear an evaluated completed attempt so its owner can retake the assessment."""
     def _sync_work():
         from db.models import Attempt, Answer, TopicScore, EvaluationJob
         db = SessionLocal()
         try:
-            attempt = db.query(Attempt).filter(Attempt.id == attempt_id).first()
+            # Lock the attempt and evaluation job so a reset cannot race with
+            # submission or a worker that is still grading it.
+            attempt = db.query(Attempt).filter(Attempt.id == attempt_id).with_for_update().first()
             if not attempt:
                 raise HTTPException(status_code=404, detail="Attempt not found")
-
-            if attempt.status == AttemptStatus.in_progress:
-                raise HTTPException(status_code=400, detail="Cannot reset an in-progress attempt. Wait for the user to submit or abort first.")
+            evaluation_job = (
+                db.query(EvaluationJob)
+                .filter(EvaluationJob.attempt_id == attempt_id)
+                .with_for_update()
+                .first()
+            )
+            has_unevaluated_answers = db.query(Answer).filter(
+                Answer.attempt_id == attempt_id, Answer.score.is_(None)
+            ).first() is not None
+            _validate_retest_state(attempt, evaluation_job, has_unevaluated_answers)
 
             # Delete all related records first (to respect foreign key constraints)
+            db.query(AttemptIntegrityEvent).filter(AttemptIntegrityEvent.attempt_id == attempt_id).delete(synchronize_session="fetch")
             db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt_id).delete(synchronize_session='fetch')
             db.query(TopicScore).filter(TopicScore.attempt_id == attempt_id).delete(synchronize_session='fetch')
             db.query(Answer).filter(Answer.attempt_id == attempt_id).delete(synchronize_session='fetch')
@@ -335,7 +484,7 @@ async def reset_user_attempt(
             db.delete(attempt)
             db.commit()
 
-            return {"message": "Attempt reset successfully. User can now retake the assessment."}
+            return {"message": "Evaluated attempt data cleared. User can now retake the assessment."}
         finally:
             db.close()
 
@@ -426,6 +575,7 @@ class AttemptAnswerReviewItem(BaseModel):
     correct_answer: str
     is_correct: bool
     score: float | None
+    answer_status: str
     suggestion: str | None
 
 
@@ -484,6 +634,7 @@ async def get_attempt_results(
             aq_links = (
                 db.query(AssessmentQuestion)
                 .filter(AssessmentQuestion.assessment_id == assessment.id)
+                .order_by(AssessmentQuestion.position.asc(), AssessmentQuestion.id.asc())
                 .all()
             )
 
@@ -557,6 +708,7 @@ async def get_attempt_results(
                         "correct_answer": correct_answer_text,
                         "is_correct": is_correct,
                         "score": score_val,
+                        "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val),
                         "suggestion": (user_ans.feedback if user_ans and user_ans.feedback else None),
                     })
                 else:
@@ -609,11 +761,12 @@ async def get_attempt_results(
                         "correct_answer": correct_answer_text,
                         "is_correct": is_correct,
                         "score": score_val,
+                        "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val),
                         "suggestion": (user_ans.feedback if user_ans and user_ans.feedback else None),
                     })
 
             total_questions = len(questions) + len(items)
-            answered = len(user_answers)
+            answered = sum(1 for answer in user_answers if (answer.answer or "").strip())
             score = attempt.score
 
             topic_scores: List[dict] = []
@@ -717,7 +870,7 @@ async def export_attempt_results(
                     answer.get("question_text"),
                     answer.get("your_answer"),
                     answer.get("correct_answer"),
-                    answer.get("score") if answer.get("score") is not None else "Pending",
+                    answer_score_label(answer.get("answer_status", "awaiting_evaluation"), answer.get("score")),
                     answer.get("suggestion") or "",
                 ])
 
@@ -1484,7 +1637,7 @@ async def import_assessment_excel(
         raise HTTPException(status_code=400, detail="Only .xlsx/.xls files are accepted")
 
     try:
-        data = await file.read()
+        data = await read_upload_limited(file, 10 * 1024 * 1024)
     except Exception:
         raise HTTPException(status_code=400, detail="Failed to read uploaded file")
 
@@ -1651,6 +1804,7 @@ class CreateFromImportIn(BaseModel):
     duration: int = 60
     negative_marking: bool = False
     batch_ids: list[UUID] = []
+    user_ids: list[UUID] = []
     start_time: str | None = None
     end_time: str | None = None
 
@@ -1668,6 +1822,11 @@ async def create_assessment_from_import(
     def _sync_work():
         db = SessionLocal()
         try:
+            if body.batch_ids and body.user_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Choose either batch assignment or individual user assignment, not both",
+                )
             imp = db.query(ImportedAssessment).filter(ImportedAssessment.id == body.import_id).first()
             if not imp:
                 raise HTTPException(status_code=404, detail="Import not found")
@@ -1676,6 +1835,20 @@ async def create_assessment_from_import(
             validated = [q for q in imported_qs if q.validated]
             if not validated:
                 raise HTTPException(status_code=400, detail="No valid questions in import to create assessment")
+
+            batch_ids = list(dict.fromkeys(body.batch_ids))
+            user_ids = list(dict.fromkeys(body.user_ids))
+            if not batch_ids and not user_ids:
+                raise HTTPException(status_code=400, detail="Assign the assessment to at least one batch or user")
+            for batch_id in batch_ids:
+                if not db.query(Batch.id).filter(Batch.id == batch_id).first():
+                    raise HTTPException(status_code=400, detail=f"Batch {batch_id} not found")
+            if user_ids:
+                recipients = db.query(User).filter(
+                    User.id.in_(user_ids), User.is_active == True, User.role == UserRole.user
+                ).all()
+                if len(recipients) != len(user_ids):
+                    raise HTTPException(status_code=400, detail="One or more selected users are unavailable")
 
             # parse optional start/end times and create assessment
             from datetime import datetime, timezone
@@ -1719,7 +1892,7 @@ async def create_assessment_from_import(
             created_question_ids = []
             topic_agg: dict[tuple[str, str, str], int] = {}
 
-            for iq in validated:
+            for question_position, iq in enumerate(validated):
                 # map or create topic by name
                 topic_obj = None
                 if iq.topic:
@@ -1773,7 +1946,11 @@ async def create_assessment_from_import(
                 db.flush()
 
                 # link the assessment to this new per-assessment item
-                db.add(AssessmentQuestion(assessment_id=assessment.id, assessment_item_id=item.id))
+                db.add(AssessmentQuestion(
+                    assessment_id=assessment.id,
+                    assessment_item_id=item.id,
+                    position=question_position,
+                ))
                 db.add(AssessmentQuestionSection(assessment_id=assessment.id, assessment_item_id=item.id, section_name=(iq.section_name or "Imported")))
 
                 created_question_ids.append(item.id)
@@ -1805,12 +1982,14 @@ async def create_assessment_from_import(
 
             # create assignments
             batch_names: list[str] = []
-            if body.batch_ids:
-                for bid in body.batch_ids:
+            if batch_ids:
+                for bid in batch_ids:
                     b = db.query(Batch).filter(Batch.id == bid).first()
                     if b:
                         db.add(Assignment(assessment_id=assessment.id, batch_id=bid))
                         batch_names.append(b.name)
+            for user_id in user_ids:
+                db.add(AssessmentUserAssignment(assessment_id=assessment.id, user_id=user_id))
 
             # finalize
             imp.status = ImportStatus.used
@@ -1825,6 +2004,7 @@ async def create_assessment_from_import(
                 "total_questions": len(created_question_ids),
                 "topics": [],
                 "batch_names": batch_names,
+                "individual_user_count": len(user_ids),
                 "start_time": to_utc_iso(assessment.start_time) if assessment.start_time else None,
                 "end_time": to_utc_iso(assessment.end_time) if assessment.end_time else None,
                 "created_at": to_utc_iso(assessment.created_at),

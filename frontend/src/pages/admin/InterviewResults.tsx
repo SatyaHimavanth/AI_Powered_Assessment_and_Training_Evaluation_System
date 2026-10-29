@@ -74,7 +74,7 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
   const [results, setResults] = useState<InterviewResult[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [viewDetail, setViewDetail] = useState<SessionDetail | null>(null);
 
   // Filters
@@ -90,22 +90,6 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
   // Sorting
   const [sortField, setSortField] = useState<SortField | "">("")
   const [sortDir, setSortDir] = useState<SortDir>("asc");
-
-  useEffect(() => {
-    loadTemplates();
-  }, []);
-
-  useEffect(() => {
-    setPage(1);
-    loadResults(1);
-  }, [filterTemplate, filterStatus, filterDateFrom, filterDateTo]);
-
-  async function loadTemplates() {
-    try {
-      const res = await api.get("/admin/interviews/templates");
-      setTemplates(Array.isArray(res.data) ? res.data : []);
-    } catch { /* ignore */ }
-  }
 
   async function loadResults(pg?: number, ps?: number) {
     setLoading(true);
@@ -133,6 +117,51 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
     }
   }
 
+  useEffect(() => {
+    let active = true;
+    const fetchTemplates = async () => {
+      try {
+        const res = await api.get("/admin/interviews/templates");
+        if (active) setTemplates(Array.isArray(res.data) ? res.data : []);
+      } catch {
+        if (active) setMessage("Failed to load interview templates");
+      }
+    };
+    void fetchTemplates();
+    return () => { active = false; };
+  }, [setMessage]);
+
+  useEffect(() => {
+    let active = true;
+    const fetchResults = async () => {
+      const params = new URLSearchParams();
+      if (filterTemplate) params.set("template_id", filterTemplate);
+      if (filterStatus) params.set("status", filterStatus);
+      if (filterDateFrom) params.set("date_from", filterDateFrom);
+      if (filterDateTo) params.set("date_to", filterDateTo);
+      params.set("page", "1");
+      params.set("page_size", String(pageSize));
+      try {
+        const res = await api.get(`/admin/interviews/results?${params.toString()}`);
+        const data = res.data;
+        if (!active) return;
+        if (data && typeof data === "object" && "items" in data) {
+          setResults(Array.isArray(data.items) ? data.items : []);
+          setTotalCount(data.total_count ?? 0);
+        } else {
+          setResults(Array.isArray(data) ? data : []);
+          setTotalCount(Array.isArray(data) ? data.length : 0);
+        }
+      } catch {
+        if (active) setMessage("Failed to load interview results");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    void fetchResults();
+    return () => { active = false; };
+  }, [filterTemplate, filterStatus, filterDateFrom, filterDateTo, pageSize, setMessage]);
+
   async function viewResultDetail(sessionId: string) {
     try {
       const res = await api.get(`/admin/interviews/results/${sessionId}`);
@@ -148,6 +177,8 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
   }
 
   function clearFilters() {
+    setLoading(true);
+    setPage(1);
     setFilterTemplate("");
     setFilterStatus("");
     setFilterDateFrom("");
@@ -303,7 +334,7 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
             <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1">Template</label>
-            <select className={selectClass} value={filterTemplate} onChange={(e) => setFilterTemplate(e.target.value)}>
+            <select className={selectClass} value={filterTemplate} onChange={(e) => { setLoading(true); setPage(1); setFilterTemplate(e.target.value); }}>
               <option value="">All Templates</option>
               {templates.map((t) => (
                 <option key={t.id} value={t.id}>{t.title}</option>
@@ -312,7 +343,7 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
           </div>
           <div>
             <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1">Status</label>
-            <select className={selectClass} value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
+            <select className={selectClass} value={filterStatus} onChange={(e) => { setLoading(true); setPage(1); setFilterStatus(e.target.value); }}>
               {STATUS_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
@@ -320,11 +351,11 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
           </div>
           <div>
             <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1">From Date</label>
-            <input type="date" className={inputClass} value={filterDateFrom} onChange={(e) => setFilterDateFrom(e.target.value)} />
+            <input type="date" className={inputClass} value={filterDateFrom} onChange={(e) => { setLoading(true); setPage(1); setFilterDateFrom(e.target.value); }} />
           </div>
           <div>
             <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1">To Date</label>
-            <input type="date" className={inputClass} value={filterDateTo} onChange={(e) => setFilterDateTo(e.target.value)} />
+            <input type="date" className={inputClass} value={filterDateTo} onChange={(e) => { setLoading(true); setPage(1); setFilterDateTo(e.target.value); }} />
           </div>
         </div>
       </div>
@@ -340,7 +371,7 @@ export default function InterviewResults({ setMessage }: { setMessage: (m: strin
               <select
                 className="border border-[var(--color-border)] rounded px-1.5 py-1 text-xs bg-white"
                 value={pageSize}
-                onChange={(e) => { const ps = Number(e.target.value); setPageSize(ps); setPage(1); loadResults(1, ps); }}
+                onChange={(e) => { const ps = Number(e.target.value); setLoading(true); setPageSize(ps); setPage(1); }}
               >
                 {PAGE_SIZE_OPTIONS.map((n) => (
                   <option key={n} value={n}>{n}</option>

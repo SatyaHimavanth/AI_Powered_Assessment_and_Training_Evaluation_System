@@ -16,6 +16,7 @@ Scenarios covered:
 import os
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import requests
@@ -28,6 +29,7 @@ def _login(api_client, username, password):
     resp = api_client.post(
         f"{BASE_URL}/auth/login",
         json={"username": username, "password": password},
+        headers={"X-Token-Response": "bearer"},
         timeout=10,
     )
     assert resp.status_code == 200, f"Login failed for {username}: {resp.text}"
@@ -67,14 +69,18 @@ def _submit_assessment(api_client, token, attempt_id, answers):
 
 
 def _save_violations(api_client, token, attempt_id, violations):
-    resp = api_client.post(
-        f"{BASE_URL}/user/assessments/save-violations",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"attempt_id": str(attempt_id), "violations": violations},
-        timeout=10,
-    )
-    assert resp.status_code == 200
-    return resp.json()
+    responses = []
+    for _ in range(violations):
+        resp = api_client.post(
+            f"{BASE_URL}/user/assessments/save-violations",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"attempt_id": str(attempt_id)},
+            json={"event_id": str(uuid.uuid4()), "event_type": "focus_lost"},
+            timeout=10,
+        )
+        assert resp.status_code == 200, resp.text
+        responses.append(resp.json())
+    return responses[-1] if responses else {"status": "saved", "violations": 0}
 
 
 def _abort_assessment(api_client, token, attempt_id, answers):
@@ -181,6 +187,105 @@ class TestAssessmentInputValidation:
         )
         assert response.status_code == 400
         assert "does not belong" in response.json()["detail"]
+
+
+class TestAttemptDeadlineRecovery:
+    def test_attempt_can_resume_with_remaining_active_time_after_long_break(self, ctx, db_session):
+        from db.models import Assessment, Attempt, AttemptStatus
+
+        username = ctx.usernames[0]
+        client = ctx.get_client(username)
+        token = ctx.login(username)
+        started = _start_attempt(client, token, ctx.assessment_id)
+        attempt_id = uuid.UUID(started["attempt_id"])
+        attempt = db_session.query(Attempt).filter(Attempt.id == attempt_id).one()
+        assessment = db_session.query(Assessment).filter(
+            Assessment.id == attempt.assessment_id
+        ).one()
+        assessment.end_time = datetime.now(timezone.utc) + timedelta(hours=1)
+        attempt.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        attempt.active_seconds = 0
+        attempt.active_started_at = None
+        attempt.active_heartbeat_at = None
+        db_session.commit()
+
+        response = client.post(
+            f"{BASE_URL}/user/assessments/start/{ctx.assessment_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["attempt_id"] == str(attempt_id)
+        assert assessment.duration * 60 - 1 <= response.json()["time_remaining_seconds"] <= assessment.duration * 60
+        db_session.refresh(attempt)
+        assert attempt.status == AttemptStatus.in_progress
+
+    def test_assessment_end_finalizes_attempt_and_queues_evaluation(self, ctx, db_session):
+        from db.models import Attempt, AttemptStatus, Assessment, EvaluationJob
+
+        username = ctx.usernames[0]
+        client = ctx.get_client(username)
+        token = ctx.login(username)
+        started = _start_attempt(client, token, ctx.assessment_id)
+        attempt_id = uuid.UUID(started["attempt_id"])
+        attempt = db_session.query(Attempt).filter(Attempt.id == attempt_id).one()
+        assessment = db_session.query(Assessment).filter(
+            Assessment.id == attempt.assessment_id
+        ).one()
+        assessment.end_time = datetime.now(timezone.utc) - timedelta(seconds=1)
+        attempt.started_at = datetime.now(timezone.utc) - timedelta(minutes=started["duration"] + 1)
+        db_session.commit()
+
+        response = client.post(
+            f"{BASE_URL}/user/assessments/start/{ctx.assessment_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        db_session.refresh(attempt)
+        assert response.status_code == 400
+        assert attempt.status == AttemptStatus.completed
+        assert db_session.query(EvaluationJob).filter(
+            EvaluationJob.attempt_id == attempt_id
+        ).count() == 1
+        assert db_session.query(Attempt).filter(
+            Attempt.user_id == attempt.user_id,
+            Attempt.assessment_id == attempt.assessment_id,
+        ).count() == 1
+
+    def test_late_submission_finalizes_only_answers_already_saved(self, ctx, db_session):
+        from db.models import Answer, Attempt, Assessment
+
+        username = ctx.usernames[0]
+        client = ctx.get_client(username)
+        token = ctx.login(username)
+        started = _start_attempt(client, token, ctx.assessment_id)
+        attempt_id = uuid.UUID(started["attempt_id"])
+        question = started["questions"][0]
+        question_id = str(question["id"])
+        saved_choice = ctx.question_correct_options[question_id]
+        _save_answer(client, token, str(attempt_id), question_id, saved_choice)
+
+        attempt = db_session.query(Attempt).filter(Attempt.id == attempt_id).one()
+        assessment = db_session.query(Assessment).filter(
+            Assessment.id == attempt.assessment_id
+        ).one()
+        assessment.end_time = datetime.now(timezone.utc) - timedelta(seconds=1)
+        attempt.started_at = datetime.now(timezone.utc) - timedelta(minutes=started["duration"] + 1)
+        db_session.commit()
+
+        late_answers = [
+            (str(item["id"]), ctx.question_correct_options[str(item["id"])])
+            for item in started["questions"]
+        ]
+        response = _submit_assessment(client, token, str(attempt_id), late_answers)
+
+        assert response.status_code == 200, response.text
+        persisted = db_session.query(Answer).filter(Answer.attempt_id == attempt_id).all()
+        assert len(persisted) == 1
+        assert str(persisted[0].question_id) == question_id
+        assert persisted[0].answer == saved_choice
 
 
 class TestPartialAttemptScoring:

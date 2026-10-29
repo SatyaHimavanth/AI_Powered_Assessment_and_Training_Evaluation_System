@@ -6,6 +6,7 @@ Provides endpoints for:
 - Getting test cases for a coding question
 """
 
+import asyncio
 from typing import List
 from uuid import UUID
 
@@ -14,13 +15,11 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.auth import get_current_user
-from core.code_runner import run_test_case
+from core.code_runner import ensure_execution_available, run_test_case
 from core.sql_runner import run_sql_test_case
 from db.models import Question, QuestionType, TestCase, User
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
-from pydantic import BaseModel
-import re
 
 router = APIRouter(prefix="/code", tags=["code-execution"])
 
@@ -102,11 +101,18 @@ async def run_code(
     """
     Execute user code against test cases.
 
-    - run_sample_only=True: run only sample (visible) test cases (for "Run" button)
-    - run_sample_only=False: run all test cases including hidden (for final submission scoring)
+    Candidate-facing execution is limited to public sample cases regardless of
+    the request body. Hidden cases are evaluated only by the server worker.
     """
+    language = (body.language or "python").strip().lower()
+    if language not in ("python", "sql"):
+        raise HTTPException(status_code=400, detail="Invalid language. Supported: 'python', 'sql'")
+    if not body.code.strip():
+        raise HTTPException(status_code=400, detail="No code provided")
+    if len(body.code.encode("utf-8")) > 50_000:
+        raise HTTPException(status_code=400, detail="Code exceeds maximum length (50000 bytes)")
 
-    def _sync_work():
+    def _load_test_cases():
         db = SessionLocal()
         try:
             question = db.query(Question).filter(Question.id == body.question_id).first()
@@ -115,62 +121,56 @@ async def run_code(
             if question.type != QuestionType.coding:
                 raise HTTPException(status_code=400, detail="Not a coding question")
 
-            if not body.code.strip():
-                raise HTTPException(status_code=400, detail="No code provided")
-
-            # Security: basic code length check
-            if len(body.code) > 50_000:
-                raise HTTPException(status_code=400, detail="Code exceeds maximum length (50000 chars)")
-
-            # Get appropriate test cases
-            query = db.query(TestCase).filter(TestCase.question_id == body.question_id)
-            if body.run_sample_only:
-                query = query.filter(TestCase.is_sample == True).limit(2)
+            # Candidate-facing execution is always restricted to public samples.
+            query = db.query(TestCase).filter(
+                TestCase.question_id == body.question_id,
+                TestCase.is_sample == True,
+            ).limit(2)
             test_cases = query.all()
-
             if not test_cases:
                 raise HTTPException(status_code=400, detail="No test cases available for this question")
-
-            results_list = []
-
-            language = (body.language or "python").strip().lower()
-            if language not in ("python", "sql"):
-                raise HTTPException(status_code=400, detail="Invalid language. Supported: 'python', 'sql'")
-
-            for tc in test_cases:
-                if language == "sql":
-                    result = run_sql_test_case(
-                        code=body.code,
-                        input_data=tc.input_data,
-                        expected_output=tc.expected_output,
-                    )
-                else:
-                    result = run_test_case(
-                        code=body.code,
-                        input_data=tc.input_data,
-                        expected_output=tc.expected_output,
-                    )
-
-                results_list.append({
-                    "test_case_id": tc.id,
-                    "passed": bool(result.get("passed")),
-                    "input_data": tc.input_data if tc.is_sample else "(hidden)",
-                    "expected_output": tc.expected_output if tc.is_sample else "(hidden)",
-                    "actual_output": result.get("actual_output") if tc.is_sample else ("correct" if result.get("passed") else "wrong answer"),
-                    "error": result.get("error"),
+            return [
+                {
+                    "id": tc.id,
+                    "input_data": tc.input_data or "",
+                    "expected_output": tc.expected_output or "",
                     "is_sample": bool(tc.is_sample),
-                })
-
-            passed_count = sum(1 for r in results_list if r["passed"])
-            return {
-                "results": results_list,
-                "total": len(results_list),
-                "passed": passed_count,
-                "failed": len(results_list) - passed_count,
-                "all_passed": passed_count == len(results_list),
-            }
+                }
+                for tc in test_cases
+            ]
         finally:
             db.close()
 
-    payload = await run_db_sync(_sync_work)
+    test_cases = await run_db_sync(_load_test_cases)
+    results_list = []
+    for test_case in test_cases:
+        runner = run_sql_test_case if language == "sql" else run_test_case
+        result = await asyncio.to_thread(
+            runner,
+            code=body.code,
+            input_data=test_case["input_data"],
+            expected_output=test_case["expected_output"],
+        )
+        try:
+            ensure_execution_available(result)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        results_list.append({
+            "test_case_id": test_case["id"],
+            "passed": bool(result.get("passed")),
+            "input_data": test_case["input_data"],
+            "expected_output": test_case["expected_output"],
+            "actual_output": result.get("actual_output"),
+            "error": result.get("error"),
+            "is_sample": test_case["is_sample"],
+        })
+
+    passed_count = sum(1 for result in results_list if result["passed"])
+    payload = {
+        "results": results_list,
+        "total": len(results_list),
+        "passed": passed_count,
+        "failed": len(results_list) - passed_count,
+        "all_passed": passed_count == len(results_list),
+    }
     return RunCodeResponse(**payload)

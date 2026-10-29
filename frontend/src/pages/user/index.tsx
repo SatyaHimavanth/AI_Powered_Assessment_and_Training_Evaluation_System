@@ -7,6 +7,7 @@ import Practice from "./Practice";
 import Interviews from "./Interviews";
 import ExamPage from "./ExamPage";
 import InterviewPage from "./InterviewPage";
+import { clearUserAssessmentDrafts } from "../../assessmentOfflineDraft";
 
 interface UserProfile {
   username: string;
@@ -29,32 +30,6 @@ export default function UserHome() {
   });
   const navigate = useNavigate();
 
-  const loadProfile = useCallback(async () => {
-    try {
-      const res = await api.get("/auth/me");
-      setProfile(res.data);
-    } catch {
-      navigate("/login");
-    }
-  }, [navigate]);
-
-  useEffect(() => {
-    const role = localStorage.getItem("role");
-    if (role !== "user") {
-      navigate("/login");
-      return;
-    }
-    const t = setTimeout(() => {
-      loadProfile();
-    }, 0);
-    return () => clearTimeout(t);
-  }, [loadProfile, navigate]);
-
-  useEffect(() => {
-    if (!profile) return;
-    loadSidebarCounts();
-  }, [profile]);
-
   const loadSidebarCounts = useCallback(async () => {
     try {
       const [assessmentsRes, interviewsRes] = await Promise.all([
@@ -62,8 +37,10 @@ export default function UserHome() {
         api.get("/interviews/dashboard-counts"),
       ]);
 
-      const assessments = Array.isArray(assessmentsRes.data) ? assessmentsRes.data : [];
-      const assessmentsToAttend = assessments.filter((a: any) => a.status === "pending").length;
+      const assessments = Array.isArray(assessmentsRes.data)
+        ? assessmentsRes.data as { status?: string }[]
+        : [];
+      const assessmentsToAttend = assessments.filter((assessment) => assessment.status === "pending").length;
 
       setCounts({
         assessmentsToAttend,
@@ -75,8 +52,30 @@ export default function UserHome() {
     }
   }, []);
 
-  const handleLogout = () => {
-    localStorage.clear();
+  const loadProfile = useCallback(async () => {
+    try {
+      const res = await api.get("/auth/me");
+      setProfile(res.data);
+      await loadSidebarCounts();
+    } catch {
+      navigate("/login");
+    }
+  }, [loadSidebarCounts, navigate]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void loadProfile();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadProfile, navigate]);
+
+  const handleLogout = async () => {
+    try {
+      await api.post("/auth/logout");
+    } catch {
+      // Clear local session even when the server is unreachable.
+    }
+    if (profile?.username) clearUserAssessmentDrafts(profile.username);
     navigate("/login");
   };
 
@@ -85,6 +84,7 @@ export default function UserHome() {
     return (
       <ExamPage
         assessmentId={examAssessmentId}
+        userKey={profile?.username ?? ""}
         onExit={() => setExamAssessmentId(null)}
       />
     );
@@ -237,17 +237,9 @@ export default function UserHome() {
           ) : (
             <Interviews
               onStartInterview={(templateId) => setInterviewTemplateId(templateId)}
-              onResumeInterview={(sessionId) => {
-                // We need template ID for resume - fetch it from sessions
-                // For now, use a placeholder approach: set templateId from the session data
-                api.get(`/interviews/${sessionId}/results`).then((res) => {
-                  setInterviewTemplateId(res.data?.template_id || "");
-                  setInterviewSessionId(sessionId);
-                }).catch(() => {
-                  // fallback: just open with session
-                  setInterviewTemplateId("_resume_");
-                  setInterviewSessionId(sessionId);
-                });
+              onResumeInterview={(sessionId, templateId) => {
+                setInterviewTemplateId(templateId);
+                setInterviewSessionId(sessionId);
               }}
             />
           )}

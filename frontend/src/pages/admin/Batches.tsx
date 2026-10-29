@@ -12,20 +12,20 @@ interface Props {
 
 export default function Batches({ batches, users, setMessage, reloadBatches }: Props) {
   const extractError = (err: unknown, fallback: string) => {
-    const anyErr = err as any;
+    const error = err as { response?: { data?: unknown }; message?: string };
     try {
-      if (anyErr?.response?.data) {
-        const data = anyErr.response.data;
-        if (typeof data.detail === "string") return data.detail;
-        if (Array.isArray(data.detail)) return data.detail.join(", ");
-        if (typeof data.message === "string") return data.message;
+      const data = error?.response?.data;
+      if (data && typeof data === "object") {
+        const body = data as { detail?: unknown; message?: unknown };
+        if (typeof body.detail === "string") return body.detail;
+        if (Array.isArray(body.detail)) return body.detail.map(String).join(", ");
+        if (typeof body.message === "string") return body.message;
         if (typeof data === "string") return data;
-        // sometimes fastapi returns { detail: { ... } }
         return JSON.stringify(data);
       }
-      if (anyErr?.message) return anyErr.message;
-    } catch (e) {
-      // ignore parsing errors
+      if (typeof error?.message === "string") return error.message;
+    } catch {
+      return fallback;
     }
     return fallback;
   };

@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
 import os
+import uuid
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -18,8 +19,9 @@ from core.auth import (
     get_password_hash,
     verify_password,
     ACCESS_TOKEN_EXPIRE_MINUTES,
+    ACCESS_COOKIE_NAME,
 )
-from db.models import RegistrationRequest, RegistrationStatus, User
+from db.models import RefreshSession, RegistrationRequest, RegistrationStatus, User
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
 
@@ -27,6 +29,48 @@ from db.database import SessionLocal
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 REGISTRATION_EXPIRY_DAYS = int(os.getenv("REGISTRATION_EXPIRY_DAYS", "2"))
+REFRESH_COOKIE_NAME = "assessment_refresh"
+COOKIE_SECURE = os.getenv("APP_ENV", "development").lower() in {"production", "prod"}
+
+
+def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie(
+        ACCESS_COOKIE_NAME,
+        access_token,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    response.set_cookie(
+        REFRESH_COOKIE_NAME,
+        refresh_token,
+        max_age=7 * 24 * 60 * 60,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+
+
+def _revoke_refresh_session(db: Session, user: User, jti: str) -> bool:
+    session = (
+        db.query(RefreshSession)
+        .filter(RefreshSession.jti == jti, RefreshSession.user_id == user.id)
+        .with_for_update()
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+    if not session or session.revoked_at is not None:
+        return False
+    expires_at = session.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        return False
+    session.revoked_at = now
+    return True
 
 
 # ---------- Schemas ---------- #
@@ -47,14 +91,10 @@ class UserLogin(BaseModel):
 
 
 class Token(BaseModel):
-    access_token: str
-    refresh_token: str
+    """Browser calls receive HttpOnly cookies; trusted API clients can opt into bearer JSON."""
+    access_token: str | None = None
     token_type: str
     role: str
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
 
 
 class MessageResponse(BaseModel):
@@ -158,8 +198,8 @@ async def register(payload: UserRegister):
     return await run_db_sync(_sync_work)
 
 
-@router.post("/login", response_model=Token)
-async def login(payload: UserLogin):
+@router.post("/login", response_model=Token, response_model_exclude_none=True)
+async def login(payload: UserLogin, request: Request, response: Response):
     def _sync_work():
         db = SessionLocal()
         try:
@@ -174,57 +214,136 @@ async def login(payload: UserLogin):
                 data={"sub": user.username, "role": user.role.value},
                 expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
             )
-            refresh_token = create_refresh_token(data={"sub": user.username})
+            refresh_jti = str(uuid.uuid4())
+            refresh_expiry = datetime.now(timezone.utc) + timedelta(days=7)
+            refresh_token = create_refresh_token(
+                data={"sub": user.username, "jti": refresh_jti}
+            )
+            db.add(RefreshSession(
+                jti=refresh_jti,
+                user_id=user.id,
+                expires_at=refresh_expiry,
+            ))
+            db.commit()
 
             return {
                 "access_token": access_token,
-                "refresh_token": refresh_token,
+                "refresh_cookie": refresh_token,
                 "token_type": "bearer",
                 "role": user.role.value,
             }
         finally:
             db.close()
 
-    return await run_db_sync(_sync_work)
+    result = await run_db_sync(_sync_work)
+    access_token = result.pop("access_token")
+    _set_auth_cookies(response, access_token, result.pop("refresh_cookie"))
+    if request.headers.get("x-token-response", "").lower() == "bearer":
+        result["access_token"] = access_token
+    return result
 
 
-@router.post("/refresh", response_model=Token)
-async def refresh(req: RefreshRequest):
+@router.post("/refresh", response_model=Token, response_model_exclude_none=True)
+async def refresh(
+    request: Request,
+    response: Response,
+    refresh_cookie: str | None = Cookie(default=None, alias=REFRESH_COOKIE_NAME),
+):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
     )
     try:
-        payload = jwt.decode(req.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        token = refresh_cookie
+        if not token:
+            raise credentials_exception
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        if username is None:
+        jti: str | None = payload.get("jti")
+        if username is None or not jti or payload.get("token_use") != "refresh":
             raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception
 
-    def _sync_work(username: str):
+    def _sync_work(username: str, jti: str):
         db = SessionLocal()
         try:
-            user = db.query(User).filter(User.username == username).first()
+            user = db.query(User).filter(User.username == username).with_for_update().first()
             if user is None or not user.is_active:
+                raise credentials_exception
+
+            if not _revoke_refresh_session(db, user, jti):
+                # Reuse invalidates all active sessions, including the rotated token.
+                db.query(RefreshSession).filter(
+                    RefreshSession.user_id == user.id,
+                    RefreshSession.revoked_at.is_(None),
+                ).update({RefreshSession.revoked_at: datetime.now(timezone.utc)})
+                db.commit()
                 raise credentials_exception
 
             access_token = create_access_token(
                 data={"sub": user.username, "role": user.role.value},
                 expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
             )
-            refresh_token = create_refresh_token(data={"sub": user.username})
+            next_jti = str(uuid.uuid4())
+            refresh_expiry = datetime.now(timezone.utc) + timedelta(days=7)
+            refresh_token = create_refresh_token(
+                data={"sub": user.username, "jti": next_jti}
+            )
+            db.add(RefreshSession(
+                jti=next_jti,
+                user_id=user.id,
+                expires_at=refresh_expiry,
+            ))
+            db.commit()
 
             return {
                 "access_token": access_token,
-                "refresh_token": refresh_token,
+                "refresh_cookie": refresh_token,
                 "token_type": "bearer",
                 "role": user.role.value,
             }
         finally:
             db.close()
 
-    return await run_db_sync(_sync_work, username)
+    result = await run_db_sync(_sync_work, username, jti)
+    access_token = result.pop("access_token")
+    _set_auth_cookies(response, access_token, result.pop("refresh_cookie"))
+    if request.headers.get("x-token-response", "").lower() == "bearer":
+        result["access_token"] = access_token
+    return result
+
+
+@router.post("/logout", response_model=MessageResponse)
+async def logout(
+    response: Response,
+    refresh_cookie: str | None = Cookie(default=None, alias=REFRESH_COOKIE_NAME),
+):
+    if refresh_cookie:
+        try:
+            payload = jwt.decode(refresh_cookie, SECRET_KEY, algorithms=[ALGORITHM])
+            username = payload.get("sub")
+            jti = payload.get("jti")
+        except jwt.PyJWTError:
+            username = None
+            jti = None
+
+        if username and jti:
+            def _sync_work():
+                db = SessionLocal()
+                try:
+                    user = db.query(User).filter(User.username == username).first()
+                    if user:
+                        _revoke_refresh_session(db, user, jti)
+                        db.commit()
+                finally:
+                    db.close()
+
+            await run_db_sync(_sync_work)
+
+    response.delete_cookie(ACCESS_COOKIE_NAME, path="/", secure=COOKIE_SECURE, httponly=True, samesite="strict")
+    response.delete_cookie(REFRESH_COOKIE_NAME, path="/", secure=COOKIE_SECURE, httponly=True, samesite="strict")
+    return {"message": "Logged out"}
 
 
 @router.get("/me", response_model=UserOut)

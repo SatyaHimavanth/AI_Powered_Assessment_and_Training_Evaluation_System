@@ -81,22 +81,47 @@ class TestRegistrationAndUserLifecycle:
         assert login.status_code == 200, login.text
         tokens = login.json()
         assert tokens["role"] == "user"
-
-        me = api_client.get(
-            f"{BASE_URL}/auth/me",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
-            timeout=10,
+        assert "access_token" not in tokens
+        assert "refresh_token" not in tokens
+        assert "assessment_access" in login.cookies
+        assert "assessment_refresh" in login.cookies
+        refresh_cookie = login.cookies.get("assessment_refresh")
+        cookie = next(
+            item for item in login.cookies
+            if item.name == "assessment_refresh"
         )
+        assert cookie.has_nonstandard_attr("HttpOnly")
+        set_cookie_header = login.headers.get("set-cookie", "").lower()
+        assert "httponly" in set_cookie_header
+        assert "samesite=strict" in set_cookie_header
+
+        me = api_client.get(f"{BASE_URL}/auth/me", timeout=10)
         assert me.status_code == 200
         assert me.json()["username"] == payload["username"]
 
         refreshed = api_client.post(
             f"{BASE_URL}/auth/refresh",
-            json={"refresh_token": tokens["refresh_token"]},
             timeout=10,
         )
         assert refreshed.status_code == 200
-        assert refreshed.json()["access_token"]
+        assert "access_token" not in refreshed.json()
+        assert "assessment_access" in refreshed.cookies
+        assert "assessment_refresh" in refreshed.cookies
+
+        # Reusing a rotated cookie revokes the whole refresh-token family.
+        api_client.cookies.set(
+            "assessment_refresh", refresh_cookie, domain=cookie.domain, path=cookie.path
+        )
+        replay = api_client.post(f"{BASE_URL}/auth/refresh", timeout=10)
+        assert replay.status_code == 401
+        api_client.cookies.set(
+            "assessment_refresh",
+            refreshed.cookies.get("assessment_refresh"),
+            domain=cookie.domain,
+            path=cookie.path,
+        )
+        replay_successor = api_client.post(f"{BASE_URL}/auth/refresh", timeout=10)
+        assert replay_successor.status_code == 401
 
         from db.models import User
 

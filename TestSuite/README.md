@@ -13,7 +13,10 @@ App Engine, or another cloud platform.
 - learner-visible results matched against admin results, including answer
   counts, per-question text, topic percentages, and per-user isolation
 - practice and interview read workflows
-- browser login feedback, navigation, and rapid double-click suppression
+- browser login validation, keyboard submission, network-failure feedback, and rapid double-click suppression
+- browser practice-load outage/retry, large Unicode and markup-like answer persistence, refresh/resume, and interview recovery
+- browser lifecycle: admin-provisioned assessment attended and submitted by two isolated candidate sessions, with integrity-event checks
+- malformed and unsupported anti-cheat event API payloads, including attempt ownership boundaries
 
 Safe API tests run by default. Tests that start/finalize an assessment require
 `RUN_STATEFUL_TESTS=1`; use a dedicated database. Browser tests require
@@ -44,6 +47,21 @@ $env:RUN_E2E_TESTS = "1"
 uv run pytest -m e2e --browser chromium
 ```
 
+To run the multi-candidate browser lifecycle, enable both stateful fixtures and
+browser tests. It provisions assessment content and three temporary users
+through authenticated admin APIs, then two candidates log in and attend the
+assessment through separate Chromium contexts. Candidate sessions run serially
+and the test asserts that no focus/fullscreen integrity events were emitted.
+The third candidate is available to extend the scenario without reusing an
+account. Local/test teardown removes the generated attempts and evaluation
+jobs. Run stateful tests only against a dedicated test environment.
+
+```powershell
+$env:RUN_STATEFUL_TESTS = "1"
+$env:RUN_E2E_TESTS = "1"
+uv run pytest tests/test_browser_workflows.py -k two_candidates_attend --browser chromium
+```
+
 For CORS validation, set `CORS_TEST_ORIGIN` to the deployed frontend origin.
 The stateful workflow skips when the test user has no currently startable
 assessment.
@@ -65,11 +83,13 @@ uv run python run_all.py -x -vv
 ```
 
 The stateful concurrency scenario creates three temporary users plus an
-isolated topic, four questions, batch, and assessment through public admin
-APIs. Users concurrently exercise full, partial, and violation-aborted
-attempts and verify that learner results agree with admin results. Teardown
-deactivates the users and archives the content. Run it only against a
-dedicated test environment because audit records remain.
+isolated topic, four questions, batch, and individually assigned assessment through admin APIs. Users
+exercise full, partial, and violation-aborted attempts and verify that learner
+results agree with admin results. In local/test environments, teardown uses a
+restricted TestSuite cleanup endpoint to remove the fixture, attempts,
+evaluation jobs, users, and content. Other environments retain the existing
+archive/deactivate behavior; run stateful tests only against a dedicated test
+environment.
 
 The backend must allow `FRONTEND_URL` through `CORS_ALLOWED_ORIGINS`. Local
 development origins are enabled by default; cloud deployments must set the
@@ -77,10 +97,13 @@ deployed frontend origin explicitly.
 
 ## Coverage boundaries
 
-The suite targets the highest-risk known paths: authentication, authorization,
-service health, payload bounds, CORS, concurrent reads, duplicate starts,
-concurrent autosaves, duplicate submission, and browser login behavior. It
-does not prove every possible edge case. Areas that still require dedicated
-fixtures or external-service test doubles include LLM failures, coding/SQL
-sandbox limits, imports/exports, evaluation-worker crash recovery, practice
-generation, interviews, registration approval races, and large-scale load.
+Playwright browser tests use actual Chromium input, form validation, network
+interception, refresh, and navigation. API-backed workflows use deterministic
+responses where a live model or backend is unnecessary; the stateful and
+authorization tests still require a dedicated running test environment. The
+suite targets authentication, authorization, service health, payload bounds,
+CORS, concurrent reads/writes, duplicate starts/submission, transient failures,
+long/unicode candidate input, and recovery flows. It does not prove every
+possible edge case. Further work includes human-labelled AI grading evaluation,
+coding/SQL sandbox limits, imports/exports, sustained load, and additional
+worker restart and registration-approval races.

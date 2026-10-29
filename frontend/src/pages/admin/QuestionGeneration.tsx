@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import api from "../../api";
 import type { TopicInfo } from "./types";
 import { card, inputClass, selectClass, btnPrimary } from "./types";
@@ -95,17 +95,7 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
   const [matchedQuestion, setMatchedQuestion] = useState<MatchedQuestion | null>(null);
   const [loadingCompare, setLoadingCompare] = useState(false);
 
-  useEffect(() => {
-    loadBatches();
-  }, [batchesPage]);
-
-  useEffect(() => {
-    if (selectedBatchId) {
-      loadStaged();
-    }
-  }, [selectedBatchId, stagedPage, filterStatus, filterBand]);
-
-  const loadBatches = async () => {
+  const loadBatches = useCallback(async () => {
     setLoadingBatches(true);
     try {
       const res = await api.get("/admin/questions/generation/batches", {
@@ -118,9 +108,9 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
     } finally {
       setLoadingBatches(false);
     }
-  };
+  }, [batchesPage, setMessage]);
 
-  const loadStaged = async (batchId = selectedBatchId, statusOverride = filterStatus) => {
+  const loadStaged = useCallback(async (batchId = selectedBatchId, statusOverride = filterStatus) => {
     if (!batchId) return;
     setLoadingStaged(true);
     try {
@@ -135,7 +125,23 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
     } finally {
       setLoadingStaged(false);
     }
-  };
+  }, [selectedBatchId, filterStatus, stagedPage, filterBand, setMessage]);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (active) void loadBatches();
+    });
+    return () => { active = false; };
+  }, [loadBatches]);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (active && selectedBatchId) void loadStaged();
+    });
+    return () => { active = false; };
+  }, [selectedBatchId, loadStaged]);
 
   const handleGenerate = async () => {
     if (!sourceText.trim()) {

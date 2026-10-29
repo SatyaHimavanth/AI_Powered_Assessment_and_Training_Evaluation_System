@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import api from "../../api";
 import type { UserInfo, BatchInfo } from "./types";
 import { card } from "./types";
@@ -68,14 +68,13 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
   const [savingCreate, setSavingCreate] = useState(false);
 
   // Load users from server with pagination
-  const loadUsers = async (pg?: number, ps?: number, search?: string) => {
+  const loadUsers = useCallback(async (pg: number, ps: number, search: string) => {
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      params.set("page", String(pg ?? currentPage));
-      params.set("page_size", String(ps ?? pageSize));
-      const q = search !== undefined ? search : searchQuery;
-      if (q) params.set("search", q);
+      params.set("page", String(pg));
+      params.set("page_size", String(ps));
+      if (search) params.set("search", search);
       const res = await api.get(`/admin/users?${params.toString()}`);
       const data = res.data;
       if (data && typeof data === "object" && "items" in data) {
@@ -92,11 +91,15 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadUsers(1, pageSize, "");
-  }, []);
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (active) void loadUsers(1, pageSize, "");
+    });
+    return () => { active = false; };
+  }, [loadUsers, pageSize]);
 
   // Handle search
   const handleSearch = () => {
@@ -175,7 +178,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
   const handlePageSizeChange = (newSize: number) => {
     setPageSize(newSize);
     setCurrentPage(1);
-    loadUsers(1, newSize);
+    loadUsers(1, newSize, searchQuery);
   };
 
   // View user performance
@@ -231,7 +234,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
       await api.put(`/admin/users/${editingUser.id}/batches`, { batch_ids: editBatchIds });
       setMessage(`User '${editUsername || editingUser.username}' updated successfully.`);
       setShowEditModal(false);
-      loadUsers();
+      loadUsers(currentPage, pageSize, searchQuery);
       reloadUsers();
     } catch (err: unknown) {
       console.error(err);
@@ -265,7 +268,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
       await api.patch(`/admin/users/${editingUser.id}/password`, { password: newPassword });
       setMessage("Password updated successfully.");
       setShowPasswordModal(false);
-      loadUsers();
+      loadUsers(currentPage, pageSize, searchQuery);
       reloadUsers();
     } catch (err: unknown) {
       console.error(err);
@@ -830,7 +833,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
           </div>
           <div className="flex gap-2">
             <button
-              onClick={() => { const p = Math.max(1, currentPage - 1); setCurrentPage(p); loadUsers(p); }}
+              onClick={() => { const p = Math.max(1, currentPage - 1); setCurrentPage(p); loadUsers(p, pageSize, searchQuery); }}
               disabled={currentPage === 1}
               className="px-3 py-1.5 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
@@ -851,7 +854,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
                 return (
                   <button
                     key={pageNum}
-                    onClick={() => { setCurrentPage(pageNum); loadUsers(pageNum); }}
+                    onClick={() => { setCurrentPage(pageNum); loadUsers(pageNum, pageSize, searchQuery); }}
                     className={`w-8 h-8 rounded text-sm font-medium cursor-pointer ${
                       currentPage === pageNum
                         ? "bg-blue-600 text-white"
@@ -864,7 +867,7 @@ export default function Users({ users: initialUsers, batches, setMessage, reload
               })}
             </div>
             <button
-              onClick={() => { const p = Math.min(totalPages, currentPage + 1); setCurrentPage(p); loadUsers(p); }}
+              onClick={() => { const p = Math.min(totalPages, currentPage + 1); setCurrentPage(p); loadUsers(p, pageSize, searchQuery); }}
               disabled={currentPage === totalPages}
               className="px-3 py-1.5 border border-gray-300 rounded text-sm hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >

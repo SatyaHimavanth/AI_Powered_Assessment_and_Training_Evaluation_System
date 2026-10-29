@@ -30,6 +30,7 @@ interface AnswerReview {
   correct_answer: string;
   is_correct: boolean;
   score: number | null;
+  answer_status: "unattempted" | "awaiting_evaluation" | "correct" | "incorrect" | "partial";
   suggestion: string | null;
 }
 
@@ -168,6 +169,16 @@ export default function Dashboard({ profile, onStartExam }: Props) {
     return true;
   };
 
+  const resumableNext = incomplete.find(isWithinWindow);
+  const availableNext = pending.find(isWithinWindow);
+  const nextAction = resumableNext
+    ? { title: resumableNext.title, message: "Continue where you left off.", action: () => onStartExam(resumableNext), label: "Resume assessment" }
+    : availableNext
+    ? { title: availableNext.title, message: "This assessment is ready to start.", action: () => onStartExam(availableNext), label: "Start assessment" }
+    : evaluating[0]
+    ? { title: evaluating[0].title, message: "Your answers are submitted. Results will appear here when evaluation is complete.", action: null, label: "" }
+    : null;
+
   return (
     <div className="space-y-6">
       {/* Profile Card */}
@@ -210,6 +221,17 @@ export default function Dashboard({ profile, onStartExam }: Props) {
             )}
           </div>
         </div>
+      )}
+
+      {nextAction && (
+        <section className={`${card} flex flex-wrap items-center justify-between gap-4 bg-blue-50/50 p-5`} aria-label="Recommended next action">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--color-primary)]">Your next step</p>
+            <p className="mt-1 text-base font-semibold">{nextAction.title}</p>
+            <p className="mt-1 text-sm text-[var(--color-text-secondary)]">{nextAction.message}</p>
+          </div>
+          {nextAction.action && <button onClick={nextAction.action} className="h-10 rounded-[var(--radius-sm)] bg-[var(--color-primary)] px-4 text-sm font-medium text-white hover:bg-[var(--color-primary-hover)]">{nextAction.label}</button>}
+        </section>
       )}
 
       {/* Summary Cards */}
@@ -280,7 +302,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                     {a.description && <p className="text-xs text-[var(--color-text-secondary)] mt-0.5">{a.description}</p>}
                     <div className="flex gap-4 mt-2">
                       <span className="text-xs text-[var(--color-text-secondary)]">{a.total_questions} questions</span>
-                      <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min</span>
+<span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min active time</span>
                       {a.start_time && (
                         <span className="text-xs text-[var(--color-text-secondary)]">
                           Opens: {new Date(a.start_time).toLocaleString()}
@@ -321,7 +343,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                     {a.description && <p className="text-xs text-[var(--color-text-secondary)] mt-0.5">{a.description}</p>}
                     <div className="flex gap-4 mt-2">
                       <span className="text-xs text-[var(--color-text-secondary)]">{a.total_questions} questions</span>
-                      <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min</span>
+                      <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min active time</span>
                     </div>
                     <p className="text-xs text-amber-600 mt-1">You have an in-progress attempt. Click Resume to continue.</p>
                   </div>
@@ -350,7 +372,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                   <p className="text-sm font-medium">{a.title}</p>
                   <div className="flex gap-4 mt-1">
                     <span className="text-xs text-[var(--color-text-secondary)]">{a.total_questions} questions</span>
-                    <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min</span>
+                    <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min active time</span>
                   </div>
                   <p className="text-xs text-[var(--color-text-secondary)] mt-1">
                     Your answers were submitted. Evaluation is in progress.
@@ -375,7 +397,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                   <p className="text-sm font-medium">{a.title}</p>
                   <div className="flex gap-4 mt-1">
                     <span className="text-xs text-[var(--color-text-secondary)]">{a.total_questions} questions</span>
-                    <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min</span>
+                    <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min active time</span>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -409,7 +431,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                   <p className="text-sm font-medium">{a.title}</p>
                   <div className="flex gap-4 mt-1">
                     <span className="text-xs text-[var(--color-text-secondary)]">{a.total_questions} questions</span>
-                    <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min</span>
+                    <span className="text-xs text-[var(--color-text-secondary)]">{a.duration} min active time</span>
                   </div>
                 </div>
                 <span className="inline-flex items-center h-7 px-3 rounded-full text-xs font-medium bg-red-50 text-[var(--color-danger)]">
@@ -468,7 +490,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
 
                   {results.evaluation_pending && (
                     <div className="p-4 rounded-[var(--radius-sm)] border border-blue-200 bg-blue-50 text-sm text-[var(--color-primary)]">
-                      Your subjective answers are still being evaluated by the LLM. Results will update automatically when evaluation completes.
+                      Your answers are being scored. Results will update automatically when evaluation completes.
                     </div>
                   )}
 
@@ -513,7 +535,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                         <div key={ans.question_id} className="px-5 py-4">
                           <div className="flex items-start gap-3">
                             <span className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${
-                              ans.is_correct ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"
+                              ans.answer_status === "correct" ? "bg-green-50 text-green-700" : ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation" ? "bg-gray-100 text-gray-600" : ans.answer_status === "partial" ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"
                             }`}>
                               {idx + 1}
                             </span>
@@ -521,21 +543,21 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                               <div className="flex items-start justify-between gap-3 mb-2">
                                 <p className="text-sm font-medium">{ans.question_text}</p>
                                 <span className={`shrink-0 inline-flex items-center px-2 py-1 rounded text-xs font-semibold ${
-                                  ans.score === null
+                                  ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation"
                                     ? "bg-gray-100 text-gray-600"
-                                    : ans.score >= 0.999
+                                    : ans.answer_status === "correct"
                                     ? "bg-green-50 text-green-700"
-                                    : ans.score > 0
+                                    : ans.answer_status === "partial"
                                     ? "bg-amber-50 text-amber-700"
                                     : "bg-red-50 text-red-700"
                                 }`}>
-                                  Score: {ans.score === null ? "Pending" : `${ans.score.toFixed(2)} / 1`}
+                                  {ans.answer_status === "unattempted" ? "Unattempted" : ans.answer_status === "awaiting_evaluation" ? "Pending" : `${ans.answer_status === "partial" ? "Partial" : ans.answer_status === "correct" ? "Correct" : "Incorrect"} · ${ans.score?.toFixed(2)} / 1`}
                                 </span>
                               </div>
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
                                 <div className={`p-2 rounded ${ans.is_correct ? "bg-green-50" : "bg-red-50"}`}>
                                   <span className="font-medium">Your answer: </span>
-                                  <span>{ans.your_answer || "—"}</span>
+                                  <span>{ans.your_answer || (ans.answer_status === "unattempted" ? "Unattempted" : "—")}</span>
                                 </div>
                                 {!ans.is_correct && (
                                   <div className="p-2 rounded bg-green-50">

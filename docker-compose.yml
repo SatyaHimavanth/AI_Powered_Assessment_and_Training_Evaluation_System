@@ -1,19 +1,17 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
-    env_file:
-      - ./backend/.env
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-assessment_db}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in the Compose environment}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Compose environment}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in the Compose environment}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -26,12 +24,84 @@ services:
     env_file:
       - ./backend/.env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-assessment_db}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the Compose database hostname and credentials}
+      RUN_WORKER_IN_API: "false"
+      PYTHON_RUNNER_MODE: ${PYTHON_RUNNER_MODE:-local}
+      PYTHON_RUNNER_QUEUE_DIR: /run/python-jobs
+    volumes:
+      - type: bind
+        source: ./backend/.sandbox-jobs
+        target: /run/python-jobs
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health?db=true', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     depends_on:
       db:
         condition: service_healthy
+      backend-migrate:
+        condition: service_completed_successfully
+
+  backend-migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the Compose database hostname and credentials}
+    command: ["/app/.venv/bin/python", "-m", "db.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  backend-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the Compose database hostname and credentials}
+      PYTHON_RUNNER_MODE: ${PYTHON_RUNNER_MODE:-local}
+      PYTHON_RUNNER_QUEUE_DIR: /run/python-jobs
+    volumes:
+      - type: bind
+        source: ./backend/.sandbox-jobs
+        target: /run/python-jobs
+    command: ["/app/.venv/bin/python", "-m", "worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  python-sandbox:
+    profiles: [isolated-python]
+    build:
+      context: ./backend
+      dockerfile: python_sandbox/Dockerfile
+    restart: unless-stopped
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, KILL, SETGID, SETUID]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ./backend/.sandbox-jobs
+        target: /run/python-jobs
 
   frontend:
     build:

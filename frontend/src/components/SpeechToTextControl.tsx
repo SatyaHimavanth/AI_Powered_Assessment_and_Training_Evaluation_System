@@ -2,11 +2,19 @@ import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "re
 
 type SpeechToTextControlProps = {
   disabled?: boolean;
+  language?: string;
   onTranscriptChange?: (text: string) => void;
   onError?: (error: string) => void;
   onStart?: () => void;
   onStop?: () => void;
 };
+
+type SpeechRecognitionResultEvent = {
+  resultIndex: number;
+  results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }>;
+};
+
+type SpeechRecognitionErrorEvent = { error?: string };
 
 export type SpeechToTextControlHandle = {
   start: () => void;
@@ -17,8 +25,8 @@ type SpeechRecognitionType = {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
-  onresult: ((event: any) => void) | null;
-  onerror: ((event: any) => void) | null;
+  onresult: ((event: SpeechRecognitionResultEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
@@ -32,7 +40,7 @@ declare global {
 }
 
 const SpeechToTextControl = forwardRef<SpeechToTextControlHandle, SpeechToTextControlProps>(
-  function SpeechToTextControl({ disabled = false, onTranscriptChange, onError, onStart, onStop }, ref) {
+  function SpeechToTextControl({ disabled = false, language, onTranscriptChange, onError, onStart, onStop }, ref) {
     const [isRecording, setIsRecording] = useState(false);
     const [isSupported, setIsSupported] = useState(false);
     const recognitionRef = useRef<SpeechRecognitionType | null>(null);
@@ -57,9 +65,9 @@ const SpeechToTextControl = forwardRef<SpeechToTextControlHandle, SpeechToTextCo
       const recognition = new SpeechApi();
       recognition.continuous = true;
       recognition.interimResults = true;
-      recognition.lang = "en-US";
+      recognition.lang = language?.trim() || navigator.languages?.[0] || navigator.language || "en-US";
 
-      recognition.onresult = (event: any) => {
+      recognition.onresult = (event) => {
         let finalText = "";
         for (let i = event.resultIndex; i < event.results.length; i += 1) {
           const result = event.results[i];
@@ -73,7 +81,7 @@ const SpeechToTextControl = forwardRef<SpeechToTextControlHandle, SpeechToTextCo
         }
       };
 
-      recognition.onerror = (event: any) => {
+      recognition.onerror = (event) => {
         onErrorRef.current?.(String(event?.error || "Speech recognition failed"));
       };
 
@@ -87,7 +95,7 @@ const SpeechToTextControl = forwardRef<SpeechToTextControlHandle, SpeechToTextCo
         recognition.stop();
         recognitionRef.current = null;
       };
-    }, []);
+    }, [language]);
 
     const startRecording = () => {
       if (!recognitionRef.current || disabled) return;

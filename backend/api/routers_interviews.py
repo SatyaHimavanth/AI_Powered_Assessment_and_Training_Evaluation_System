@@ -4,7 +4,7 @@ from typing import List
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.auth import get_current_user, require_admin
 from core.interview_agent import generate_opening_question, evaluate_and_generate_followup
@@ -29,6 +29,48 @@ user_router = APIRouter(prefix="/interviews", tags=["interviews"])
 admin_router = APIRouter(prefix="/admin/interviews", tags=["admin-interviews"])
 
 INTERVIEW_REQUEST_EXPIRY_DAYS = int(os.getenv("INTERVIEW_REQUEST_EXPIRY_DAYS", "2"))
+
+
+def _mark_interview_expired(session: InterviewSession, now: datetime | None = None) -> bool:
+    """Finalize a session after its non-paused, server-recorded time is used."""
+    if not session.started_at or not session.duration_seconds:
+        return False
+    current = now or datetime.now(timezone.utc)
+    started_at = as_utc_aware(session.started_at)
+    elapsed = current - started_at
+    if session.status == InterviewSessionStatus.paused and session.paused_at:
+        elapsed -= current - as_utc_aware(session.paused_at)
+    if elapsed < timedelta(seconds=session.duration_seconds):
+        return False
+    if session.status not in (
+        InterviewSessionStatus.completed,
+        InterviewSessionStatus.missed,
+        InterviewSessionStatus.abandoned,
+    ):
+        session.status = InterviewSessionStatus.missed
+        session.completed_at = current
+    return True
+
+
+def _interview_remaining_seconds(
+    session: InterviewSession,
+    now: datetime | None = None,
+    fallback_duration_seconds: int | None = None,
+) -> int | None:
+    duration_seconds = session.duration_seconds or fallback_duration_seconds
+    if not session.started_at or not duration_seconds:
+        return None
+    current = as_utc_aware(now or datetime.now(timezone.utc))
+    elapsed = current - as_utc_aware(session.started_at)
+    if session.status == InterviewSessionStatus.paused and session.paused_at:
+        elapsed -= current - as_utc_aware(session.paused_at)
+    return max(0, int(duration_seconds - elapsed.total_seconds()))
+
+
+def _snapshot_legacy_duration(session: InterviewSession, template: InterviewTemplate) -> None:
+    """Give pre-enforcement active sessions the template duration at first use."""
+    if not session.duration_seconds:
+        session.duration_seconds = max(1, int(template.duration_minutes or 60)) * 60
 
 
 class MessageResponse(BaseModel):
@@ -134,10 +176,11 @@ class InterviewSessionOut(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     total_score: float | None
+    remaining_seconds: int | None = None
 
 
 class InterviewMessageIn(BaseModel):
-    response_text: str
+    response_text: str = Field(min_length=1, max_length=20_000)
 
 
 class InterviewMessageOut(BaseModel):
@@ -189,6 +232,7 @@ class InterviewSessionResultOut(BaseModel):
     feedback: dict | None
     evaluations: list[EvaluationItemOut]
     topic_scores: list[TopicScoreOut]
+    remaining_seconds: int | None = None
 
 
 class DashboardCountsOut(BaseModel):
@@ -876,6 +920,9 @@ async def get_results(
                         "started_at": s.started_at,
                         "completed_at": s.completed_at,
                         "total_score": s.total_score,
+                        "remaining_seconds": _interview_remaining_seconds(
+                            s, fallback_duration_seconds=int(t.duration_minutes or 60) * 60
+                        ),
                     }
                 )
 
@@ -1344,6 +1391,7 @@ async def start_interview(
                 attempt_number=attempt_number,
                 status=InterviewSessionStatus.in_progress,
                 started_at=datetime.now(timezone.utc),
+                duration_seconds=template.duration_minutes * 60,
                 pause_count=0,
                 disconnect_count=0,
                 max_pauses_allowed_snapshot=template.max_pauses_allowed,
@@ -1361,6 +1409,7 @@ async def start_interview(
                 template.difficulty,
                 template.focus_areas or [],
                 template.default_questions_or_topics or [],
+                system_prompt=template.system_prompt,
             )
             session.transcript = [
                 {
@@ -1382,6 +1431,9 @@ async def start_interview(
                 "started_at": session.started_at,
                 "completed_at": session.completed_at,
                 "total_score": session.total_score,
+                "remaining_seconds": _interview_remaining_seconds(
+                    session, fallback_duration_seconds=int(template.duration_minutes or 60) * 60
+                ),
             }
         finally:
             db.close()
@@ -1400,38 +1452,48 @@ async def interview_message(
     if not response_text:
         raise HTTPException(status_code=400, detail="Response cannot be empty")
 
-    def _sync_work():
+    def _prepare_turn():
         db = SessionLocal()
         try:
             row = (
                 db.query(InterviewSession, InterviewTemplate)
                 .join(InterviewTemplate, InterviewSession.template_id == InterviewTemplate.id)
                 .filter(InterviewSession.id == session_id, InterviewSession.user_id == current_user.id)
+                .with_for_update(of=InterviewSession)
                 .first()
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Session not found")
 
             session, template = row
+            _snapshot_legacy_duration(session, template)
+            if _mark_interview_expired(session):
+                db.commit()
+                raise HTTPException(status_code=409, detail="Interview duration has expired")
             if session.status != InterviewSessionStatus.in_progress:
                 raise HTTPException(status_code=400, detail="Session is not in progress")
 
             transcript = list(session.transcript or [])
-            transcript.append(
-                {
+            if transcript and transcript[-1].get("role") == "user":
+                # A previous request may have saved the answer before a worker or
+                # provider failure. Retry that same answer without duplicating it.
+                if transcript[-1].get("content") != response_text:
+                    raise HTTPException(status_code=409, detail="A prior answer is awaiting evaluation")
+                history = transcript[:-1]
+            else:
+                transcript.append({
                     "role": "user",
                     "content": response_text,
                     "timestamp": to_utc_iso(datetime.now(timezone.utc)),
-                }
-            )
+                })
+                session.transcript = transcript
+                db.commit()
+                history = transcript[:-1]
 
-            # Calculate current_topic_turns for drill-down limit
             focus_list = template.focus_areas or ["general"]
             feedback_obj = session.feedback if isinstance(session.feedback, dict) else {}
             turn_count = len(feedback_obj.get("turns", []))
-            current_focus_idx = turn_count % len(focus_list)
-            current_focus = focus_list[current_focus_idx]
-            # Count consecutive turns on same topic
+            current_focus = focus_list[turn_count % len(focus_list)]
             existing_evals = (
                 db.query(InterviewResponseEvaluation)
                 .filter(
@@ -1440,53 +1502,94 @@ async def interview_message(
                 )
                 .count()
             )
+            return {
+                "session_id": session.id,
+                "history": history,
+                "transcript_length": len(transcript),
+                "turn_count": turn_count,
+                "role": template.role,
+                "level": template.experience_level,
+                "difficulty": template.difficulty,
+                "focus_areas": template.focus_areas or [],
+                "max_followup": getattr(template, "max_followup_depth", 2) or 2,
+                "current_focus": current_focus,
+                "existing_evals": existing_evals,
+                "default_questions": template.default_questions_or_topics or [],
+                "system_prompt": template.system_prompt,
+                "evaluation_rubric": template.evaluation_rubric,
+            }
+        finally:
+            db.close()
 
-            max_followup = getattr(template, "max_followup_depth", 2) or 2
-
-            # Determine which default question to use next (turn_count is 0-based after this response)
-            # The opening question used default_questions[0], so next turns use [1], [2], etc.
-            default_questions = template.default_questions_or_topics or []
-            next_default_idx = turn_count + 1  # +1 because opening already used index 0
-
-            eval_result = evaluate_and_generate_followup(
-                str(session.id),
-                template.role,
-                template.experience_level,
-                template.difficulty,
-                template.focus_areas or [],
+    context = await run_db_sync(_prepare_turn)
+    try:
+        eval_result = await run_db_sync(
+            lambda: evaluate_and_generate_followup(
+                str(context["session_id"]),
+                context["role"],
+                context["level"],
+                context["difficulty"],
+                context["focus_areas"],
                 response_text,
-                max_followup_depth=max_followup,
-                current_topic_turns=existing_evals,
-                default_questions=default_questions,
-                current_turn=next_default_idx,
+                max_followup_depth=context["max_followup"],
+                current_topic_turns=context["existing_evals"],
+                default_questions=context["default_questions"],
+                current_turn=context["turn_count"] + 1,
+                system_prompt=context["system_prompt"],
+                evaluation_rubric=context["evaluation_rubric"],
+                conversation=context["history"],
             )
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Your answer was saved, but interview evaluation is temporarily unavailable. Retry the same answer.",
+        ) from exc
+
+    def _persist_turn():
+        db = SessionLocal()
+        try:
+            session = (
+                db.query(InterviewSession)
+                .filter(InterviewSession.id == session_id, InterviewSession.user_id == current_user.id)
+                .with_for_update()
+                .first()
+            )
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if session.status != InterviewSessionStatus.in_progress:
+                raise HTTPException(status_code=409, detail="Session is no longer accepting responses")
+
+            transcript = list(session.transcript or [])
+            feedback_obj = dict(session.feedback) if isinstance(session.feedback, dict) else {}
+            turn_feedback = list(feedback_obj.get("turns", []))
+            if (
+                len(transcript) != context["transcript_length"]
+                or not transcript
+                or transcript[-1].get("role") != "user"
+                or transcript[-1].get("content") != response_text
+                or len(turn_feedback) != context["turn_count"]
+            ):
+                raise HTTPException(status_code=409, detail="Interview response changed while it was being evaluated")
 
             ai_message = eval_result.get("next_question") or "Please continue with your explanation."
-            transcript.append(
-                {
-                    "role": "assistant",
-                    "content": ai_message,
-                    "timestamp": to_utc_iso(datetime.now(timezone.utc)),
-                }
-            )
+            transcript.append({
+                "role": "assistant",
+                "content": ai_message,
+                "timestamp": to_utc_iso(datetime.now(timezone.utc)),
+            })
             session.transcript = transcript
-
-            feedback_obj = session.feedback if isinstance(session.feedback, dict) else {}
-            feedback_obj = dict(feedback_obj)
-            turn_feedback = list(feedback_obj.get("turns", []))
-            turn_feedback.append(
-                {
-                    "turn": len(turn_feedback) + 1,
-                    "score": eval_result.get("score"),
-                    "strengths": eval_result.get("strengths", []),
-                    "improvements": eval_result.get("improvements", []),
-                    "feedback": eval_result.get("feedback", ""),
-                }
-            )
+            turn_feedback.append({
+                "turn": len(turn_feedback) + 1,
+                "score": eval_result.get("score"),
+                "strengths": eval_result.get("strengths", []),
+                "improvements": eval_result.get("improvements", []),
+                "feedback": eval_result.get("feedback", ""),
+            })
             feedback_obj["turns"] = turn_feedback
             session.feedback = feedback_obj
 
-            eval_row = InterviewResponseEvaluation(
+            db.add(InterviewResponseEvaluation(
                 session_id=session.id,
                 turn_index=len(turn_feedback),
                 user_response=response_text,
@@ -1499,21 +1602,16 @@ async def interview_message(
                     "next_question": ai_message,
                     "raw": eval_result.get("raw", ""),
                 },
-                focus_area=current_focus,
-            )
-            db.add(eval_row)
-            db.flush()
-
-            numeric_scores: list[float] = []
-            for item in turn_feedback:
-                value = item.get("score")
-                if isinstance(value, (int, float)):
-                    numeric_scores.append(float(value))
+                focus_area=context["current_focus"],
+            ))
+            numeric_scores = [
+                float(item["score"])
+                for item in turn_feedback
+                if isinstance(item.get("score"), (int, float))
+            ]
             if numeric_scores:
                 session.total_score = round((sum(numeric_scores) / len(numeric_scores)) * 10.0, 2)
-
             db.commit()
-
             return {
                 "session_id": session.id,
                 "ai_message": ai_message,
@@ -1525,7 +1623,7 @@ async def interview_message(
         finally:
             db.close()
 
-    return await run_db_sync(_sync_work)
+    return await run_db_sync(_persist_turn)
 
 
 @user_router.post("/{session_id}/pause", response_model=MessageResponse)
@@ -1539,10 +1637,17 @@ async def pause_interview(
             session = (
                 db.query(InterviewSession)
                 .filter(InterviewSession.id == session_id, InterviewSession.user_id == current_user.id)
+                .with_for_update()
                 .first()
             )
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
+            template = db.query(InterviewTemplate).filter(InterviewTemplate.id == session.template_id).first()
+            if template:
+                _snapshot_legacy_duration(session, template)
+            if _mark_interview_expired(session):
+                db.commit()
+                raise HTTPException(status_code=409, detail="Interview duration has expired")
             if session.status not in [InterviewSessionStatus.in_progress, InterviewSessionStatus.started]:
                 raise HTTPException(status_code=400, detail="Session cannot be paused in current state")
 
@@ -1576,12 +1681,27 @@ async def record_interrupt(
             session = (
                 db.query(InterviewSession)
                 .filter(InterviewSession.id == session_id, InterviewSession.user_id == current_user.id)
+                .with_for_update()
                 .first()
             )
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
+            template = db.query(InterviewTemplate).filter(InterviewTemplate.id == session.template_id).first()
+            if template:
+                _snapshot_legacy_duration(session, template)
+            if _mark_interview_expired(session):
+                db.commit()
+                raise HTTPException(status_code=409, detail="Interview duration has expired")
             if session.status in [InterviewSessionStatus.completed, InterviewSessionStatus.abandoned, InterviewSessionStatus.missed]:
                 raise HTTPException(status_code=400, detail="Session already closed")
+            if session.status == InterviewSessionStatus.paused:
+                return {
+                    "message": "Interruption already recorded.",
+                    "status": session.status.value,
+                    "pause_count": int(session.pause_count or 0),
+                    "disconnect_count": int(session.disconnect_count or 0),
+                    "max_pauses_allowed": int(session.max_pauses_allowed_snapshot or 3),
+                }
 
             session.disconnect_count = int(session.disconnect_count or 0) + 1
             session.pause_count = int(session.pause_count or 0) + 1
@@ -1627,11 +1747,16 @@ async def resume_interview(
                 db.query(InterviewSession, InterviewTemplate)
                 .join(InterviewTemplate, InterviewSession.template_id == InterviewTemplate.id)
                 .filter(InterviewSession.id == session_id, InterviewSession.user_id == current_user.id)
+                .with_for_update(of=InterviewSession)
                 .first()
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Session not found")
             session, template = row
+            _snapshot_legacy_duration(session, template)
+            if _mark_interview_expired(session):
+                db.commit()
+                raise HTTPException(status_code=409, detail="Interview duration has expired")
             if session.status != InterviewSessionStatus.paused:
                 raise HTTPException(status_code=400, detail="Only paused sessions can be resumed")
             if session.pause_count > int(session.max_pauses_allowed_snapshot or 3):
@@ -1642,6 +1767,11 @@ async def resume_interview(
             if template.is_archived:
                 raise HTTPException(status_code=400, detail="Template archived and session cannot be resumed")
             session.status = InterviewSessionStatus.in_progress
+            if session.paused_at:
+                paused_at = as_utc_aware(session.paused_at)
+                pause_duration = max(0, int((datetime.now(timezone.utc) - paused_at).total_seconds()))
+                session.duration_seconds = int(session.duration_seconds or 0) + pause_duration
+                session.paused_at = None
             session.resumed_at = datetime.now(timezone.utc)
             db.commit()
             return {"message": "Interview resumed"}
@@ -1666,6 +1796,9 @@ async def end_interview(
             )
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
+            if _mark_interview_expired(session):
+                db.commit()
+                raise HTTPException(status_code=409, detail="Interview duration has expired")
             if session.status in [InterviewSessionStatus.completed, InterviewSessionStatus.missed, InterviewSessionStatus.abandoned]:
                 raise HTTPException(status_code=400, detail="Session already closed")
 
@@ -1745,6 +1878,9 @@ async def get_my_result(
                 "feedback": session.feedback or {},
                 "evaluations": evaluations_out,
                 "topic_scores": topic_scores_out,
+                "remaining_seconds": _interview_remaining_seconds(
+                    session, fallback_duration_seconds=int(template.duration_minutes or 60) * 60
+                ),
             }
         finally:
             db.close()

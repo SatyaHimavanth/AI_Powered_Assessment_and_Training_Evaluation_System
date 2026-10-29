@@ -199,8 +199,8 @@ export default function Questions({ topics, setMessage, reloadTopics }: Props) {
       setEditDifficulty(data.difficulty || "");
       setEditReferenceAnswer(data.reference_answer || "");
       setEditDefaultCode(data.default_code || "");
-      setEditOptions((data.options && Array.isArray(data.options)) ? data.options.map((o: any) => ({ text: o.text || "", is_correct: !!o.is_correct })) : []);
-      setEditTestCases((data.test_cases && Array.isArray(data.test_cases)) ? data.test_cases.map((tc: any) => ({ input: tc.input_data || "", expected_output: tc.expected_output || "", is_sample: !!tc.is_sample })) : []);
+      setEditOptions((data.options && Array.isArray(data.options)) ? data.options.map((o: { text?: string; is_correct?: boolean }) => ({ text: o.text || "", is_correct: !!o.is_correct })) : []);
+      setEditTestCases((data.test_cases && Array.isArray(data.test_cases)) ? data.test_cases.map((tc: { input_data?: string; expected_output?: string; is_sample?: boolean }) => ({ input: tc.input_data || "", expected_output: tc.expected_output || "", is_sample: !!tc.is_sample })) : []);
     } catch (err: unknown) {
       console.error(err);
       setMessage("Failed to load question details");
@@ -232,7 +232,7 @@ export default function Questions({ topics, setMessage, reloadTopics }: Props) {
       return;
     }
 
-    const payload: any = {
+    const payload: Record<string, unknown> = {
       question: editQuestionText,
       type: editType,
       difficulty: editDifficulty,

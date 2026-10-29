@@ -1,6 +1,6 @@
 # AI-Powered Assessment & Training Evaluation System
 
-A full-stack platform for managing assessments, training evaluations, AI-assisted question generation, practice tests, coding/SQL questions, and results exports. Built with FastAPI, React, PostgreSQL, pgvector, and Azure OpenAI.
+A full-stack platform for managing assessments, training evaluations, AI-assisted question generation, practice tests, coding/SQL questions, interviews, and results exports. Built with FastAPI, React, PostgreSQL, and configurable Azure OpenAI or Ollama model providers.
 
 ## Tech Stack
 
@@ -9,62 +9,67 @@ A full-stack platform for managing assessments, training evaluations, AI-assiste
 | Backend | Python 3.12+, FastAPI, SQLAlchemy, Uvicorn |
 | Frontend | React 19, TypeScript, Vite 8, Tailwind CSS v4 |
 | Database | PostgreSQL with optional pgvector (JSON fallback available) |
-| LLM | Azure OpenAI via `langchain-openai` |
-| Auth | JWT access/refresh tokens, bcrypt |
+| LLM | Azure OpenAI or local Ollama via LangChain |
+| Auth | JWT access and refresh tokens in HttpOnly, SameSite cookies; bcrypt |
 
 ## Prerequisites
 
 - Python 3.12+
-- Node.js 18+
+- `uv` for locked Python dependency setup
+- Node.js 20.19+ or 22.12+ (Vite 8 requirement)
 - PostgreSQL 14+
 - pgvector installed on the PostgreSQL server, or JSON fallback mode enabled
-- Azure OpenAI API access
+- Azure OpenAI API access or an Ollama server/model
 
 ## Quick Setup
 
 ### 1. Create Database
 
-```bash
-psql -U postgres -c "CREATE DATABASE assessment_db;"
-```
-
-Enable pgvector once in `assessment_db` if your app DB user cannot create extensions:
+Create a PostgreSQL database and install the `vector` extension, or choose the
+JSON embedding fallback below. Docker Compose provisions PostgreSQL 16 with
+pgvector automatically. Enable pgvector once if your app DB user cannot create
+extensions:
 
 ```sql
 \c assessment_db
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-In the default mode, the backend also runs `CREATE EXTENSION IF NOT EXISTS
-vector` during startup. Use `EMBEDDING_STORAGE_BACKEND=json` when the extension
-is unavailable.
+The default mode requires pgvector. Run the versioned database migrations once
+before starting the API. Use `EMBEDDING_STORAGE_BACKEND=json` only when the
+database has been provisioned in JSON mode.
 
 ### 2. Backend Setup
 
 ```bash
 cd backend
 
-python -m venv .venv
-.venv\Scripts\activate
+uv sync --extra local
+Copy-Item .env.example .env # PowerShell; use cp on macOS/Linux
 
-pip install -e .
-cp .env.example .env
+# Edit DATABASE_URL for localhost and set unique passwords/secrets.
+# Select Azure OpenAI or Ollama with CHAT_PROVIDER / EMBEDDING_PROVIDER.
 
-uvicorn main:app --reload --port 8000
+# Apply database schema migrations before the API starts
+uv run python -m db.migrate
+
+# The API starts its local background worker automatically in development.
+uv run uvicorn main:app --reload --port 8000
 ```
 
 Example backend `.env`:
 
 ```env
 DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/assessment_db
-ASYNC_DATABASE_URL=postgresql+asyncpg://postgres:yourpassword@localhost:5432/assessment_db
-SECRET_KEY=your-secret-key-here
+DATABASE_URL_ASYNC=postgresql+asyncpg://postgres:yourpassword@localhost:5432/assessment_db
+JWT_SECRET_KEY=replace-with-a-long-random-secret
 CORS_ALLOWED_ORIGINS=http://localhost:5173
+PYTHON_RUNNER_MODE=local
+RUN_WORKER_IN_API=true
 
-AZURE_OPENAI_API_KEY=your-azure-openai-key
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-CHAT_DEPLOYMENT_NAME=gpt-4
-OPENAI_API_VERSION=2024-12-01-preview
+# Set Azure credentials/deployment names, or configure Ollama provider/model names.
+CHAT_PROVIDER=azure_openai
+EMBEDDING_PROVIDER=azure_openai
 
 EMBEDDING_DEPLOYMENT_NAME=text-embedding-3-small
 SIMILARITY_THRESHOLD_HIGH_DUP=0.85
@@ -84,14 +89,15 @@ npm run dev
 
 Frontend runs at `http://localhost:5173`, backend at `http://localhost:8000`.
 
-## Default Credentials
+## Bootstrap Accounts
 
 | Role | Username | Password |
 | --- | --- | --- |
-| Admin | admin | admin123 |
-| User | user | user123 |
+| Admin | `DEFAULT_ADMIN_USERNAME` | `DEFAULT_ADMIN_PASSWORD` |
+| User | `DEFAULT_USER_USERNAME` | `DEFAULT_USER_PASSWORD` |
 
-These are auto-created on first startup and can be overridden with environment variables.
+Set unique passwords in `backend/.env` before first startup. The example file
+contains placeholders; do not use those values in a deployed environment.
 
 ## Key Features
 
@@ -99,10 +105,10 @@ These are auto-created on first startup and can be overridden with environment v
 - Admin-created users/admins from the Admin -> Users page.
 - Two-stage public registration with admin approval.
 - Question bank upload and management by topic, type, and difficulty.
-- Assessment builder with batch assignment.
+- Assessment builder with a mutually exclusive batch or individual-user assignment mode.
 - User assessment dashboard with attempted assessment exports.
 - Admin results dashboard with per-user and filtered all-users Excel exports.
-- Auto and LLM evaluation for MCQ, text, coding, and SQL questions.
+- Automatic objective and coding-test evaluation, with AI evaluation for text answers.
 - AI-generated practice tests.
 - AI question generation with duplicate detection, staged review, archive, and unarchive-to-review flow.
 - pgvector- or JSON-based similarity search for question embeddings.
@@ -123,7 +129,7 @@ backend/
     routers_practice.py           # Practice test flow
     routers_question_generation.py# AI question generation and staged review
   app/
-    llms.py                       # Azure OpenAI client setup
+    llms.py                       # Azure OpenAI / Ollama model providers
     prompts.py                    # LLM prompt templates
   core/
     auth.py                       # JWT and password utilities
@@ -133,7 +139,7 @@ backend/
     vector_store.py               # Embedding storage setup and similarity helpers
     embedding_service.py          # Embedding computation and storage
     question_generation.py        # LLM question generation pipeline
-    embedding_backfill.py         # Startup backfill for missing embeddings
+    embedding_backfill.py         # Worker backfill for missing embeddings
   db/
     database.py                   # SQLAlchemy engine and session
     models.py                     # ORM models
@@ -152,7 +158,7 @@ frontend/
 
 ## Embedding Storage
 
-Question embeddings use pgvector by default. When the PostgreSQL service does
+Question embeddings use pgvector by default. When PostgreSQL does
 not provide the vector extension, set:
 
 ```env
@@ -165,12 +171,16 @@ banks; pgvector remains preferable for indexed, database-side similarity at
 scale. Select the backend before creating `question_embeddings`; changing an
 existing column between vector and JSON requires a database migration.
 
-In the default `pgvector` mode, startup:
+In the default `pgvector` mode, the migration command:
 
 1. Runs `CREATE EXTENSION IF NOT EXISTS vector`.
-2. Creates missing tables.
-3. Ensures `question_embeddings.embedding` is `vector(EMBEDDING_DIM)`.
-4. Backfills embeddings for active questions that do not have one.
+2. Creates missing tables and applies the ordered schema migrations.
+3. Ensures `question_embeddings.embedding` uses the configured storage type
+   (`vector(EMBEDDING_DIM)` in pgvector mode).
+
+The worker backfills embeddings for active questions that do not have one. The
+configured embedding provider (Azure OpenAI or Ollama) must be available for
+that operation.
 
 If pgvector is unavailable in the default mode, startup fails. Either install
 the extension or select JSON mode.
@@ -178,6 +188,7 @@ the extension or select JSON mode.
 Relevant env vars:
 
 ```env
+EMBEDDING_PROVIDER=azure_openai
 EMBEDDING_DEPLOYMENT_NAME=text-embedding-3-small
 EMBEDDING_DIM=1536
 SIMILARITY_THRESHOLD_HIGH_DUP=0.85
@@ -186,17 +197,28 @@ SIMILARITY_THRESHOLD_REVIEW=0.70
 
 ## SQL Assessment Sandbox
 
-SQL coding questions now use demo tables inside the main `assessment_db`, not a separate `demo_db`.
+SQL coding questions use a dedicated restricted login against the configured
+demo schema in the application database; this is a separate role and permission
+boundary, not a separate database instance.
 
-Startup creates and seeds:
+Provision the example tables with `uv run python -m core.setup_demo_db` from
+`backend/` after configuring the application database. The command creates and
+seeds:
 
 - `demo.departments`
 - `demo.employees`
 
-The SQL runner connects with `DATABASE_URL`, starts a read-only transaction, sets:
+Candidate SQL runs use `SQL_SANDBOX_DATABASE_URL`; it must not reuse
+the application's `DATABASE_URL`. Configure a dedicated PostgreSQL role with
+`SELECT` access only to the allowlisted `demo` tables. The runner verifies the
+role privileges, starts a read-only transaction, applies statement and lock
+timeouts, and caps result size. Only one `SELECT` or `WITH ... SELECT` is
+accepted. See [DOCKER.md](DOCKER.md#sql-execution-setup) for provisioning steps.
+
+The runner sets the transaction-local search path to:
 
 ```sql
-SET LOCAL search_path TO demo, pg_temp;
+SET LOCAL search_path TO demo, pg_catalog;
 ```
 
 So a user query like:
@@ -211,7 +233,10 @@ resolves to:
 SELECT * FROM demo.employees;
 ```
 
-The runner rejects DML/DDL and blocks access to application tables or system schemas such as `public`, `pg_catalog`, and `information_schema`.
+The runner accepts one read-only `SELECT`/`WITH ... SELECT`, checks the role's
+privileges and table allowlist, and applies query/output limits. Python coding
+execution is separate and defaults to the temporary local subprocess mode
+described in [DOCKER.md](DOCKER.md#candidate-code-execution).
 
 ## AI Question Generation
 
@@ -267,5 +292,8 @@ uv run python run_all.py
 ```
 
 Stateful tests provision three temporary users, a topic, four questions, a
-batch, and an assessment through public APIs. Teardown deactivates or archives
-the generated records, so use a dedicated test database.
+batch, and an assessment through public APIs. In local/test environments,
+teardown deletes fixtures through a restricted cleanup endpoint; other
+environments use the documented archive/deactivate fallback. Run stateful tests
+only against a dedicated test environment. See
+[TestSuite/README.md](TestSuite/README.md) for details.

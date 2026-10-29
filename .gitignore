@@ -1,0 +1,34 @@
+# Local configuration and secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies, Python caches, and generated build output
+**/node_modules/
+**/__pycache__/
+*.py[cod]
+**/.pytest_cache/
+**/.pytest-tmp-*/
+**/pytest-cache-files-*/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+coverage/
+backend/.venv/
+backend/.sandbox-jobs/
+backend/.candidate-tmp/
+**/testvenv/
+frontend/dist/
+frontend/.vite/
+playwright-report/
+test-results/
+
+# Local audit notes, generated artifacts, and machine-specific files
+/memory/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+/.idea/
+/.vscode/

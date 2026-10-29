@@ -1,15 +1,44 @@
+import { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import api from "./api";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
 import AdminHome from "./pages/AdminHome";
 import UserHome from "./pages/UserHome";
 
 function ProtectedRoute({ children, role }: { children: React.ReactNode; role: string }) {
-  const token = localStorage.getItem("access_token");
-  const userRole = localStorage.getItem("role");
+  const [status, setStatus] = useState<"checking" | "authorized" | "denied">("checking");
 
-  if (!token) return <Navigate to="/login" replace />;
-  if (userRole !== role) return <Navigate to="/login" replace />;
+  useEffect(() => {
+    let active = true;
+    api.get("/auth/me")
+      .then((response) => {
+        if (!active) return;
+        const actualRole = response.data?.role;
+        if (typeof actualRole !== "string") {
+          setStatus("denied");
+          return;
+        }
+        setStatus(actualRole === role ? "authorized" : "denied");
+      })
+      .catch(() => {
+        if (!active) return;
+        setStatus("denied");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [role]);
+
+  if (status === "checking") {
+    return (
+      <main className="min-h-screen flex items-center justify-center" role="status" aria-live="polite">
+        Restoring your session…
+      </main>
+    );
+  }
+  if (status === "denied") return <Navigate to="/login" replace />;
 
   return <>{children}</>;
 }

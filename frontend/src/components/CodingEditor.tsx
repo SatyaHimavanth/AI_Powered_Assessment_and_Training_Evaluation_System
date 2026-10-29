@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { python } from "@codemirror/lang-python";
@@ -6,6 +6,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { EditorView, Decoration } from "@codemirror/view";
 import type { DecorationSet } from "@codemirror/view";
 import { StateField, RangeSetBuilder, EditorState } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
 import api from "../api";
 
 interface TestCase {
@@ -34,6 +35,7 @@ interface Props {
   onChange: (code: string) => void;
   disablePaste?: boolean;
   onPasteAttempt?: () => void;
+  readOnly?: boolean;
 }
 
 const EDITABLE_START = "# --- EDITABLE START ---";
@@ -86,6 +88,7 @@ export default function CodingEditor({
   onChange,
   disablePaste,
   onPasteAttempt,
+  readOnly = false,
 }: Props) {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<TestCaseResult[] | null>(null);
@@ -94,14 +97,6 @@ export default function CodingEditor({
   const containerRef = useRef<HTMLDivElement>(null);
   const [leftWidth, setLeftWidth] = useState(40);
   const editorRef = useRef<ReactCodeMirrorRef>(null);
-
-  // When the parent switches to a different question, clear any previous run results
-  // and reset the active tab so results from the prior question don't persist.
-  useEffect(() => {
-    setResults(null);
-    setActiveTab("testcases");
-    setRunning(false);
-  }, [questionId]);
 
   // Parse the template
   const { header, editablePlaceholder, footer, hasTemplate } = useMemo(
@@ -203,24 +198,40 @@ export default function CodingEditor({
 
   // Build final extensions array and optionally attach DOM event handlers
   const cmExtensions = useMemo(() => {
-    const exts: any[] = [...(language === "python" ? [python()] : []), ...readOnlyRanges];
+    const exts: Extension[] = [...(language === "python" ? [python()] : []), ...readOnlyRanges];
     if (disablePaste) {
       exts.push(
         EditorView.domEventHandlers({
-          paste: (e: any) => {
+          paste: (e) => {
             e.preventDefault();
-            try { onPasteAttempt?.(); } catch {}
+            try { onPasteAttempt?.(); } catch (error) {
+              console.warn("Could not record paste attempt", error);
+            }
             return true;
           },
-          copy: (e: any) => {
+          copy: (e) => {
             e.preventDefault();
-            try { if (e.clipboardData && typeof e.clipboardData.setData === 'function') e.clipboardData.setData('text/plain', ''); } catch {}
+            try {
+              if (e.clipboardData && typeof e.clipboardData.setData === "function") {
+                e.clipboardData.setData("text/plain", "");
+              }
+            } catch (error) {
+              console.warn("Could not clear clipboard data", error);
+            }
             return true;
           },
-          cut: (e: any) => {
+          cut: (e) => {
             e.preventDefault();
-            try { if (e.clipboardData && typeof e.clipboardData.setData === 'function') e.clipboardData.setData('text/plain', ''); } catch {}
-            try { onPasteAttempt?.(); } catch {}
+            try {
+              if (e.clipboardData && typeof e.clipboardData.setData === "function") {
+                e.clipboardData.setData("text/plain", "");
+              }
+            } catch (error) {
+              console.warn("Could not clear clipboard data", error);
+            }
+            try { onPasteAttempt?.(); } catch (error) {
+              console.warn("Could not record cut attempt", error);
+            }
             return true;
           }
         })
@@ -368,7 +379,7 @@ export default function CodingEditor({
           </div>
           <button
             onClick={runCode}
-            disabled={running || (!value.trim() && !hasTemplate)}
+            disabled={readOnly || running || (!value.trim() && !hasTemplate)}
             className="h-8 px-4 text-xs font-medium rounded bg-green-600 hover:bg-green-500 text-white disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer flex items-center gap-1.5"
           >
             {running ? (
@@ -395,6 +406,7 @@ export default function CodingEditor({
             ref={editorRef}
             value={fullCode}
             onChange={handleChange}
+            readOnly={readOnly}
             extensions={cmExtensions}
             theme={oneDark}
             height="100%"

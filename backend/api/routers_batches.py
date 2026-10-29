@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.auth import get_password_hash, require_admin
+from core.uploads import read_upload_limited
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
 from db.models import Batch, BatchStatus, BatchUser, User, UserRole
@@ -147,7 +148,7 @@ async def upload_batch_users(
         raise HTTPException(status_code=400, detail="No file provided")
 
     filename = file.filename.lower()
-    content = await file.read()
+    content = await read_upload_limited(file, 10 * 1024 * 1024)
 
     # uses top-level run_db_sync and SessionLocal
 

@@ -26,9 +26,6 @@ export default function Login() {
     setLoading(true);
     try {
       const res = await api.post("/auth/login", { username, password });
-      localStorage.setItem("access_token", res.data.access_token);
-      localStorage.setItem("refresh_token", res.data.refresh_token);
-      localStorage.setItem("role", res.data.role);
 
       if (res.data.role === "admin") {
         navigate("/admin");

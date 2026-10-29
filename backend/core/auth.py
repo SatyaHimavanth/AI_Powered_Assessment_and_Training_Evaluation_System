@@ -1,10 +1,11 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import uuid
 
 import bcrypt
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +22,8 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+ACCESS_COOKIE_NAME = "assessment_access"
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -37,6 +39,7 @@ def get_password_hash(password: str) -> str:
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
+    to_encode["token_use"] = "access"
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
@@ -46,13 +49,17 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
+    to_encode["token_use"] = "refresh"
+    to_encode.setdefault("jti", str(uuid.uuid4()))
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 async def get_current_user(
-    token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_async_db)
+    token: str | None = Depends(oauth2_scheme),
+    access_cookie: str | None = Cookie(default=None, alias=ACCESS_COOKIE_NAME),
+    db: AsyncSession = Depends(get_async_db),
 ) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -60,9 +67,12 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        credential = token or access_cookie
+        if not credential:
+            raise credentials_exception
+        payload = jwt.decode(credential, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        if username is None:
+        if username is None or payload.get("token_use") != "access":
             raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception

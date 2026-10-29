@@ -22,6 +22,7 @@ from db.models import (
     AssessmentQuestionSection,
     AssessmentTopic,
     Assignment,
+    AssessmentUserAssignment,
     Attempt,
     AttemptStatus,
     Batch,
@@ -34,6 +35,7 @@ from db.models import (
     TopicScore,
     Topic,
     User,
+    UserRole,
 )
 from api.timezone_helper import parse_to_utc_aware, as_utc_aware, to_utc_iso
 
@@ -58,6 +60,7 @@ class CreateAssessmentRequest(BaseModel):
     negative_marking: bool = False
     topics: List[TopicConfig]
     batch_ids: List[UUID] = []
+    user_ids: List[UUID] = []
     start_time: str | None = None
     end_time: str | None = None
 
@@ -81,6 +84,7 @@ class AssessmentOut(BaseModel):
     total_questions: int
     topics: List[AssessmentTopicOut]
     batch_names: List[str] = []
+    individual_user_count: int = 0
     start_time: str | None = None
     end_time: str | None = None
     created_at: str
@@ -98,6 +102,7 @@ class AssessmentListItem(BaseModel):
     is_archived: bool = False
     total_questions: int
     batch_names: List[str] = []
+    individual_user_count: int = 0
     start_time: str | None = None
     end_time: str | None = None
     created_at: str
@@ -176,6 +181,11 @@ async def create_assessment(
         raise HTTPException(status_code=400, detail="Assessment title is required")
     if not body.topics:
         raise HTTPException(status_code=400, detail="At least one topic configuration is required")
+    if body.batch_ids and body.user_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose either batch assignment or individual user assignment, not both",
+        )
 
     # Parse start/end times (light, non-DB work)
     start_dt = None
@@ -198,14 +208,26 @@ async def create_assessment(
     def _sync_work():
         db = SessionLocal()
         try:
+            batch_ids = list(dict.fromkeys(body.batch_ids))
+            user_ids = list(dict.fromkeys(body.user_ids))
+            if not batch_ids and not user_ids:
+                raise HTTPException(status_code=400, detail="Assign the assessment to at least one batch or user")
+
             # Validate batch_ids exist and collect names
             batch_names: List[str] = []
-            if body.batch_ids:
-                for bid in body.batch_ids:
+            if batch_ids:
+                for bid in batch_ids:
                     batch = db.query(Batch).filter(Batch.id == bid).first()
                     if not batch:
                         raise HTTPException(status_code=400, detail=f"Batch {bid} not found")
                     batch_names.append(batch.name)
+
+            if user_ids:
+                recipients = db.query(User).filter(
+                    User.id.in_(user_ids), User.is_active == True, User.role == UserRole.user
+                ).all()
+                if len(recipients) != len(user_ids):
+                    raise HTTPException(status_code=400, detail="One or more selected users are unavailable")
 
             # Create assessment record
             assessment = Assessment(
@@ -273,6 +295,7 @@ async def create_assessment(
                     )
 
             selected_question_ids: set[UUID] = set()
+            next_question_position = 0
 
             for tc, topic, q_type, diff, section_name in validated_configs:
                 at = AssessmentTopic(
@@ -312,7 +335,9 @@ async def create_assessment(
                     aq = AssessmentQuestion(
                         assessment_id=assessment.id,
                         question_id=q.id,
+                        position=next_question_position,
                     )
+                    next_question_position += 1
                     db.add(aq)
                     db.add(AssessmentQuestionSection(
                         assessment_id=assessment.id,
@@ -331,12 +356,15 @@ async def create_assessment(
                     section_name=section_name,
                 ))
 
-            for bid in body.batch_ids:
+            for bid in batch_ids:
                 assignment = Assignment(
                     assessment_id=assessment.id,
                     batch_id=bid,
                 )
                 db.add(assignment)
+
+            for user_id in user_ids:
+                db.add(AssessmentUserAssignment(assessment_id=assessment.id, user_id=user_id))
 
             db.commit()
 
@@ -350,6 +378,7 @@ async def create_assessment(
                 "total_questions": total_questions,
                 "topics": topic_results,
                 "batch_names": batch_names,
+                "individual_user_count": len(user_ids),
                 "start_time": to_utc_iso(assessment.start_time),
                 "end_time": to_utc_iso(assessment.end_time),
                 "created_at": to_utc_iso(assessment.created_at),
@@ -413,6 +442,9 @@ async def list_assessments(
                     batch = db.query(Batch).filter(Batch.id == asgn.batch_id).first()
                     if batch:
                         b_names.append(batch.name)
+                individual_user_count = db.query(AssessmentUserAssignment).filter(
+                    AssessmentUserAssignment.assessment_id == a.id
+                ).count()
                 result.append(AssessmentListItem(
                     id=a.id,
                     title=a.title,
@@ -422,6 +454,7 @@ async def list_assessments(
                     is_archived=getattr(a, "is_archived", False),
                     total_questions=total_q,
                     batch_names=b_names,
+                    individual_user_count=individual_user_count,
                     start_time=to_utc_iso(a.start_time),
                     end_time=to_utc_iso(a.end_time),
                     created_at=to_utc_iso(a.created_at),
@@ -487,6 +520,9 @@ async def get_assessment(
                 batch = db.query(Batch).filter(Batch.id == asgn.batch_id).first()
                 if batch:
                     b_names.append(batch.name)
+            individual_user_count = db.query(AssessmentUserAssignment).filter(
+                AssessmentUserAssignment.assessment_id == assessment_id
+            ).count()
 
             return AssessmentOut(
                 id=assessment.id,
@@ -498,6 +534,7 @@ async def get_assessment(
                 total_questions=total_q,
                 topics=topic_results,
                 batch_names=b_names,
+                individual_user_count=individual_user_count,
                 start_time=to_utc_iso(assessment.start_time),
                 end_time=to_utc_iso(assessment.end_time),
                 created_at=to_utc_iso(assessment.created_at),
@@ -786,36 +823,40 @@ async def get_assessment_results(
                     a.batch_id for a in db.query(Assignment).filter(Assignment.assessment_id == assessment_id).all()
                     if a.batch_id
                 ]
+            assigned_user_ids = set()
             if assignment_batch_ids:
-                # Get all users in those batches
-                assigned_user_ids = set(
+                assigned_user_ids.update(
                     row.user_id for row in
                     db.query(BatchUser).filter(BatchUser.batch_id.in_(assignment_batch_ids)).all()
                 )
-                if scoped_user_ids is not None:
-                    assigned_user_ids &= scoped_user_ids
-                # Remove users who already have an attempt
-                users_with_attempts = set(latest_attempts.keys())
-                pending_user_ids = assigned_user_ids - users_with_attempts
+            if batch_id is None:
+                assigned_user_ids.update(
+                    row.user_id for row in db.query(AssessmentUserAssignment.user_id)
+                    .filter(AssessmentUserAssignment.assessment_id == assessment_id).all()
+                )
+            if scoped_user_ids is not None:
+                assigned_user_ids &= scoped_user_ids
+            # Use the union of direct and batch recipients to avoid duplicates.
+            pending_user_ids = assigned_user_ids - set(latest_attempts.keys())
 
-                for uid in pending_user_ids:
-                    user = db.query(User).filter(User.id == uid).first()
-                    if user:
-                        user_results.append(UserAttemptResult(
-                            attempt_id=None,
-                            user_id=uid,
-                            user_name=user.name or user.username,
-                            username=user.username,
-                            score=None,
-                            status="pending",
-                            started_at=None,
-                            submitted_at=None,
-                            total_answered=0,
-                            evaluation_status=None,
-                            evaluation_job_id=None,
-                            evaluation_error=None,
-                            evaluation_error_category=None,
-                        ))
+            for uid in pending_user_ids:
+                user = db.query(User).filter(User.id == uid).first()
+                if user:
+                    user_results.append(UserAttemptResult(
+                        attempt_id=None,
+                        user_id=uid,
+                        user_name=user.name or user.username,
+                        username=user.username,
+                        score=None,
+                        status="pending",
+                        started_at=None,
+                        submitted_at=None,
+                        total_answered=0,
+                        evaluation_status=None,
+                        evaluation_job_id=None,
+                        evaluation_error=None,
+                        evaluation_error_category=None,
+                    ))
 
             total_participants = len(user_results)
 
@@ -975,30 +1016,36 @@ async def export_assessment_results(
                 a.batch_id for a in db.query(Assignment).filter(Assignment.assessment_id == assessment_id).all()
                 if a.batch_id
             ]
+            assigned_user_ids = set()
             if assignment_batch_ids:
-                assigned_user_ids = {
+                assigned_user_ids.update(
                     row.user_id for row in db.query(BatchUser).filter(BatchUser.batch_id.in_(assignment_batch_ids)).all()
-                }
-                if scoped_user_ids is not None:
-                    assigned_user_ids &= scoped_user_ids
-                pending_user_ids = assigned_user_ids - set(latest_attempts.keys())
-                for uid in pending_user_ids:
-                    user = db.query(User).filter(User.id == uid).first()
-                    if user:
-                        rows.append({
-                            "attempt": None,
-                            "user": user,
-                            "attempt_id": None,
-                            "user_id": uid,
-                            "user_name": user.name or user.username,
-                            "username": user.username,
-                            "score": None,
-                            "status": "pending",
-                            "started_at": None,
-                            "submitted_at": None,
-                            "total_answered": 0,
-                            "evaluation_status": None,
-                        })
+                )
+            if batch_id is None:
+                assigned_user_ids.update(
+                    row.user_id for row in db.query(AssessmentUserAssignment.user_id)
+                    .filter(AssessmentUserAssignment.assessment_id == assessment_id).all()
+                )
+            if scoped_user_ids is not None:
+                assigned_user_ids &= scoped_user_ids
+            pending_user_ids = assigned_user_ids - set(latest_attempts.keys())
+            for uid in pending_user_ids:
+                user = db.query(User).filter(User.id == uid).first()
+                if user:
+                    rows.append({
+                        "attempt": None,
+                        "user": user,
+                        "attempt_id": None,
+                        "user_id": uid,
+                        "user_name": user.name or user.username,
+                        "username": user.username,
+                        "score": None,
+                        "status": "pending",
+                        "started_at": None,
+                        "submitted_at": None,
+                        "total_answered": 0,
+                        "evaluation_status": None,
+                    })
 
             total_participants = len(rows)
             completed_count = sum(1 for attempt in attempts if attempt.status == AttemptStatus.completed)

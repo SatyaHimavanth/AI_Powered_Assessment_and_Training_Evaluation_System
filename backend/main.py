@@ -1,12 +1,14 @@
 import asyncio
+import logging
 import os
 import secrets
+from threading import Thread
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 # from fastapi.staticfiles import StaticFiles
@@ -25,14 +27,13 @@ from api.routers_interviews import user_router as interviews_router, admin_route
 from api.routers_user_assessments import router as user_assessments_router
 from api.routers_question_generation import router as question_generation_router
 from core.auth import get_password_hash
-from core.evaluation_service import start_evaluation_job_consumer
-from core.setup_demo_db import create_demo_db_for_tests
-from core.vector_store import ensure_pgvector_ready
 from sqlalchemy import text
-
-from sqlalchemy import text
-from db.database import Base, SessionLocal, engine
+from db.database import SessionLocal, engine
 from db.models import Batch, BatchStatus, BatchUser, RegistrationRequest, RegistrationStatus, User, UserRole
+from db.schema_migrations import (
+    serialized_startup,
+    assert_migrations_applied,
+)
 
 # ---------- Default credentials ---------- #
 DEFAULT_ADMIN_USERNAME = os.getenv("DEFAULT_ADMIN_USERNAME", "admin")
@@ -44,7 +45,7 @@ DEFAULT_ADMIN_CONTACT_EMAIL = os.getenv("DEFAULT_ADMIN_CONTACT_EMAIL", "admin@as
 DEFAULT_ADMIN_NAME = os.getenv("DEFAULT_ADMIN_NAME", "System Admin")
 
 DEFAULT_USER_USERNAME = os.getenv("DEFAULT_USER_USERNAME", "user")
-DEFAULT_USER_PASSWORD = os.getenv("DEFAULT_USER_PASSWORD", "user123")
+DEFAULT_USER_PASSWORD = os.getenv("DEFAULT_USER_PASSWORD")
 DEFAULT_USER_EMAIL = os.getenv("DEFAULT_USER_EMAIL", "user@assessment.com")
 DEFAULT_USER_CONTACT_EMAIL = os.getenv("DEFAULT_USER_CONTACT_EMAIL", "user@assessment.com")
 DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Default User")
@@ -52,6 +53,24 @@ DEFAULT_USER_NAME = os.getenv("DEFAULT_USER_NAME", "Default User")
 DEFAULT_BATCH_NAME = os.getenv("DEFAULT_BATCH_NAME", "Default Batch")
 
 REGISTRATION_EXPIRY_DAYS = int(os.getenv("REGISTRATION_EXPIRY_DAYS", "2"))
+logger = logging.getLogger(__name__)
+
+
+def should_run_embedded_worker() -> bool:
+    app_env = os.getenv("APP_ENV", "development").strip().lower()
+    configured = os.getenv("RUN_WORKER_IN_API")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return app_env in {"development", "dev", "local", "test", "testing"}
+
+
+def _run_embedded_worker() -> None:
+    try:
+        from worker import main as run_worker
+
+        run_worker()
+    except Exception:
+        logger.exception("Embedded background worker stopped unexpectedly")
 
 
 def seed_defaults(db):
@@ -69,10 +88,10 @@ def seed_defaults(db):
             account="system",
         )
         db.add(admin)
-        print("[OK] Default admin created (admin / admin123)")
+        print("[OK] Configured admin account created")
 
     user = db.query(User).filter(User.username == DEFAULT_USER_USERNAME).first()
-    if not user:
+    if not user and DEFAULT_USER_PASSWORD:
         user = User(
             username=DEFAULT_USER_USERNAME,
             email=DEFAULT_USER_EMAIL,
@@ -84,7 +103,7 @@ def seed_defaults(db):
             account="system",
         )
         db.add(user)
-        print("[OK] Default user created (user / user123)")
+        print("[OK] Configured candidate account created")
 
     db.flush()
 
@@ -134,31 +153,26 @@ def auto_reject_expired_registrations(db):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    ensure_pgvector_ready()
-    Base.metadata.create_all(bind=engine)
-    ensure_pgvector_ready()
-    print("[OK] Database tables created")
+    with serialized_startup(engine):
+        assert_migrations_applied(engine)
+        print("[OK] Database migrations verified")
 
-    db = SessionLocal()
-    try:
-        seed_defaults(db)
-        auto_reject_expired_registrations(db)
-    finally:
-        db.close()
+        db = SessionLocal()
+        try:
+            seed_defaults(db)
+            auto_reject_expired_registrations(db)
+        finally:
+            db.close()
 
-    # Start evaluation job consumer daemon
-    start_evaluation_job_consumer(daemon=True)
-    print("[OK] Evaluation job consumer started")
-
-    # Create demo db for postgres assessment
-    is_demo = os.getenv("DEMO_MODE", "").lower() == "true"
-    if is_demo:
-        create_demo_db_for_tests()
-
-    # Backfill embeddings for questions that don't have them yet
-    import threading
-    from core.embedding_backfill import backfill_missing_embeddings
-    threading.Thread(target=backfill_missing_embeddings, daemon=True).start()
+    if should_run_embedded_worker():
+        worker_thread = Thread(
+            target=_run_embedded_worker,
+            daemon=True,
+            name="local-background-worker",
+        )
+        worker_thread.start()
+        app.state.local_worker_thread = worker_thread
+        logger.info("Started the in-process worker for local development")
 
     yield
     # Shutdown (nothing to clean up)
@@ -171,17 +185,31 @@ app = FastAPI(
 )
 
 # CORS
-cors_origins = (
+cors_origins = [
+    origin.strip()
+    for origin in (
     os.getenv("CORS_ALLOWED_ORIGINS")
     or "http://localhost:5173,http://127.0.0.1:5173"
-).split(",")
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in cors_origins if o.strip()],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+
+@app.middleware("http")
+async def validate_request_origin(request, call_next):
+    """Reject cross-origin state changes before cookie-authenticated routes run."""
+    origin = request.headers.get("origin")
+    unsafe_methods = {"POST", "PUT", "PATCH", "DELETE"}
+    if origin and request.method.upper() in unsafe_methods and origin not in cors_origins:
+        return JSONResponse(status_code=403, content={"detail": "Origin is not allowed"})
+    return await call_next(request)
 
 # # React assets
 # app.mount(
@@ -218,9 +246,9 @@ app.include_router(question_generation_router)
 @app.get("/health")
 async def health_check(
     db: bool = Query(default=True, alias="db"),
-    llm: bool = Query(default=True, alias="llm"),
+    llm: bool = Query(default=False, alias="llm"),
 ):
-    """Health check endpoint. Default checks DB and LLM connectivity.
+    """Health check endpoint. DB is checked by default; LLM probing is opt-in.
 
     Query params: db=true/false, llm=true/false
     """
@@ -228,14 +256,17 @@ async def health_check(
     overall = "healthy"
 
     if db:
+        session = None
         try:
             session = SessionLocal()
             session.execute(text("SELECT 1"))
-            session.close()
             results["db"] = "healthy"
-        except Exception as e:
-            results["db"] = f"unhealthy: {e}"
+        except Exception:
+            results["db"] = "unhealthy"
             overall = "degraded"
+        finally:
+            if session is not None:
+                session.close()
 
     if llm:
         try:
@@ -252,13 +283,13 @@ async def health_check(
             if "Missing Azure OpenAI config" in str(e):
                 results["llm"] = "not_configured"
             else:
-                results["llm"] = f"unhealthy: {e}"
+                results["llm"] = "unhealthy"
                 overall = "degraded"
         except asyncio.TimeoutError:
             results["llm"] = "unhealthy: timeout"
             overall = "degraded"
-        except Exception as e:
-            results["llm"] = f"unhealthy: {e}"
+        except Exception:
+            results["llm"] = "unhealthy"
             overall = "degraded"
 
     status_code = 200 if overall == "healthy" else 503
@@ -273,6 +304,8 @@ async def speed_test(size: int = Query(default=512000, ge=1024, le=10_000_000)):
     throughput.  Random bytes prevent transparent compression from inflating
     the result.
     """
+    if os.getenv("ENABLE_SPEED_TEST", "false").lower() != "true":
+        raise HTTPException(status_code=404, detail="Not found")
     payload = secrets.token_bytes(size)
     return Response(content=payload, media_type="application/octet-stream")
 

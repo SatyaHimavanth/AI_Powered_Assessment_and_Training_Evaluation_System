@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 
 type ToastType = "info" | "success" | "error" | "warning";
 
@@ -23,16 +23,12 @@ function inferType(msg: string): ToastType {
 }
 
 export default function Toast({ message, onClose, duration = 5000, type, position = "bottom-right" }: Props) {
-  const [visible, setVisible] = useState(false);
   const ttype: ToastType = type || inferType(message || "");
 
   useEffect(() => {
     if (!message) return;
-    setVisible(true);
     const auto = setTimeout(() => {
-      setVisible(false);
-      // allow animation to finish
-      setTimeout(() => onClose?.(), 250);
+      onClose();
     }, duration);
     return () => clearTimeout(auto);
   }, [message, duration, onClose]);
@@ -52,16 +48,13 @@ export default function Toast({ message, onClose, duration = 5000, type, positio
     <div className={`fixed z-50 ${posClass} max-w-sm w-full`}>
       <div
         role="status"
-        className={`w-full border rounded-lg shadow-lg p-3 ${styleMap[ttype]} transition-all duration-200 transform ${visible ? "translate-y-0 opacity-100" : "translate-y-3 opacity-0"}`}
+        className={`w-full border rounded-lg shadow-lg p-3 ${styleMap[ttype]} transition-all duration-200 transform translate-y-0 opacity-100`}
       >
         <div className="flex items-start gap-3">
           <div className="flex-1 text-sm leading-snug whitespace-pre-wrap">{message}</div>
           <button
             aria-label="Close"
-            onClick={() => {
-              setVisible(false);
-              setTimeout(() => onClose(), 200);
-            }}
+            onClick={onClose}
             className="text-xl leading-none ml-2 opacity-80 hover:opacity-100"
           >
             &times;

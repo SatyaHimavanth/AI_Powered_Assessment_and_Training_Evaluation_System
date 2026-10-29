@@ -58,6 +58,7 @@ interface AnswerReview {
   correct_answer: string;
   is_correct: boolean;
   score: number | null;
+  answer_status: "unattempted" | "awaiting_evaluation" | "correct" | "incorrect" | "partial";
   suggestion?: string | null;
 }
 
@@ -173,7 +174,7 @@ export default function Results({ batches }: Props) {
 
   const handleResetAttempt = async (attemptId: string | null, userName: string) => {
     if (!attemptId) return;
-    if (!window.confirm(`Re-enable test for ${userName}? They will be able to retake this assessment.`)) {
+    if (!window.confirm(`Retest for ${userName}? This permanently deletes their saved answers, score, feedback, and evaluation record for this attempt. They can then start this assessment again.`)) {
       return;
     }
 
@@ -396,21 +397,21 @@ export default function Results({ batches }: Props) {
                       {attemptResults.answers.map((ans, idx) => (
                         <div key={ans.question_id} className="px-5 py-4">
                           <div className="flex items-start gap-3">
-                            <span className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${ans.is_correct ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"}`}>
+                            <span className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${ans.answer_status === "correct" ? "bg-green-50 text-green-700" : ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation" ? "bg-gray-100 text-gray-600" : ans.answer_status === "partial" ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>
                               {idx + 1}
                             </span>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-start justify-between gap-3 mb-2">
                                 <p className="text-sm font-medium">{ans.question_text}</p>
-                                <span className={`shrink-0 inline-flex items-center px-2 py-1 rounded text-xs font-semibold ${ans.score === null ? "bg-gray-100 text-gray-600" : ans.score >= 0.999 ? "bg-green-50 text-green-700" : ans.score > 0 ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>
-                                  Score: {ans.score === null ? "Pending" : `${ans.score} / 1`}
+                                <span className={`shrink-0 inline-flex items-center px-2 py-1 rounded text-xs font-semibold ${ans.answer_status === "correct" ? "bg-green-50 text-green-700" : ans.answer_status === "partial" ? "bg-amber-50 text-amber-700" : ans.answer_status === "incorrect" ? "bg-red-50 text-red-700" : "bg-gray-100 text-gray-600"}`}>
+                                  {ans.answer_status === "unattempted" ? "Unattempted" : ans.answer_status === "awaiting_evaluation" ? "Pending" : `${ans.answer_status === "partial" ? "Partial" : ans.answer_status === "correct" ? "Correct" : "Incorrect"} · ${ans.score} / 1`}
                                 </span>
                               </div>
                               <p className="text-xs text-[var(--color-text-secondary)] mb-1">{ans.topic_name} • {ans.question_type}</p>
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
                                 <div className={`p-2 rounded ${ans.is_correct ? "bg-green-50" : "bg-red-50"}`}>
                                   <span className="font-medium">Your answer: </span>
-                                  <span>{ans.your_answer || "—"}</span>
+                                  <span>{ans.your_answer || (ans.answer_status === "unattempted" ? "Unattempted" : "—")}</span>
                                 </div>
                                 {!ans.is_correct && (
                                   <div className="p-2 rounded bg-green-50">
@@ -493,12 +494,6 @@ export default function Results({ batches }: Props) {
                     Retry Eval
                   </button>
                 )}
-                <button
-                  onClick={() => { handleResetAttempt(errorModalUser.attempt_id, errorModalUser.user_name); setErrorModalUser(null); }}
-                  className="px-3 py-1.5 text-xs font-medium rounded bg-red-100 text-red-700 hover:bg-red-200 cursor-pointer transition-colors"
-                >
-                  Re-enable Test
-                </button>
                 <button
                   onClick={() => setErrorModalUser(null)}
                   className="px-3 py-1.5 text-xs font-medium rounded bg-gray-100 text-gray-600 hover:bg-gray-200 cursor-pointer transition-colors ml-auto"
@@ -680,7 +675,7 @@ export default function Results({ batches }: Props) {
                 </thead>
                 <tbody className="divide-y divide-[var(--color-border)]">
                   {(() => {
-                    let items = [...results.user_results];
+                    const items = [...results.user_results];
                     if (sortField) {
                       items.sort((a, b) => {
                         const dir = sortDir === "asc" ? 1 : -1;
@@ -734,12 +729,22 @@ export default function Results({ batches }: Props) {
                             eval failed ⓘ
                           </span>
                         )}
+                        {ur.status === "evaluating" && (
+                          <span className="ml-1 text-xs text-blue-700" title="Evaluation job state">
+                            {ur.evaluation_status === "in_progress" ? "Scoring now" : ur.evaluation_status === "pending" ? "In evaluation queue" : "Evaluation pending"}
+                          </span>
+                        )}
                       </td>
                       <td className="px-5 py-3 text-[var(--color-text-secondary)]">{ur.total_answered}</td>
                       <td className="px-5 py-3 text-[var(--color-text-secondary)] text-xs">
                         {ur.submitted_at
                           ? new Date(ur.submitted_at).toLocaleString()
                           : "—"}
+                        {ur.status === "evaluating" && (
+                          <span className="block mt-1 text-blue-700">
+                            {ur.evaluation_status === "in_progress" ? "Evaluation in progress" : ur.evaluation_status === "pending" ? "Waiting for evaluator" : "Evaluation pending"}
+                          </span>
+                        )}
                       </td>
                       <td className="px-5 py-3">
                         <div className="flex gap-2">
@@ -757,13 +762,14 @@ export default function Results({ batches }: Props) {
                           >
                             Topics
                           </button>
-                          {(ur.status === "missed" || ur.status === "in_progress" || ur.status === "completed") && (
+                          {((ur.status === "completed" && ur.evaluation_status === "completed" && ur.score !== null) || ur.status === "missed") && ur.attempt_id && (
                             <button
                               onClick={() => handleResetAttempt(ur.attempt_id, ur.user_name)}
                               disabled={resettingAttemptId === ur.attempt_id}
-                              className="px-2 py-1.5 text-xs font-medium rounded bg-blue-100 text-blue-700 hover:bg-blue-200 disabled:opacity-50 cursor-pointer transition-colors"
+                              title={ur.status === "missed" ? "Clear this missed attempt so the candidate can retake" : "Clear this evaluated attempt so the candidate can retake"}
+                              className="px-2 py-1.5 text-xs font-medium rounded bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50 cursor-pointer transition-colors"
                             >
-                              {resettingAttemptId === ur.attempt_id ? "Resetting..." : "Re-enable"}
+                              {resettingAttemptId === ur.attempt_id ? "Clearing..." : "Retest"}
                             </button>
                           )}
                           {ur.evaluation_status === "failed" && ur.evaluation_job_id && (
@@ -777,13 +783,6 @@ export default function Results({ batches }: Props) {
                                   {retryingJobId === ur.evaluation_job_id ? "Retrying..." : "Retry Eval"}
                                 </button>
                               )}
-                              <button
-                                onClick={() => handleResetAttempt(ur.attempt_id, ur.user_name)}
-                                disabled={resettingAttemptId === ur.attempt_id}
-                                className="px-2 py-1.5 text-xs font-medium rounded bg-red-100 text-red-700 hover:bg-red-200 disabled:opacity-50 cursor-pointer transition-colors"
-                              >
-                                {resettingAttemptId === ur.attempt_id ? "Resetting..." : "Re-enable"}
-                              </button>
                             </>
                           )}
                         </div>

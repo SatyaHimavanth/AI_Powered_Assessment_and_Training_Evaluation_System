@@ -2,17 +2,15 @@
 API router for AI question generation.
 """
 
-import asyncio
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.auth import require_admin
 from core.question_generation import (
     approve_staged_question,
-    process_generation_batch,
     reject_staged_question,
 )
 from db.async_helpers import run_db_sync
@@ -40,11 +38,11 @@ router = APIRouter(prefix="/admin/questions/generation", tags=["question-generat
 
 
 class GenerateBatchRequest(BaseModel):
-    source_text: str
+    source_text: str = Field(min_length=1, max_length=200_000)
     topic_id: Optional[UUID] = None
     question_type: Optional[str] = "text"
     difficulty: Optional[str] = "medium"
-    count: int = 10
+    count: int = Field(default=10, ge=1, le=50)
     auto_approve_unique: bool = False
 
 
@@ -294,11 +292,6 @@ async def start_generation(
             db.close()
 
     result = await run_db_sync(_create_batch)
-
-    # Process in background
-    asyncio.get_running_loop().run_in_executor(
-        None, process_generation_batch, result["id"]
-    )
 
     return result
 
