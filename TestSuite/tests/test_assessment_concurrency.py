@@ -96,7 +96,7 @@ def test_start_save_and_submit_are_race_safe(
         )
     statuses = sorted(response.status_code for response in submissions)
     assert statuses[0] == 200
-    assert statuses[1] in {400, 409}
+    assert statuses[1] == 200
     assert 500 not in statuses
 
     partial_questions = partial_attempt["questions"][:2]

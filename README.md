@@ -114,6 +114,33 @@ contains placeholders; do not use those values in a deployed environment.
 - pgvector- or JSON-based similarity search for question embeddings.
 - SQL assessment sandbox using demo tables inside the main assessment database.
 
+## Assessment and Recovery Behavior
+
+- Editing a bank question already linked to an assessment creates a new active
+  version and archives the bank entry for the original. Existing assessments,
+  option IDs, saved answers, and grading retain the original version.
+- Sections may share the same topic/type/difficulty pool. Requested counts are
+  aggregated while question selection remains unique across sections.
+- Assessment Excel imports validate rows and report errors before creation.
+  Answer keys accept option letters separated by spaces, commas, pipes, or
+  semicolons, and full option text (separate multiple full-text keys with pipes,
+  commas, or semicolons). Blank/unknown topic names remain local to the imported
+  assessment rather than creating question-bank topics.
+- The assessment-import format supports text and MCQ questions. Upload coding
+  questions through the question bank with their templates and test cases;
+  assessment imports reject coding rows rather than assigning unavoidable zeroes.
+- Interview approvals are single-use. Approved retries work after completed,
+  missed, or abandoned sessions. Normal duration expiry completes the session;
+  repeating an end request is harmless.
+- Unfinished and failed practice tests remain accessible from history, including
+  tests created on previous days. Failed submissions show feedback without
+  discarding the candidate's answers.
+- Missing assessment answers count as zero in topic reporting. Rejected
+  registration requests can be resubmitted after the configured cooldown.
+
+See [TestSuite](TestSuite/README.md) for executable recovery, failure-injection,
+browser, and live concurrency scenarios and their validation boundaries.
+
 ## Project Structure
 
 ```text

@@ -70,6 +70,63 @@ evaluation jobs are recovered by the worker. Interrupted question-generation
 batches with partial staged output are marked failed for review rather than
 replayed automatically.
 
+### Cloud SQL console-only upgrade from a02c14f
+
+When only Cloud SQL Studio/SQL console access is available, use
+[`backend/migrations/20261029_cloudsql_from_a02c14f.sql`](backend/migrations/20261029_cloudsql_from_a02c14f.sql).
+It is a SQL-only equivalent of the migration set introduced in `659690f`,
+prepared by comparing the deployed `a02c14f` models with the new models. This
+is not a generic upgrade script for arbitrary older installations.
+
+1. Take a Cloud SQL backup/snapshot. Prefer rehearsing on a restored clone.
+2. Finish active candidate sessions and stop the old API and workers so they
+   cannot write during the upgrade.
+3. In Cloud SQL Studio, connect to the **application database** as a role with
+   schema/table/index modification permissions. Confirm `SELECT
+   current_database(), current_schema();` points to the application's schema.
+4. Open the linked SQL file and execute its **entire `DO ... $upgrade$;`
+   statement**, not individual lines. It is one atomic transaction. A lock
+   timeout, duplicate data, invalid ownership, or other SQL error rolls back all
+   of this script's changes, including migration history. Do not ignore errors
+   or manually insert migration versions.
+5. After successful completion, verify:
+
+   ```sql
+   SELECT version, applied_at
+   FROM app_schema_migrations
+   ORDER BY version;
+   ```
+
+   The script records all 12 versions in the `659690f` migration set. Future
+   application releases may require additional migrations.
+6. Deploy the new backend and worker with the **same embedding storage backend
+   and dimension as the existing database**. Check `/health?db=true&llm=false`,
+   login, historical results, and one new assessment flow.
+
+The script adds tables/columns/indexes and backfills missing question positions.
+It does not delete application records, reconcile duplicates automatically, or
+convert embeddings. Compatible re-execution is supported. Constraint failures
+require explicit review of historical data before retrying. Normal duration
+accounting starts with the new columns' defaults, so do not perform this upgrade
+mid-exam. Existing login sessions may need a fresh login for the new persisted
+refresh-session flow.
+
+The accompanying regression tests build the exact `a02c14f` schema from Git,
+seed historical rows, and verify preservation, repeated execution, target
+column/nullability compatibility, migration history, and rollback on invalid
+data. They require a disposable PostgreSQL database:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m pytest -q -c TestSuite\pyproject.toml TestSuite\tests\test_cloudsql_console_migration.py
+```
+
+Set `REALWORLD_TEST_DATABASE_URL` and matching `DATABASE_URL` /
+`DATABASE_URL_ASYNC` as described in [TestSuite](TestSuite/README.md). Local
+rehearsal used JSON embedding storage; the SQL retains pgvector columns and
+dimensions and creates the cosine index only when its dimensions support HNSW.
+The actual Cloud SQL data and its vector-specific branch must still be verified
+on a Cloud SQL clone.
+
 ### Candidate code execution
 
 The default `PYTHON_RUNNER_MODE=local` runs candidate Python in a subprocess

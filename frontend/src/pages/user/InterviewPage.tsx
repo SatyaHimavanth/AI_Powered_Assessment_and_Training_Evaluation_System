@@ -115,9 +115,11 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   useEffect(() => { draftRef.current = draft; }, [draft]);
 
   useEffect(() => {
+    let cancelled = false;
     const loadTemplate = async () => {
       try {
         const res = await api.get("/interviews/templates");
+        if (cancelled) return;
         const templates = Array.isArray(res.data) ? res.data as InterviewTemplate[] : [];
         const t = templates.find((item) => item.id === templateId);
         if (t) {
@@ -126,12 +128,13 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
           setError("Template not found");
         }
       } catch {
-        setError("Failed to load template");
+        if (!cancelled) setError("Failed to load template");
       } finally {
-        if (!resumeSessionId) setLoading(false);
+        if (!cancelled && !resumeSessionId) setLoading(false);
       }
     };
     loadTemplate();
+    return () => { cancelled = true; };
   }, [templateId, resumeSessionId]);
 
   async function loadSessionResult(sessionId: string) {
@@ -143,15 +146,18 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   // If resuming, load existing session and enter interview phase (wait for template)
   useEffect(() => {
     if (!resumeSessionId || !template) return;
+    let cancelled = false;
     const resumeExisting = async () => {
       try {
         // Report any pending interrupt from previous disconnection.
         const key = interruptKey(resumeSessionId);
         if (window.localStorage.getItem(key)) {
           await api.post(`/interviews/${resumeSessionId}/interrupt`);
+          if (cancelled) return;
           window.localStorage.removeItem(key);
         }
         const result = await loadSessionResult(resumeSessionId);
+        if (cancelled) return;
         const transcript = Array.isArray(result.transcript) ? result.transcript : [];
         const pendingAnswer = transcript[transcript.length - 1];
         if (pendingAnswer?.role === "user" && typeof pendingAnswer.content === "string") {
@@ -160,6 +166,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
         }
         if (result.status === "paused") {
           await api.post(`/interviews/${resumeSessionId}/resume`);
+          if (cancelled) return;
         } else if (result.status !== "in_progress" && result.status !== "started") {
           setPhase("completed");
           return;
@@ -178,12 +185,13 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
           console.info("Fullscreen is unavailable; interview can continue", fullscreenError);
         }
       } catch {
-        setError("Failed to resume interview");
+        if (!cancelled) setError("Failed to resume interview");
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
     resumeExisting();
+    return () => { cancelled = true; };
   }, [resumeSessionId, template, templateId]);
 
   const startInterview = async () => {

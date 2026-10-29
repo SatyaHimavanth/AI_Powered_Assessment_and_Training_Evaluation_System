@@ -21,6 +21,7 @@ type RequestItem = {
   template_title: string;
   status: string;
   request_type: string;
+  used?: boolean;
   requested_at: string;
 };
 
@@ -146,14 +147,6 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
     }
   }
 
-  function allTurnsEvaluated(templateId: string): boolean {
-    // Check if the completed/missed session for this template has a score (meaning evaluation is done)
-    const session = sessions.find(
-      (s) => s.template_id === templateId && (s.status === "completed" || s.status === "missed")
-    );
-    return session ? session.total_score !== null : true;
-  }
-
   function handleResume(sessionId: string, templateId: string) {
     if (onResumeInterview) {
       onResumeInterview(sessionId, templateId);
@@ -173,16 +166,11 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
   }
 
   const approvedTemplateIds = new Set(
-    requests.filter((r) => r.status === "approved").map((r) => r.template_id)
+    requests.filter((r) => r.status === "approved" && !r.used).map((r) => r.template_id)
   );
   const pendingTemplateIds = new Set(
     requests.filter((r) => r.status === "pending").map((r) => r.template_id)
   );
-  // Check if there's an approved retry request for a template
-  const approvedRetryTemplateIds = new Set(
-    requests.filter((r) => r.status === "approved" && r.request_type === "retry").map((r) => r.template_id)
-  );
-
   return (
     <div className="space-y-6">
       {message && (
@@ -212,7 +200,10 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
               const hasApproved = approvedTemplateIds.has(t.id);
               const hasPending = pendingTemplateIds.has(t.id);
               const hasMissedOrCompleted = sessions.some(
-                (s) => s.template_id === t.id && (s.status === "missed" || s.status === "completed")
+                (s) => s.template_id === t.id && ["missed", "completed", "abandoned"].includes(s.status)
+              );
+              const hasActive = sessions.some(
+                (s) => s.template_id === t.id && ["started", "in_progress", "paused"].includes(s.status)
               );
 
               return (
@@ -224,7 +215,7 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
                   <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{t.duration_minutes} min</td>
                   <td className="px-5 py-3.5 text-[var(--color-text-secondary)]">{t.question_count}</td>
                   <td className="px-5 py-3.5 text-right space-x-2">
-                    {!hasApproved && !hasPending && (
+                    {!hasApproved && !hasPending && !hasMissedOrCompleted && !hasActive && (
                       <button
                         onClick={() => requestAccess(t.id)}
                         disabled={loadingId === t.id}
@@ -238,7 +229,7 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
                         Pending Approval
                       </span>
                     )}
-                    {hasApproved && !hasMissedOrCompleted && (
+                    {hasApproved && !hasMissedOrCompleted && !hasActive && (
                       <button
                         onClick={() => handleStart(t.id)}
                         className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-green-50 text-green-700 hover:bg-green-100 cursor-pointer transition-colors"
@@ -246,7 +237,7 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
                         Start Interview
                       </button>
                     )}
-                    {hasMissedOrCompleted && approvedRetryTemplateIds.has(t.id) && (
+                    {hasMissedOrCompleted && hasApproved && !hasActive && (
                       <button
                         onClick={() => handleStart(t.id)}
                         className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-green-50 text-green-700 hover:bg-green-100 cursor-pointer transition-colors"
@@ -254,17 +245,16 @@ export default function Interviews({ onStartInterview, onResumeInterview }: Inte
                         Start Interview
                       </button>
                     )}
-                    {hasMissedOrCompleted && !approvedRetryTemplateIds.has(t.id) && !pendingTemplateIds.has(t.id) && (
+                    {hasMissedOrCompleted && !hasApproved && !hasActive && !pendingTemplateIds.has(t.id) && (
                       <button
                         onClick={() => requestRetry(t.id)}
-                        disabled={loadingId === `retry-${t.id}` || !allTurnsEvaluated(t.id)}
+                        disabled={loadingId === `retry-${t.id}`}
                         className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-gray-100 text-[var(--color-text)] hover:bg-gray-200 cursor-pointer transition-colors disabled:opacity-50"
-                        title={!allTurnsEvaluated(t.id) ? "Wait for evaluation to complete" : ""}
                       >
                         Request Retry
                       </button>
                     )}
-                    {hasMissedOrCompleted && !approvedRetryTemplateIds.has(t.id) && pendingTemplateIds.has(t.id) && (
+                    {hasMissedOrCompleted && !hasApproved && !hasActive && pendingTemplateIds.has(t.id) && (
                       <span className="inline-flex items-center h-8 px-3 text-xs font-medium rounded-[var(--radius-sm)] bg-amber-50 text-amber-700">
                         Retry Pending
                       </span>

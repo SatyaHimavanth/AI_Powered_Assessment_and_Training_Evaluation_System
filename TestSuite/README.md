@@ -17,6 +17,12 @@ App Engine, or another cloud platform.
 - browser practice-load outage/retry, large Unicode and markup-like answer persistence, refresh/resume, and interview recovery
 - browser lifecycle: admin-provisioned assessment attended and submitted by two isolated candidate sessions, with integrity-event checks
 - malformed and unsupported anti-cheat event API payloads, including attempt ownership boundaries
+- repeated question pools across separate assessment sections, with unique question selection
+- isolated regression scenarios for versioned question edits, partial/negative grading,
+  import answer keys and validation, registration cooldowns, interview retries and
+  delayed evaluation, offline deadline sync, and practice-provider outages
+- Chromium scenarios for previous-day practice start/resume/generation retry,
+  visible submission failures without draft loss, and normal interview countdown completion
 
 Safe API tests run by default. Tests that start/finalize an assessment require
 `RUN_STATEFUL_TESTS=1`; use a dedicated database. Browser tests require
@@ -82,6 +88,102 @@ example:
 uv run python run_all.py -x -vv
 ```
 
+## Deterministic real-world regressions
+
+From the repository root, use the backend environment for scenarios that exercise
+actual route functions, ORM constraints, transactions, and grading with a fresh
+in-memory SQLite database per test:
+
+```powershell
+uv sync --project backend --extra local
+.\backend\.venv\Scripts\python.exe -m pytest -q -c TestSuite\pyproject.toml TestSuite\tests\test_realworld_regressions.py
+```
+
+These scenarios do not start background workers or call external models. By
+default they do not connect to the configured application database. They cover:
+
+| Situation | Required outcome |
+| --- | --- |
+| An administrator edits a question while a candidate is answering it | Original option IDs and grading survive; future assessments use the edited version |
+| Two sections draw from the same topic/type/difficulty | One aggregated configuration, distinct questions, stable section positions |
+| Imports contain unknown/blank topics, option gaps, spaces or full-text answer keys | Valid rows create usable per-assessment questions without global-topic pollution |
+| Imports contain invalid keys/types/difficulty or coding without tests | Actionable row errors; invalid rows cannot silently become graded questions |
+| A candidate submits only part of an assessment | Missing answers count as zero consistently across all topic reports |
+| A rejected applicant reapplies before/after cooldown | Early requests fail explicitly; eligible reapplications reuse the original request safely |
+| An admin approves a retry after a completed/missed/abandoned interview | Approval starts exactly one new attempt; consumed approvals cannot be reused |
+| An interview ends at its deadline or the end request is retried | Completion is successful and idempotent |
+| Evaluation finishes after an accepted interview answer and session end | The accepted answer keeps its evaluation |
+| An assessment reconnects after deadline within its offline-sync grace | One draft is applied; subsequent retries cannot overwrite finalized answers |
+| Practice evaluation fails after submission | Answers remain persisted; a later submission can complete successfully |
+| Interview start or registration resubmission arrives twice concurrently | Only one attempt/request is accepted |
+| A successful interview resume is retried | Pause counters and accumulated duration remain unchanged |
+| Several administrators publish assessments from overlapping section pools | Each assessment retains distinct questions and creation completes without database errors |
+
+When run in the standalone TestSuite environment, local regression scenarios
+skip if backend dependencies are absent. PostgreSQL-only concurrency scenarios
+skip in SQLite mode. The stateful API fixture also uses two sections sharing the
+same question pool.
+
+### PostgreSQL validation
+
+`tests/test_cloudsql_console_migration.py` additionally rehearses the standalone
+Cloud SQL console migration from the exact `a02c14f` model source in Git. It
+checks historical data preservation, reruns, target columns and migration
+history, and atomic rollback when old data contains invalid ownership, null
+relationships, or duplicate topic configurations. Run it with the backend
+Python environment and `REALWORLD_TEST_DATABASE_URL` set as below; Git must
+contain commit `a02c14f`. See [console migration instructions](../DOCKER.md#cloud-sql-console-only-upgrade-from-a02c14f).
+
+Create a separate, disposable PostgreSQL database. Never point stateful tests at
+your normal application database. From the repository root:
+
+```powershell
+$env:REALWORLD_TEST_DATABASE_URL = "postgresql://TEST_USER:TEST_PASSWORD@localhost:5432/assessment_validation"
+$env:DATABASE_URL = $env:REALWORLD_TEST_DATABASE_URL
+$env:DATABASE_URL_ASYNC = "postgresql+asyncpg://TEST_USER:TEST_PASSWORD@localhost:5432/assessment_validation"
+# Use json when the local PostgreSQL server does not have pgvector installed.
+$env:EMBEDDING_STORAGE_BACKEND = "json"
+$env:JWT_SECRET_KEY = "local-validation-only-key-replace-before-deployment"
+
+.\backend\.venv\Scripts\python.exe -m pytest -q -c TestSuite\pyproject.toml TestSuite\tests\test_realworld_regressions.py
+```
+
+In this mode every regression test creates a uniquely named PostgreSQL schema,
+uses independent connections with that schema as its search path, and drops only
+its own schema during teardown. The regression fixture creates ORM tables;
+validate the actual database migrations and worker recovery separately:
+
+```powershell
+Push-Location backend
+.\.venv\Scripts\python.exe -m db.migrate
+$env:AUDIT_TEST_DATABASE_URL = $env:DATABASE_URL
+.\.venv\Scripts\python.exe -m pytest -q tests\test_schema_constraints.py
+Pop-Location
+```
+
+Stop other workers connected to this disposable database before running the
+worker-recovery tests: they deliberately requeue interrupted jobs. Run the live
+HTTP/stateful and browser workflows described above after starting the API and
+worker against that same disposable database. Ensure the frontend's
+`VITE_API_BASE` matches `API_BASE_URL` when using non-default ports. Authenticated
+test accounts use separate cookie sessions so fixture logins cannot corrupt
+refresh tests or turn anonymous checks into authenticated requests.
+
+Run the new browser scenarios against a running frontend from the repository root:
+
+```powershell
+uv sync --project TestSuite
+uv run --project TestSuite playwright install chromium
+$env:RUN_E2E_TESTS = "1"
+$env:FRONTEND_URL = "http://localhost:5173"
+$env:API_BASE_URL = "http://localhost:8000"
+uv run --project TestSuite pytest TestSuite\tests\test_realworld_browser.py --browser chromium
+```
+
+Their API responses are intercepted deterministically; no running backend is
+required. They test real Chromium navigation/input and UI recovery, not live
+provider or PostgreSQL integration.
+
 The stateful concurrency scenario creates three temporary users plus an
 isolated topic, four questions, batch, and individually assigned assessment through admin APIs. Users
 exercise full, partial, and violation-aborted attempts and verify that learner
@@ -97,6 +199,52 @@ deployed frontend origin explicitly.
 
 ## Coverage boundaries
 
+### Optional Cisco LLM integration
+
+The test-only factory in `client_llms/llms.py` loads the adjacent ignored `.env`
+when first requested; importing it does not authenticate or contact a model.
+Set `MBR_AI_CANVAS_Ingest_Client_ID`, `MBR_AI_CANVAS_Ingest_Client_Secret`, and
+`MBR_AI_CANVAS_APP_KEY` in that local file. Existing shell values take precedence.
+Optional variables from the supplied client include
+`MBR_AI_CANVAS_AZURE_ENDPOINT`, `MBR_AI_CANVAS_SSO_TOKEN_API`,
+`MBR_AI_CANVAS_AZURE_API_VERSION`, and `MBR_AI_CANVAS_AZURE_MODEL_4_1`
+(otherwise the client's default model is used).
+
+Run from the repository root using the backend environment:
+
+```powershell
+uv sync --project backend --extra local
+.\backend\.venv\Scripts\python.exe -m pytest -q -c TestSuite\pyproject.toml TestSuite\tests\test_llm_client_adapter.py
+$env:RUN_LIVE_LLM_TESTS = "1"
+.\backend\.venv\Scripts\python.exe -m pytest -q -c TestSuite\pyproject.toml TestSuite\tests\test_live_llm_workflows.py --tb=short
+Remove-Item Env:\RUN_LIVE_LLM_TESTS
+```
+
+The live tests temporarily replace chat factories only inside the pytest process;
+pytest restores them after each test. Normal backend provider configuration is
+unchanged. Calls send synthetic questions, reference answers, candidate answers,
+and interview context, not stored candidate records or uploaded documents.
+The persistence scenario uses an isolated SQLite database by default, or its own
+PostgreSQL schema if `REALWORLD_TEST_DATABASE_URL` is explicitly supplied.
+Do not run live tests as a load test: they incur real provider requests/costs.
+
+Coverage includes:
+
+- native structured-output grading with correct, incorrect, and partial answers;
+- interview evaluation and follow-up schema compatibility;
+- generation of text, single-choice and multiple-choice questions;
+- ten-question practice generation and actual worker persistence;
+- offline verification that structured calls obtain current OAuth tokens;
+- provider failure preserving an empty question set, exposing a failed state,
+  and allowing explicit generation retry.
+
+**No embedding model is required for these checks.** Question generation stops
+before the embedding/similarity stages. The tests do not fabricate embeddings,
+validate semantic duplicate detection, or certify end-to-end staged bank
+generation. Small grading examples are smoke checks, not a statistically
+meaningful human-labelled grading benchmark. These tests also do not establish
+long-duration OAuth expiry behavior or provider rate-limit capacity.
+
 Playwright browser tests use actual Chromium input, form validation, network
 interception, refresh, and navigation. API-backed workflows use deterministic
 responses where a live model or backend is unnecessary; the stateful and
@@ -105,5 +253,5 @@ suite targets authentication, authorization, service health, payload bounds,
 CORS, concurrent reads/writes, duplicate starts/submission, transient failures,
 long/unicode candidate input, and recovery flows. It does not prove every
 possible edge case. Further work includes human-labelled AI grading evaluation,
-coding/SQL sandbox limits, imports/exports, sustained load, and additional
+coding/SQL sandbox limits, live imports/exports, sustained load, and additional
 worker restart and registration-approval races.

@@ -17,11 +17,11 @@ def test_invalid_login_does_not_issue_tokens(api_client, api_url):
     assert "access_token" not in response.text
 
 
-def test_login_identity_and_refresh(api_client, api_url, user_tokens):
+def test_login_identity_and_refresh(user_session, api_url, user_tokens):
     assert {"access_token", "role"} <= user_tokens.keys()
     assert "refresh_token" not in user_tokens
-    assert api_client.cookies.get("assessment_refresh")
-    me = api_client.get(
+    assert user_session.cookies.get("assessment_refresh")
+    me = user_session.get(
         f"{api_url}/auth/me",
         headers={"Authorization": f"Bearer {user_tokens['access_token']}"},
         timeout=10,
@@ -29,7 +29,7 @@ def test_login_identity_and_refresh(api_client, api_url, user_tokens):
     assert me.status_code == 200
     assert me.json()["role"] == "user"
 
-    refreshed = api_client.post(
+    refreshed = user_session.post(
         f"{api_url}/auth/refresh",
         headers={"X-Token-Response": "bearer"},
         timeout=10,
@@ -52,3 +52,15 @@ def test_parallel_logins_do_not_fail(api_client, api_url):
     with ThreadPoolExecutor(max_workers=6) as pool:
         responses = list(pool.map(lambda _: login(), range(6)))
     assert {response.status_code for response in responses} == {200}
+
+
+def test_candidate_provisioning_does_not_replace_another_users_refresh_cookie(
+    provisioned_assessment, api_client, api_url, user_session, user_tokens
+):
+    assert user_tokens["role"] == "user"
+    assert not api_client.cookies
+    anonymous = api_client.get(f"{api_url}/auth/me", timeout=10)
+    assert anonymous.status_code == 401
+    refreshed = user_session.post(f"{api_url}/auth/refresh", timeout=10)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["role"] == "user"

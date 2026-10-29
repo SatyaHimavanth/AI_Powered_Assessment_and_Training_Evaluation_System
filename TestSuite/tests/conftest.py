@@ -52,9 +52,15 @@ def _login(client: requests.Session, api_url: str, username: str, password: str)
 
 
 @pytest.fixture(scope="session")
-def user_tokens(api_client: requests.Session, api_url: str) -> dict:
+def user_session(api_client: requests.Session) -> Iterator[requests.Session]:
+    with requests.Session() as client:
+        yield client
+
+
+@pytest.fixture(scope="session")
+def user_tokens(user_session: requests.Session, api_url: str) -> dict:
     return _login(
-        api_client,
+        user_session,
         api_url,
         os.getenv("TEST_USER_USERNAME", "user"),
         os.getenv("TEST_USER_PASSWORD", "user123"),
@@ -63,12 +69,13 @@ def user_tokens(api_client: requests.Session, api_url: str) -> dict:
 
 @pytest.fixture(scope="session")
 def admin_tokens(api_client: requests.Session, api_url: str) -> dict:
-    return _login(
-        api_client,
-        api_url,
-        os.getenv("TEST_ADMIN_USERNAME", "admin"),
-        os.getenv("TEST_ADMIN_PASSWORD", "admin123"),
-    )
+    with requests.Session() as client:
+        return _login(
+            client,
+            api_url,
+            os.getenv("TEST_ADMIN_USERNAME", "admin"),
+            os.getenv("TEST_ADMIN_PASSWORD", "admin123"),
+        )
 
 
 @pytest.fixture(scope="session")
@@ -229,9 +236,16 @@ def provisioned_assessment(
                         "topic_id": topic_id,
                         "question_type": "single_mcq",
                         "difficulty": "easy",
-                        "question_count": 4,
-                        "section_name": "Concurrency",
-                    }
+                        "question_count": 2,
+                        "section_name": "Foundations",
+                    },
+                    {
+                        "topic_id": topic_id,
+                        "question_type": "single_mcq",
+                        "difficulty": "easy",
+                        "question_count": 2,
+                        "section_name": "Applied skills",
+                    },
                 ],
                 # Exercise direct recipient assignment independently of batches.
                 "user_ids": [user["id"] for user in created_users],
@@ -263,12 +277,13 @@ def provisioned_assessment(
         mixed_assessment_id = mixed_assessment.json()["id"]
 
         for user in created_users:
-            tokens = _login(
-                api_client,
-                api_url,
-                user["username"],
-                user["password"],
-            )
+            with requests.Session() as client:
+                tokens = _login(
+                    client,
+                    api_url,
+                    user["username"],
+                    user["password"],
+                )
             user["headers"] = {
                 "Authorization": f"Bearer {tokens['access_token']}"
             }

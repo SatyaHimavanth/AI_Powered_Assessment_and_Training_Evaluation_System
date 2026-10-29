@@ -5,6 +5,7 @@ import jwt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from dotenv import load_dotenv
@@ -129,8 +130,7 @@ async def register(payload: UserRegister):
             if existing_user:
                 raise HTTPException(status_code=400, detail="Username or email already registered")
 
-            # Check if there's a pending registration request
-            existing_request = (
+            previous_requests = (
                 db.query(RegistrationRequest)
                 .filter(
                     or_(
@@ -139,10 +139,10 @@ async def register(payload: UserRegister):
                         RegistrationRequest.contact_email == payload.contact_email,
                     ),
                 )
-                .filter(RegistrationRequest.status == RegistrationStatus.pending)
-                .first()
+                .with_for_update()
+                .all()
             )
-            if existing_request:
+            if any(req.status == RegistrationStatus.pending for req in previous_requests):
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -152,23 +152,13 @@ async def register(payload: UserRegister):
                 )
 
             # Check if rejected/expired within the configured window
-            recent_rejected = (
-                db.query(RegistrationRequest)
-                .filter(
-                    or_(
-                        RegistrationRequest.username == payload.username,
-                        RegistrationRequest.email == payload.email,
-                        RegistrationRequest.contact_email == payload.contact_email,
-                    ),
-                )
-                .filter(RegistrationRequest.status == RegistrationStatus.rejected)
-                .filter(
-                    RegistrationRequest.resolved_at
-                    > datetime.now(timezone.utc) - timedelta(days=REGISTRATION_EXPIRY_DAYS)
-                )
-                .first()
-            )
-            if recent_rejected:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=REGISTRATION_EXPIRY_DAYS)
+            if any(
+                req.status == RegistrationStatus.rejected
+                and req.resolved_at
+                and (req.resolved_at.replace(tzinfo=timezone.utc) if req.resolved_at.tzinfo is None else req.resolved_at) > cutoff
+                for req in previous_requests
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -177,19 +167,31 @@ async def register(payload: UserRegister):
                     ),
                 )
 
-            # Create pending registration request
+            if len(previous_requests) > 1 or any(
+                req.status != RegistrationStatus.rejected for req in previous_requests
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="These details belong to an existing registration. Contact an administrator.",
+                )
+
             hashed = get_password_hash(payload.password)
-            reg_request = RegistrationRequest(
-                username=payload.username,
-                email=payload.email,
-                contact_email=payload.contact_email,
-                name=payload.name,
-                account=(payload.account or "").strip() or None,
-                hashed_password=hashed,
-                status=RegistrationStatus.pending,
-            )
+            reg_request = previous_requests[0] if previous_requests else RegistrationRequest()
+            reg_request.username = payload.username
+            reg_request.email = payload.email
+            reg_request.contact_email = payload.contact_email
+            reg_request.name = payload.name
+            reg_request.account = (payload.account or "").strip() or None
+            reg_request.hashed_password = hashed
+            reg_request.status = RegistrationStatus.pending
+            reg_request.requested_at = datetime.now(timezone.utc)
+            reg_request.resolved_at = None
             db.add(reg_request)
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError as exc:
+                db.rollback()
+                raise HTTPException(status_code=400, detail="A registration with these details already exists") from exc
 
             return {"message": "Registration request submitted. Please wait for admin approval."}
         finally:
@@ -367,4 +369,3 @@ async def get_me(current_user: User = Depends(get_current_user)):
             db.close()
 
     return await run_db_sync(_sync_work, current_user.username)
-

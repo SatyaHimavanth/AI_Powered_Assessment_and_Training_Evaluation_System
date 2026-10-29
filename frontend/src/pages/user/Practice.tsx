@@ -86,6 +86,8 @@ export default function Practice() {
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [currentQ, setCurrentQ] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const [startingTestId, setStartingTestId] = useState<string | null>(null);
+  const startLockRef = useRef(false);
   const submitLockRef = useRef(false);
   const answerSaveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const answerSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
@@ -117,23 +119,24 @@ export default function Practice() {
   const maxPerDay = (accessInfo && accessInfo.tests_per_day_granted) ? Number(accessInfo.tests_per_day_granted) : 3;
   const canCreateMore = Boolean(accessInfo?.has_access) && todayCount < maxPerDay;
 
-  // Poll for status when generating
+  const isGenerating = todayTest?.status === "generating" || history.some((test) => test.status === "generating");
+
   useEffect(() => {
-    if (todayTest?.status === "generating") {
+    if (isGenerating) {
       const interval = setInterval(async () => {
         try {
-          const res = await api.get("/practice/today");
-          if (res.data && res.data.status !== "generating") {
-            setTodayTest(res.data);
-            clearInterval(interval);
-          }
+          const [todayRes, historyRes] = await Promise.all([
+            api.get("/practice/today"), api.get("/practice/history"),
+          ]);
+          setTodayTest(todayRes.data);
+          setHistory(historyRes.data || []);
         } catch {
           setMessage("Could not refresh practice generation status. Retrying automatically…");
         }
       }, 3000);
       return () => clearInterval(interval);
     }
-  }, [todayTest?.status]);
+  }, [isGenerating]);
 
   function loadData(): Promise<void> {
     if (loadDataRequestRef.current) return loadDataRequestRef.current;
@@ -226,19 +229,35 @@ export default function Practice() {
     }
   };
 
-  const handleStartTest = async () => {
-    if (!todayTest) return;
+  const handleStartTest = async (test: PracticeTestInfo) => {
+    if (startLockRef.current) return;
+    startLockRef.current = true;
+    setStartingTestId(test.id);
     try {
-      await api.post(`/practice/${todayTest.id}/start`);
-      const res = await api.get(`/practice/${todayTest.id}`);
+      await api.post(`/practice/${test.id}/start`);
+      const res = await api.get(`/practice/${test.id}`);
       setTestDetail({ id: res.data.id, questions: res.data.questions });
       setAnswers(res.data.saved_answers || {});
       setCurrentQ(0);
       setView("test");
-      setTodayTest({ ...todayTest, status: "in_progress" });
+      setTodayTest((current) => current?.id === test.id ? { ...current, status: "in_progress" } : current);
+      setHistory((current) => current.map((item) => item.id === test.id ? { ...item, status: "in_progress" } : item));
     } catch (err: unknown) {
       console.error(err);
-      setMessage("Failed to start test");
+      setMessage(extractError(err, "Failed to start test"));
+    } finally {
+      startLockRef.current = false;
+      setStartingTestId(null);
+    }
+  };
+
+  const handleRetryGeneration = async (test: PracticeTestInfo) => {
+    try {
+      await api.post(`/practice/${test.id}/retry-generation`);
+      setMessage("Practice test generation restarted...");
+      await loadData();
+    } catch (err: unknown) {
+      setMessage(extractError(err, "Could not restart generation"));
     }
   };
 
@@ -503,6 +522,7 @@ export default function Practice() {
 
     return (
       <div className="space-y-6">
+        <Toast message={message} onClose={() => setMessage("")} />
         {/* Progress bar */}
         <div className={`${card} p-5`}>
           <div className="flex items-center justify-between mb-2">
@@ -537,6 +557,7 @@ export default function Practice() {
                 return (
                   <button
                     key={idx}
+                    disabled={submitting}
                     onClick={() => setMcqAnswer(q.id, opt.text, q.type === "multi_mcq")}
                     className={`w-full text-left px-4 py-3 rounded-lg border text-sm transition-colors cursor-pointer ${
                       selected
@@ -558,6 +579,7 @@ export default function Practice() {
           {/* Text answer */}
           {q.type === "text" && (
             <textarea
+              disabled={submitting}
               value={answers[q.id] || ""}
               onChange={(e) => handleAnswerChange(q.id, e.target.value)}
               rows={5}
@@ -715,6 +737,7 @@ export default function Practice() {
   if (view === "create") {
     return (
       <div className="space-y-6">
+        <Toast message={message} onClose={() => setMessage("")} />
         <button
           onClick={() => setView("home")}
           className="text-sm text-blue-600 hover:text-blue-700 font-medium cursor-pointer"
@@ -869,7 +892,8 @@ export default function Practice() {
             <div className="flex gap-2">
               {(todayTest.status === "ready" || todayTest.status === "in_progress") && (
                 <button
-                  onClick={handleStartTest}
+                  onClick={() => void handleStartTest(todayTest)}
+                  disabled={startingTestId !== null}
                   className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 cursor-pointer"
                 >
                   {todayTest.status === "in_progress" ? "Resume Test" : "Start Test"}
@@ -895,15 +919,7 @@ export default function Practice() {
                 <div className="flex items-center gap-3">
                   <p className="text-sm text-red-600">Generation failed.</p>
                   <button
-                    onClick={async () => {
-                      try {
-                        await api.post(`/practice/${todayTest.id}/retry-generation`);
-                        setTodayTest({ ...todayTest, status: "generating" });
-                        setMessage("Practice test generation restarted...");
-                      } catch (err: unknown) {
-                        setMessage(extractError(err, "Could not restart generation"));
-                      }
-                    }}
+                    onClick={() => void handleRetryGeneration(todayTest)}
                     className="px-3 py-1.5 border border-red-300 text-red-700 text-sm rounded-lg hover:bg-red-50 cursor-pointer"
                   >
                     Retry generation
@@ -975,6 +991,15 @@ export default function Practice() {
                     )}
                   </td>
                   <td className="px-5 py-3">
+                    {(t.status === "ready" || t.status === "in_progress") && (
+                      <button
+                        onClick={() => void handleStartTest(t)}
+                        disabled={startingTestId !== null}
+                        className="text-blue-600 hover:text-blue-700 text-xs font-medium cursor-pointer"
+                      >
+                        {t.status === "in_progress" ? "Resume Test" : "Start Test"}
+                      </button>
+                    )}
                     {t.status === "completed" && (
                       <div className="flex gap-2">
                         <button
@@ -992,7 +1017,14 @@ export default function Practice() {
                       </div>
                     )}
                     {t.status === "generating" && <span className="text-xs text-yellow-600">Generating...</span>}
-                    {t.status === "failed" && <span className="text-xs text-red-600">Failed</span>}
+                    {t.status === "failed" && (
+                      <button
+                        onClick={() => void handleRetryGeneration(t)}
+                        className="text-xs text-red-600 cursor-pointer"
+                      >
+                        Retry generation
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

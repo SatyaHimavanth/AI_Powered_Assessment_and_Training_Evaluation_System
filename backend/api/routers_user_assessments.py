@@ -44,7 +44,7 @@ from db.models import (
 )
 from db.async_helpers import run_db_sync
 from api.timezone_helper import as_utc_aware, to_utc_iso
-from api.results_helpers import answer_score_label
+from api.results_helpers import answer_score_label, evaluated_topic_percentages
 
 router = APIRouter(prefix="/user/assessments", tags=["user-assessments"])
 MAX_ASSESSMENT_EXIT_EVENTS = 5
@@ -1243,32 +1243,7 @@ async def get_my_performance(
             # Calculate topic-wise performance across all attempts
             topic_stats: dict[str, dict] = {}
             for attempt in attempts:
-                answers = db.query(Answer).filter(Answer.attempt_id == attempt.id).all()
-                per_attempt_topic_scores: dict[str, list[float]] = {}
-
-                for answer in answers:
-                    q = None
-                    item = None
-                    if getattr(answer, "question_id", None):
-                        q = db.query(Question).filter(Question.id == answer.question_id).first()
-                    elif getattr(answer, "assessment_item_id", None):
-                        item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == answer.assessment_item_id).first()
-                    if not q and not item:
-                        continue
-
-                    topic_name = q.topic.name if q and q.topic else (item.topic or "General")
-
-                    # only include evaluated answers in per-attempt averages
-                    if answer.score is None:
-                        continue
-
-                    per_attempt_topic_scores.setdefault(topic_name, []).append(float(answer.score or 0.0))
-
-                # Aggregate per-topic stats for this attempt
-                for topic_name, scores in per_attempt_topic_scores.items():
-                    if not scores:
-                        continue
-                    attempt_pct = (sum(scores) / len(scores)) * 100
+                for topic_name, attempt_pct in evaluated_topic_percentages(db, attempt).items():
                     if topic_name not in topic_stats:
                         topic_stats[topic_name] = {"scores": [], "attempts": 0}
                     topic_stats[topic_name]["scores"].append(attempt_pct)

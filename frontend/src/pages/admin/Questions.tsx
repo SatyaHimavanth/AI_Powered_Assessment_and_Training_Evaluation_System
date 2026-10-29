@@ -250,8 +250,10 @@ export default function Questions({ topics, setMessage, reloadTopics }: Props) {
 
     setSavingQuestion(true);
     try {
-      await api.patch(`/questions/${questionToEdit.id}`, payload);
-      setMessage("Question updated.");
+      const updated = await api.patch(`/questions/${questionToEdit.id}`, payload);
+      setMessage(updated.data.id === questionToEdit.id
+        ? "Question updated."
+        : "New question version saved. Existing assessments keep the original question and answers.");
       setShowQuestionEditModal(false);
       setQuestionToEdit(null);
       loadQuestions(page);

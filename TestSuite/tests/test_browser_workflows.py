@@ -233,8 +233,10 @@ def test_two_candidates_attend_admin_provisioned_assessment_without_integrity_al
             candidate_page.get_by_role("button", name="Sign in").click()
             expect(candidate_page).to_have_url(f"{frontend_url}/user")
 
-            expect(candidate_page.get_by_text(assessment_title)).to_be_visible()
-            candidate_page.get_by_role("button", name="Start Exam").click()
+            available = candidate_page.get_by_role("heading", name="Available Assessments").locator("..")
+            title = available.get_by_text(assessment_title, exact=True)
+            expect(title).to_be_visible()
+            title.locator("..").locator("..").get_by_role("button", name="Start Exam", exact=True).click()
             candidate_page.get_by_role("button", name="Start Assessment").click()
             expect(
                 candidate_page.get_by_text("TestSuite concurrency question", exact=False)
@@ -317,7 +319,7 @@ def test_practice_answers_restore_after_browser_reload(
             saved_answer["value"] = request.post_data_json["answer"]
             route.fulfill(json={"message": "Answer saved"})
         else:
-            route.continue_()
+            route.fulfill(json=[])
 
     page.route(f"{api_url}/**", mock_practice)
     _open_login(page, frontend_url)
@@ -344,7 +346,7 @@ def test_practice_answers_restore_after_browser_reload(
     expect(page.get_by_placeholder("Type your answer here...")).to_have_value(edge_case_answer)
 
 
-def _mock_user_with_paused_interview(page: Page, frontend_url: str):
+def _mock_user_with_paused_interview(page: Page, frontend_url: str, api_url: str):
     template_id = "browser-interview-template"
     session_id = "browser-paused-interview"
     resume_calls = []
@@ -412,9 +414,7 @@ def _mock_user_with_paused_interview(page: Page, frontend_url: str):
         else:
             route.fulfill(json=[])
 
-    page.route("**/api/**", mock_api)
-    page.route("**/auth/**", mock_api)
-    page.route("**/interviews/**", mock_api)
+    page.route(f"{api_url}/**", mock_api)
     _open_login(page, frontend_url)
     page.get_by_label("Username").fill("browser-user")
     page.get_by_label("Password").fill("password")
@@ -426,9 +426,9 @@ def _mock_user_with_paused_interview(page: Page, frontend_url: str):
 
 
 def test_paused_interview_resumes_with_server_time_and_pause_count(
-    require_e2e, page, frontend_url
+    require_e2e, page, frontend_url, api_url
 ):
-    session_id, resume_calls = _mock_user_with_paused_interview(page, frontend_url)
+    session_id, resume_calls = _mock_user_with_paused_interview(page, frontend_url, api_url)
 
     page.get_by_role("button", name="Resume").click()
     expect(page.get_by_text("Describe your recovery plan.")).to_be_visible()
@@ -438,9 +438,9 @@ def test_paused_interview_resumes_with_server_time_and_pause_count(
 
 
 def test_interview_resume_load_failure_has_visible_recovery(
-    require_e2e, page, frontend_url
+    require_e2e, page, frontend_url, api_url
 ):
-    session_id, _ = _mock_user_with_paused_interview(page, frontend_url)
+    session_id, _ = _mock_user_with_paused_interview(page, frontend_url, api_url)
     page.route(
         f"**/interviews/{session_id}/results",
         lambda route: route.fulfill(status=503, json={"detail": "temporarily unavailable"}),

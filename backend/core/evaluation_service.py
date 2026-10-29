@@ -155,13 +155,28 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
     total_score = 0.0
     # Scores are percentages of every question selected for the assessment,
     # not merely of questions for which the user sent an Answer row.
-    total_questions = (
+    question_links = (
         db.query(AssessmentQuestion)
         .filter(AssessmentQuestion.assessment_id == assessment.id)
-        .count()
+        .all()
     )
+    total_questions = len(question_links)
     topic_totals = {}
     topic_counts = {}
+    question_topics = {}
+    for link in question_links:
+        question = db.query(Question).filter(Question.id == link.question_id).first() if link.question_id else None
+        item = db.query(AssessmentQuestionItem).filter(
+            AssessmentQuestionItem.id == link.assessment_item_id
+        ).first() if link.assessment_item_id else None
+        topic_key = str(question.topic_id) if question and question.topic_id else None
+        if item and item.topic:
+            topic = db.query(Topic).filter(func.lower(Topic.name) == item.topic.lower()).first()
+            topic_key = str(topic.id) if topic else None
+        question_topics[link.question_id or link.assessment_item_id] = topic_key
+        if topic_key:
+            topic_totals.setdefault(topic_key, 0.0)
+            topic_counts[topic_key] = topic_counts.get(topic_key, 0) + 1
 
     db.query(TopicScore).filter(TopicScore.attempt_id == attempt_id).delete(synchronize_session='fetch')
 
@@ -177,25 +192,7 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
         if not question and not item:
             continue
 
-        # determine topic grouping key and ensure we only create TopicScore for resolvable Topic IDs
-        topic_key = None
-        if question:
-            topic_key = str(question.topic_id) if question.topic_id else None
-        else:
-            # try to resolve item.topic to an existing Topic id by name
-            if item and item.topic:
-                try:
-                    # if it's a UUID string, use it
-                    _ = UUID(str(item.topic))
-                    topic_key = str(item.topic)
-                except Exception:
-                    t_obj = db.query(Topic).filter(func.lower(Topic.name) == str(item.topic).lower()).first()
-                    topic_key = str(t_obj.id) if t_obj else None
-
-        if topic_key:
-            topic_totals.setdefault(topic_key, 0.0)
-            topic_counts.setdefault(topic_key, 0)
-            topic_counts[topic_key] += 1
+        topic_key = question_topics.get(ans.question_id or ans.assessment_item_id)
 
         # Evaluate depending on type
         if question:

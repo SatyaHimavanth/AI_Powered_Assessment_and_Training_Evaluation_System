@@ -1,6 +1,7 @@
 """Durable practice-test generation queue consumed by the dedicated worker."""
 
 import logging
+import json
 import time
 from datetime import datetime, timezone
 from uuid import UUID
@@ -9,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from db.database import SessionLocal, engine
-from db.models import PracticeTest, PracticeTestStatus
+from db.models import PracticeQuestion, PracticeTest, PracticeTestStatus
 
 logger = logging.getLogger(__name__)
 PRACTICE_GENERATION_WORKER_LOCK_ID = 731204893
@@ -49,13 +50,52 @@ def _claim_next_practice_test(db: Session) -> UUID | None:
 
 
 def _generate_claimed_practice_test(test_id: UUID) -> None:
-    """Run the existing validated generator for a durably claimed test."""
-    # Keep provider/prompt validation in the API module until it is extracted
-    # into the shared domain service. This import is delayed to avoid loading
-    # the API router while the queue module is imported by worker startup.
-    from api.routers_practice import _generate_questions_background
+    """Generate outside the DB transaction, then atomically persist validated questions."""
+    from app.llms import get_chat_model
+    from api.routers_practice import GENERATION_PROMPT, _validate_generated_questions
 
-    _generate_questions_background(test_id)
+    with SessionLocal() as db:
+        test = db.get(PracticeTest, test_id)
+        if test is None or test.status != PracticeTestStatus.generating:
+            return
+        requested_count = test.question_count
+        context = {
+            "job_title": test.job_title,
+            "job_description": test.job_description,
+            "topics": test.topics,
+            "difficulty": test.difficulty,
+            "resume_text": test.resume_text,
+        }
+
+    response = get_chat_model().invoke(GENERATION_PROMPT.format(
+        question_count=requested_count,
+        context_json=json.dumps(context, ensure_ascii=True),
+    ))
+    questions = _validate_generated_questions(json.loads(response.content), requested_count)
+
+    with SessionLocal() as db:
+        test = db.query(PracticeTest).filter(PracticeTest.id == test_id).with_for_update().first()
+        if test is None or test.status != PracticeTestStatus.generating:
+            return
+        if db.query(PracticeQuestion.id).filter(PracticeQuestion.practice_test_id == test_id).first():
+            raise RuntimeError("Generating practice test already has persisted questions")
+        for position, question in enumerate(questions, start=1):
+            db.add(PracticeQuestion(
+                practice_test_id=test_id,
+                position=position,
+                type=question["type"],
+                question=question["question"],
+                options=json.dumps(question["options"]) if question["options"] is not None else None,
+                correct_answer=(
+                    json.dumps(question["correct_answer"])
+                    if isinstance(question["correct_answer"], list) else question["correct_answer"]
+                ),
+                topic=question["topic"],
+            ))
+        test.status = PracticeTestStatus.ready
+        test.generation_claimed_at = None
+        test.error_message = None
+        db.commit()
 
 
 def process_practice_generation_queue(poll_interval: int = 5) -> None:
@@ -97,8 +137,14 @@ def process_practice_generation_queue(poll_interval: int = 5) -> None:
 
             try:
                 _generate_claimed_practice_test(test_id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Practice test generation failed for %s", test_id)
+                with SessionLocal() as db:
+                    test = db.query(PracticeTest).filter(PracticeTest.id == test_id).with_for_update().first()
+                    if test is not None and test.status == PracticeTestStatus.generating:
+                        test.status = PracticeTestStatus.failed
+                        test.error_message = f"Practice generation failed ({type(exc).__name__}). Retry generation."
+                        db.commit()
             finally:
                 with SessionLocal() as db:
                     test = db.query(PracticeTest).filter(PracticeTest.id == test_id).first()

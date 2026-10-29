@@ -15,6 +15,7 @@ from core.uploads import read_upload_limited
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
 from db.models import (
+    AssessmentQuestion,
     Difficulty,
     Question,
     QuestionOption,
@@ -792,9 +793,33 @@ async def update_question(
     def _sync_work():
         db = SessionLocal()
         try:
-            q = db.query(Question).filter(Question.id == question_id).first()
+            q = db.query(Question).filter(Question.id == question_id).with_for_update().first()
             if not q or getattr(q, "is_archived", False):
                 raise HTTPException(status_code=404, detail="Question not found")
+
+            if db.query(AssessmentQuestion.id).filter(AssessmentQuestion.question_id == q.id).first():
+                original = q
+                q = Question(
+                    topic_id=original.topic_id,
+                    type=original.type,
+                    difficulty=original.difficulty,
+                    question=original.question,
+                    reference_answer=original.reference_answer,
+                    default_code=original.default_code,
+                )
+                db.add(q)
+                db.flush()
+                for option in original.options:
+                    db.add(QuestionOption(
+                        question_id=q.id, option_text=option.option_text, is_correct=option.is_correct
+                    ))
+                for test_case in original.test_cases:
+                    db.add(TestCase(
+                        question_id=q.id, input_data=test_case.input_data,
+                        expected_output=test_case.expected_output, is_sample=test_case.is_sample,
+                    ))
+                db.flush()
+                original.is_archived = True
 
             # Validate and apply scalar fields
             if pdata.get("type") is not None:
@@ -829,6 +854,8 @@ async def update_question(
                         raise HTTPException(status_code=400, detail="MCQ must have at least one option")
                     if not any(o.get("is_correct") for o in opts):
                         raise HTTPException(status_code=400, detail="At least one option must be marked correct")
+                    if q.type == QuestionType.single_mcq and sum(bool(o.get("is_correct")) for o in opts) != 1:
+                        raise HTTPException(status_code=400, detail="Single MCQ requires exactly one correct option")
                     # Remove existing
                     db.query(QuestionOption).filter(QuestionOption.question_id == q.id).delete(synchronize_session='fetch')
                     for opt in opts:
@@ -843,7 +870,7 @@ async def update_question(
                     tcs = pdata.get("test_cases") or []
                     # Basic validation
                     for tc in tcs:
-                        if not tc.get("input") or not tc.get("expected_output"):
+                        if tc.get("input") is None or tc.get("expected_output") is None:
                             raise HTTPException(status_code=400, detail="Test cases must include input and expected_output")
                     # Delete existing and add new
                     db.query(TestCase).filter(TestCase.question_id == q.id).delete(synchronize_session='fetch')

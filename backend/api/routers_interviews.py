@@ -47,7 +47,7 @@ def _mark_interview_expired(session: InterviewSession, now: datetime | None = No
         InterviewSessionStatus.missed,
         InterviewSessionStatus.abandoned,
     ):
-        session.status = InterviewSessionStatus.missed
+        session.status = InterviewSessionStatus.completed
         session.completed_at = current
     return True
 
@@ -139,6 +139,7 @@ class InterviewAccessRequestOut(BaseModel):
     username: str
     status: str
     request_type: str
+    used: bool = False
     reason: str | None
     requested_at: datetime
     reviewed_at: datetime | None
@@ -1151,17 +1152,39 @@ async def request_retry(
     def _sync_work():
         db = SessionLocal()
         try:
+            db.query(User).filter(User.id == current_user.id).with_for_update().first()
+            if db.query(InterviewSession.id).filter(
+                InterviewSession.user_id == current_user.id,
+                InterviewSession.template_id == payload.template_id,
+                InterviewSession.status.in_(_active_statuses()),
+            ).first():
+                raise HTTPException(status_code=409, detail="Finish or resume your active interview before requesting a retry")
             completed_exists = (
                 db.query(InterviewSession)
                 .filter(
                     InterviewSession.user_id == current_user.id,
                     InterviewSession.template_id == payload.template_id,
-                    InterviewSession.status == InterviewSessionStatus.completed,
+                    InterviewSession.status.in_([
+                        InterviewSessionStatus.completed, InterviewSessionStatus.missed,
+                        InterviewSessionStatus.abandoned,
+                    ]),
                 )
                 .first()
             )
             if not completed_exists:
-                raise HTTPException(status_code=400, detail="Retry is allowed only after a completed attempt")
+                raise HTTPException(status_code=400, detail="Retry is allowed only after a closed attempt")
+
+            unused_approval = db.query(InterviewAccessRequest.id).filter(
+                InterviewAccessRequest.user_id == current_user.id,
+                InterviewAccessRequest.template_id == payload.template_id,
+                InterviewAccessRequest.status == InterviewAccessStatus.approved,
+                (InterviewAccessRequest.expires_at.is_(None)) | (InterviewAccessRequest.expires_at > datetime.now(timezone.utc)),
+                ~db.query(InterviewSession.id).filter(
+                    InterviewSession.access_request_id == InterviewAccessRequest.id
+                ).exists(),
+            ).first()
+            if unused_approval:
+                raise HTTPException(status_code=409, detail="You already have approved access for another attempt")
 
             existing_pending_retry = (
                 db.query(InterviewAccessRequest)
@@ -1235,6 +1258,11 @@ async def my_requests(
                 .order_by(InterviewAccessRequest.requested_at.desc())
                 .all()
             )
+            used_request_ids = {
+                row.access_request_id
+                for row in db.query(InterviewSession.access_request_id)
+                .filter(InterviewSession.user_id == current_user.id).all()
+            }
             out = []
             for req, user, template in rows:
                 out.append(
@@ -1247,6 +1275,7 @@ async def my_requests(
                         "username": user.username,
                         "status": req.status.value,
                         "request_type": req.request_type.value,
+                        "used": req.id in used_request_ids,
                         "reason": req.reason,
                         "requested_at": req.requested_at,
                         "reviewed_at": req.reviewed_at,
@@ -1305,11 +1334,12 @@ async def start_interview(
     def _sync_work():
         db = SessionLocal()
         try:
+            db.query(User).filter(User.id == current_user.id).with_for_update().first()
             template = db.query(InterviewTemplate).filter(InterviewTemplate.id == payload.template_id).first()
             if not template:
                 raise HTTPException(status_code=404, detail="Template not found")
-            if template.is_archived:
-                raise HTTPException(status_code=400, detail="Template is archived")
+            if template.is_archived or not template.is_active:
+                raise HTTPException(status_code=400, detail="Template is not available")
 
             active_session = (
                 db.query(InterviewSession)
@@ -1325,50 +1355,22 @@ async def start_interview(
                     raise HTTPException(status_code=400, detail="You have a paused interview. Resume it instead.")
                 raise HTTPException(status_code=400, detail="You already have an active interview for this template")
 
-            # Check if user has any missed interviews for this template
-            missed_session = (
-                db.query(InterviewSession)
-                .filter(
-                    InterviewSession.user_id == current_user.id,
-                    InterviewSession.template_id == payload.template_id,
-                    InterviewSession.status == InterviewSessionStatus.missed,
-                )
-                .first()
-            )
-            if missed_session:
-                raise HTTPException(
-                    status_code=403,
-                    detail="You have a missed interview for this template. Please request a retry or contact admin."
-                )
-
-            # Check if user has already completed an interview for this template
-            completed_session = (
-                db.query(InterviewSession)
-                .filter(
-                    InterviewSession.user_id == current_user.id,
-                    InterviewSession.template_id == payload.template_id,
-                    InterviewSession.status == InterviewSessionStatus.completed,
-                )
-                .first()
-            )
-            if completed_session:
-                raise HTTPException(
-                    status_code=403,
-                    detail="You have already completed this interview. Request a retry if you need another attempt."
-                )
-
             approved = (
                 db.query(InterviewAccessRequest)
                 .filter(
                     InterviewAccessRequest.user_id == current_user.id,
                     InterviewAccessRequest.template_id == payload.template_id,
                     InterviewAccessRequest.status == InterviewAccessStatus.approved,
+                    ~db.query(InterviewSession.id).filter(
+                        InterviewSession.access_request_id == InterviewAccessRequest.id
+                    ).exists(),
+                    (InterviewAccessRequest.expires_at.is_(None)) | (InterviewAccessRequest.expires_at > datetime.now(timezone.utc)),
                 )
                 .order_by(InterviewAccessRequest.requested_at.desc())
                 .first()
             )
             if not approved:
-                raise HTTPException(status_code=403, detail="Interview access not approved")
+                raise HTTPException(status_code=403, detail="No unused interview approval. Request access or a retry.")
             if approved.expires_at and as_utc_aware(approved.expires_at) < datetime.now(timezone.utc):
                 approved.status = InterviewAccessStatus.expired
                 db.commit()
@@ -1418,6 +1420,7 @@ async def start_interview(
                     "timestamp": to_utc_iso(datetime.now(timezone.utc)),
                 }
             ]
+            session.started_at = datetime.now(timezone.utc)
             db.commit()
 
             return {
@@ -1557,7 +1560,7 @@ async def interview_message(
             )
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
-            if session.status != InterviewSessionStatus.in_progress:
+            if session.status not in {InterviewSessionStatus.in_progress, InterviewSessionStatus.completed}:
                 raise HTTPException(status_code=409, detail="Session is no longer accepting responses")
 
             transcript = list(session.transcript or [])
@@ -1757,6 +1760,8 @@ async def resume_interview(
             if _mark_interview_expired(session):
                 db.commit()
                 raise HTTPException(status_code=409, detail="Interview duration has expired")
+            if session.status == InterviewSessionStatus.in_progress:
+                return {"message": "Interview already resumed"}
             if session.status != InterviewSessionStatus.paused:
                 raise HTTPException(status_code=400, detail="Only paused sessions can be resumed")
             if session.pause_count > int(session.max_pauses_allowed_snapshot or 3):
@@ -1792,15 +1797,13 @@ async def end_interview(
             session = (
                 db.query(InterviewSession)
                 .filter(InterviewSession.id == session_id, InterviewSession.user_id == current_user.id)
+                .with_for_update()
                 .first()
             )
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
-            if _mark_interview_expired(session):
-                db.commit()
-                raise HTTPException(status_code=409, detail="Interview duration has expired")
             if session.status in [InterviewSessionStatus.completed, InterviewSessionStatus.missed, InterviewSessionStatus.abandoned]:
-                raise HTTPException(status_code=400, detail="Session already closed")
+                return {"message": "Interview already closed"}
 
             session.status = InterviewSessionStatus.completed
             session.completed_at = datetime.now(timezone.utc)

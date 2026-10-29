@@ -179,6 +179,8 @@ async def create_assessment(
     """
     if not body.title.strip():
         raise HTTPException(status_code=400, detail="Assessment title is required")
+    if body.duration < 1:
+        raise HTTPException(status_code=400, detail="Assessment duration must be positive")
     if not body.topics:
         raise HTTPException(status_code=400, detail="At least one topic configuration is required")
     if body.batch_ids and body.user_ids:
@@ -297,16 +299,16 @@ async def create_assessment(
             selected_question_ids: set[UUID] = set()
             next_question_position = 0
 
-            for tc, topic, q_type, diff, section_name in validated_configs:
-                at = AssessmentTopic(
+            for (topic_id, q_type, diff), requested_total in grouped_requested.items():
+                db.add(AssessmentTopic(
                     assessment_id=assessment.id,
-                    topic_id=tc.topic_id,
+                    topic_id=topic_id,
                     question_type=q_type,
                     difficulty=diff,
-                    question_count=tc.question_count,
-                )
-                db.add(at)
+                    question_count=requested_total,
+                ))
 
+            for tc, topic, q_type, diff, section_name in validated_configs:
                 matching_questions = (
                     db.query(Question)
                     .filter(
@@ -317,6 +319,7 @@ async def create_assessment(
                         Question.id.notin_(list(selected_question_ids)) if selected_question_ids else True,
                     )
                     .order_by(func.random())
+                    .with_for_update()
                     .limit(tc.question_count)
                     .all()
                 )
@@ -1177,10 +1180,8 @@ def _calculate_topic_performance(
                     .filter(Answer.attempt_id == attempt.id, Answer.assessment_item_id == item.id)
                     .first()
                 )
-                if not ans:
-                    continue
                 topic_stats[topic_name]["total"] += 1
-                if ans.score is not None:
+                if ans and ans.score is not None:
                     topic_stats[topic_name]["correct"] += float(ans.score)
         else:
             question = db.query(Question).filter(Question.id == aq.question_id).first()
@@ -1199,15 +1200,13 @@ def _calculate_topic_performance(
                     .filter(Answer.attempt_id == attempt.id, Answer.question_id == question.id)
                     .first()
                 )
-                if not ans:
-                    continue
                 topic_stats[topic_name]["total"] += 1
-                if ans.score is not None:
+                if ans and ans.score is not None:
                     topic_stats[topic_name]["correct"] += float(ans.score)
 
     result = []
     for name, stats in topic_stats.items():
-        pct = round((stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
+        pct = round(max(0.0, stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
         result.append(TopicPerformance(
             topic_name=name,
             total_questions=stats["total"],

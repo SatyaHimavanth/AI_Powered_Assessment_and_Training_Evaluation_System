@@ -1,8 +1,11 @@
 from uuid import UUID
+import logging
 from typing import Any
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from api.timezone_helper import to_utc_iso
+
+logger = logging.getLogger(__name__)
 
 
 def classify_answer_status(answer_text: str | None, score: float | None) -> str:
@@ -31,6 +34,15 @@ def require_completed_attempt(attempt) -> None:
 
     if attempt.status != AttemptStatus.completed:
         raise HTTPException(status_code=409, detail="Results are available after submission")
+
+
+def evaluated_topic_percentages(db: Session, attempt) -> dict[str, float]:
+    if attempt.score is None:
+        return {}
+    return {
+        topic["topic_name"]: topic["percentage"]
+        for topic in build_attempt_results(db, attempt)["topic_scores"]
+    }
 
 
 def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
@@ -174,14 +186,16 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                 if q.type in (QuestionType.single_mcq, QuestionType.multi_mcq):
                     selected_ids = [s for s in user_ans.answer.split(",") if s]
                     if selected_ids:
-                        selected_opts = db.query(QuestionOption).filter(QuestionOption.id.in_(selected_ids)).all()
-                        if not selected_opts:
-                            try:
-                                uuid_ids = [UUID(s) for s in selected_ids]
-                                selected_opts = db.query(QuestionOption).filter(QuestionOption.id.in_(uuid_ids)).all()
-                            except Exception:
-                                pass
-                        user_answer_text = ", ".join(o.option_text for o in selected_opts)
+                        try:
+                            uuid_ids = [UUID(s) for s in selected_ids]
+                        except ValueError:
+                            logger.warning("Invalid option selection in attempt %s, question %s", attempt.id, q.id)
+                            user_answer_text = "Invalid option selection"
+                        else:
+                            selected_opts = db.query(QuestionOption).filter(
+                                QuestionOption.id.in_(uuid_ids), QuestionOption.question_id == q.id
+                            ).all()
+                            user_answer_text = ", ".join(o.option_text for o in selected_opts) or "Unknown option selection"
                     else:
                         user_answer_text = ""
                     is_correct = (user_ans.score or 0) >= 0.999 if user_ans.score is not None else False
@@ -216,7 +230,7 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
 
     topic_scores: list[dict[str, Any]] = []
     for name, stats in topic_stats.items():
-        pct = round((stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
+        pct = round(max(0.0, stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
         topic_scores.append({"topic_name": name, "total": stats["total"], "correct": stats["correct"], "percentage": pct})
 
     status = ("evaluating" if evaluation_pending and attempt.status == AttemptStatus.completed else (attempt.status.value if attempt.status else "unknown"))

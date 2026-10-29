@@ -37,7 +37,7 @@ def test_interview_expires_after_active_time_budget():
     )
 
     assert _mark_interview_expired(session, now)
-    assert session.status == InterviewSessionStatus.missed
+    assert session.status == InterviewSessionStatus.completed
     assert session.completed_at == now
     assert _interview_remaining_seconds(session, now) == 0
 

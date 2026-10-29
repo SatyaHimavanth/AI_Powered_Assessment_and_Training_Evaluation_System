@@ -12,11 +12,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.auth import get_password_hash, require_admin
+from core.logger import get_logger
 from core.uploads import read_upload_limited
 from db.database import SessionLocal
 from db.async_helpers import run_db_sync
 from api.timezone_helper import as_utc_aware, parse_to_utc_aware, to_utc_iso
-from api.results_helpers import answer_score_label, classify_answer_status
+from api.results_helpers import answer_score_label, classify_answer_status, evaluated_topic_percentages, build_attempt_results
 from db.models import (
     Batch,
     BatchUser,
@@ -59,6 +60,7 @@ import re
 import os
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+logger = get_logger(__name__)
 
 
 def _validate_retest_state(attempt, evaluation_job, has_unevaluated_answers: bool) -> None:
@@ -524,35 +526,7 @@ async def get_attempt_topic_scores(
             if not assessment:
                 raise HTTPException(status_code=404, detail="Assessment not found")
 
-            answers = db.query(Answer).filter(Answer.attempt_id == attempt_id).all()
-
-            topic_stats: dict[str, dict] = {}
-            for answer in answers:
-                q = None
-                item = None
-                if getattr(answer, "question_id", None):
-                    q = db.query(Question).filter(Question.id == answer.question_id).first()
-                elif getattr(answer, "assessment_item_id", None):
-                    item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == answer.assessment_item_id).first()
-
-                if q:
-                    topic_name = q.topic.name if q.topic else "General"
-                elif item:
-                    topic_name = item.topic or "General"
-                else:
-                    continue
-
-                if topic_name not in topic_stats:
-                    topic_stats[topic_name] = {"total": 0, "correct": 0.0}
-
-                topic_stats[topic_name]["total"] += 1
-                earned_score = float(answer.score or 0) if answer.score is not None else 0.0
-                topic_stats[topic_name]["correct"] += earned_score
-
-            topic_scores: List[dict] = []
-            for name, stats in topic_stats.items():
-                pct = round((stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
-                topic_scores.append({"topic_name": name, "total": stats["total"], "correct": stats["correct"], "percentage": pct})
+            topic_scores = build_attempt_results(db, attempt)["topic_scores"]
 
             return {
                 "assessment_title": assessment.title,
@@ -732,13 +706,17 @@ async def get_attempt_results(
                     is_correct = False
                     if user_ans and user_ans.answer:
                         if q.type in (QuestionType.single_mcq, QuestionType.multi_mcq):
-                            selected_ids = user_ans.answer.split(",")
+                            try:
+                                selected_ids = [UUID(value) for value in user_ans.answer.split(",") if value]
+                            except ValueError:
+                                logger.warning("Invalid option selection in attempt %s, question %s", attempt.id, q.id)
+                                selected_ids = []
                             selected_opts = (
                                 db.query(QuestionOption)
-                                .filter(QuestionOption.id.in_(selected_ids))
+                                .filter(QuestionOption.id.in_(selected_ids), QuestionOption.question_id == q.id)
                                 .all()
                             )
-                            user_answer_text = ", ".join(o.option_text for o in selected_opts)
+                            user_answer_text = ", ".join(o.option_text for o in selected_opts) or "Unknown option selection"
                             is_correct = (user_ans.score or 0) >= 0.999 if user_ans.score is not None else False
                         else:
                             user_answer_text = user_ans.answer
@@ -771,7 +749,7 @@ async def get_attempt_results(
 
             topic_scores: List[dict] = []
             for name, stats in topic_stats.items():
-                pct = round((stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
+                pct = round(max(0.0, stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
                 topic_scores.append({"topic_name": name, "total": stats["total"], "correct": stats["correct"], "percentage": pct})
 
             return {
@@ -939,30 +917,7 @@ async def get_user_performance(
 
             topic_stats: dict[str, dict] = {}
             for attempt in attempts:
-                answers = db.query(Answer).filter(Answer.attempt_id == attempt.id).all()
-                per_attempt_topic_scores: dict[str, list[float]] = {}
-
-                for answer in answers:
-                    q = None
-                    item = None
-                    if getattr(answer, "question_id", None):
-                        q = db.query(Question).filter(Question.id == answer.question_id).first()
-                    elif getattr(answer, "assessment_item_id", None):
-                        item = db.query(AssessmentQuestionItem).filter(AssessmentQuestionItem.id == answer.assessment_item_id).first()
-                    if not q and not item:
-                        continue
-
-                    topic_name = q.topic.name if q and q.topic else (item.topic or "General")
-
-                    if answer.score is None:
-                        continue
-
-                    per_attempt_topic_scores.setdefault(topic_name, []).append(float(answer.score or 0.0))
-
-                for topic_name, scores in per_attempt_topic_scores.items():
-                    if not scores:
-                        continue
-                    attempt_pct = (sum(scores) / len(scores)) * 100
+                for topic_name, attempt_pct in evaluated_topic_percentages(db, attempt).items():
                     if topic_name not in topic_stats:
                         topic_stats[topic_name] = {"scores": [], "attempts": 0}
                     topic_stats[topic_name]["scores"].append(attempt_pct)
@@ -1622,6 +1577,55 @@ async def list_users(
 # ---------- Excel Import Endpoints ---------- #
 
 
+def _import_correct_answers(raw: str | list | None, labelled_options: dict[str, str]) -> list[str]:
+    if not raw:
+        return []
+    options = list(labelled_options.values())
+    if isinstance(raw, list):
+        tokens = [str(value).strip() for value in raw]
+    else:
+        value = raw.strip()
+        if any(value.casefold() == option.casefold() for option in options):
+            tokens = [value]
+        elif re.fullmatch(r"[A-Da-d\s|,;]+", value):
+            tokens = re.split(r"[|,;\s]+", value)
+        else:
+            tokens = re.split(r"[|,;]+", value)
+    correct = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if token.upper() in labelled_options:
+            matching = list(labelled_options).index(token.upper())
+        else:
+            matching = next((i for i, option in enumerate(options) if option.casefold() == token.casefold()), None)
+        if matching is None:
+            raise ValueError(f"Answer key {token!r} does not match an option")
+        letter = chr(ord("A") + matching)
+        if letter not in correct:
+            correct.append(letter)
+    return correct
+
+
+def _import_question_errors(question_type: str, difficulty: str, options: list, correct: list) -> list[str]:
+    errors = []
+    if question_type == "coding":
+        errors.append("Coding questions require templates and test cases; use the question-bank upload instead")
+    elif question_type not in {"single_mcq", "multi_mcq", "text"}:
+        errors.append(f"Unsupported question type: {question_type}")
+    if difficulty not in {"easy", "medium", "hard"}:
+        errors.append(f"Invalid difficulty: {difficulty}")
+    if question_type in {"single_mcq", "multi_mcq"}:
+        if len(options) < 2:
+            errors.append("MCQ questions require at least two options")
+        if len({str(option).strip().casefold() for option in options}) != len(options):
+            errors.append("MCQ options must be distinct")
+        if not correct or (question_type == "single_mcq" and len(correct) != 1):
+            errors.append("MCQ requires an answer key (exactly one answer for single_mcq)")
+    return errors
+
+
 @router.post("/assessments/import")
 async def import_assessment_excel(
     file: UploadFile = File(...),
@@ -1664,6 +1668,7 @@ async def import_assessment_excel(
 
             sections = []
             total_q = 0
+            errors = []
 
             for ws in wb.worksheets:
                 rows = list(ws.iter_rows(values_only=True))
@@ -1724,12 +1729,13 @@ async def import_assessment_excel(
                     correct = _get(correct_idx)
                     reference = _get(reference_idx)
 
-                    opts: list[str] = []
+                    labelled_options: dict[str, str] = {}
                     for letter in ["a", "b", "c", "d"]:
                         if letter in option_map:
                             oi = option_map[letter]
                             if oi < len(row) and row[oi] is not None and str(row[oi]).strip() != "":
-                                opts.append(str(row[oi]))
+                                labelled_options[letter.upper()] = str(row[oi]).strip()
+                    opts = list(labelled_options.values())
 
                     if not qtext or str(qtext).strip() == "":
                         continue
@@ -1750,18 +1756,19 @@ async def import_assessment_excel(
                     else:
                         qtype_val = None
 
-                    correct_list = None
-                    if correct is not None and str(correct).strip() != "":
-                        raw = str(correct).strip()
-                        parts = [p for p in re.split(r"[|,;\\s]+", raw) if p]
-                        parsed: list[str] = []
-                        for p in parts:
-                            pstr = p.strip()
-                            if len(pstr) == 1 and pstr.isalpha():
-                                parsed.append(pstr.upper())
-                            else:
-                                parsed.append(pstr)
-                        correct_list = parsed
+                    qtype_val = qtype_val or "text"
+                    difficulty = str(diff).strip().lower() if diff is not None else "medium"
+                    correct_list = []
+                    row_errors = []
+                    if qtype_val in {"single_mcq", "multi_mcq"}:
+                        try:
+                            correct_list = _import_correct_answers(
+                                str(correct) if correct is not None else None, labelled_options
+                            )
+                        except ValueError as exc:
+                            row_errors.append(str(exc))
+                    row_errors.extend(_import_question_errors(qtype_val, difficulty, opts, correct_list))
+                    errors.extend(f"{ws.title} row {rnum}: {error}" for error in row_errors)
 
                     iq = ImportedQuestion(
                         imported_assessment_id=imp.id,
@@ -1772,24 +1779,25 @@ async def import_assessment_excel(
                         options=opts or None,
                         correct_answers=(correct_list if correct_list is not None else None),
                         topic=str(topic) if topic is not None else None,
-                        difficulty=str(diff) if diff is not None else None,
+                        difficulty=difficulty,
                         row_index=rnum,
-                        validated=True,
-                        errors=None,
+                        validated=not row_errors,
+                        errors=row_errors or None,
                     )
                     db.add(iq)
-                    section_count += 1
-                    total_q += 1
+                    if not row_errors:
+                        section_count += 1
+                        total_q += 1
 
                 sections.append({"name": ws.title, "count": section_count})
 
             preview = {"sections": sections, "total_questions": total_q}
             imp.preview = preview
-            imp.meta = {"errors_count": 0}
+            imp.meta = {"errors_count": len(errors)}
             imp.status = ImportStatus.uploaded
             db.commit()
 
-            return {"import_id": str(imp.id), "preview": preview, "errors": []}
+            return {"import_id": str(imp.id), "preview": preview, "errors": errors}
         finally:
             db.close()
 
@@ -1822,6 +1830,8 @@ async def create_assessment_from_import(
     def _sync_work():
         db = SessionLocal()
         try:
+            if not body.title.strip() or body.duration < 1:
+                raise HTTPException(status_code=400, detail="A title and positive duration are required")
             if body.batch_ids and body.user_ids:
                 raise HTTPException(
                     status_code=400,
@@ -1831,7 +1841,11 @@ async def create_assessment_from_import(
             if not imp:
                 raise HTTPException(status_code=404, detail="Import not found")
 
-            imported_qs = db.query(ImportedQuestion).filter(ImportedQuestion.imported_assessment_id == imp.id).all()
+            imported_qs = (
+                db.query(ImportedQuestion)
+                .filter(ImportedQuestion.imported_assessment_id == imp.id)
+                .all()
+            )
             validated = [q for q in imported_qs if q.validated]
             if not validated:
                 raise HTTPException(status_code=400, detail="No valid questions in import to create assessment")
@@ -1893,6 +1907,22 @@ async def create_assessment_from_import(
             topic_agg: dict[tuple[str, str, str], int] = {}
 
             for question_position, iq in enumerate(validated):
+                qtype_value = iq.question_type or "text"
+                difficulty_value = (iq.difficulty or "medium").strip().lower()
+                correct_list = []
+                if qtype_value in {"single_mcq", "multi_mcq"}:
+                    try:
+                        correct_list = _import_correct_answers(
+                            iq.correct_answers,
+                            {chr(ord("A") + i): str(option) for i, option in enumerate(iq.options or [])},
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=f"Row {iq.row_index}: {exc}") from exc
+                validation_errors = _import_question_errors(
+                    qtype_value, difficulty_value, iq.options or [], correct_list
+                )
+                if validation_errors:
+                    raise HTTPException(status_code=400, detail=f"Row {iq.row_index}: {'; '.join(validation_errors)}")
                 # map or create topic by name
                 topic_obj = None
                 if iq.topic:
@@ -1901,22 +1931,12 @@ async def create_assessment_from_import(
                         # if a matching global Topic exists, link to it; do NOT create new global topics for imports
                         topic_obj = db.query(Topic).filter(func.lower(Topic.name) == topic_name.lower()).first()
 
-                q_type = None
-                try:
-                    q_type = QuestionType(iq.question_type) if iq.question_type else QuestionType.text
-                except Exception:
-                    q_type = QuestionType.text
-
-                diff = None
-                try:
-                    diff = Difficulty(iq.difficulty) if iq.difficulty else Difficulty.medium
-                except Exception:
-                    diff = Difficulty.medium
+                q_type = QuestionType(qtype_value)
+                diff = Difficulty(difficulty_value)
 
                 # create a per-assessment question item (do NOT write to global Question/QuestionOption)
                 item_options = None
                 if iq.options:
-                    correct_list = iq.correct_answers or []
                     letter_set = {str(c).strip().upper() for c in correct_list if isinstance(c, str) and len(str(c).strip()) == 1 and str(c).strip().isalpha()}
                     text_set = {str(c).strip().lower() for c in correct_list if not (isinstance(c, str) and len(str(c).strip()) == 1 and str(c).strip().isalpha())}
                     item_options = []
@@ -1936,7 +1956,7 @@ async def create_assessment_from_import(
                     question_text=iq.question_text,
                     reference_answer=(iq.reference_answer if getattr(iq, "reference_answer", None) else None),
                     options=(item_options if item_options is not None else None),
-                    correct_answers=(iq.correct_answers if getattr(iq, "correct_answers", None) else None),
+                    correct_answers=correct_list or None,
                     topic=(topic_obj.name if topic_obj else (iq.topic.strip() if iq.topic else None)),
                     difficulty=(diff.value if diff else None),
                     default_code=None,
@@ -1964,13 +1984,9 @@ async def create_assessment_from_import(
             # create AssessmentTopic records
             for k, cnt in topic_agg.items():
                 topic_id_str, qtype_str, diff_str = k
-                if topic_id_str:
-                    try:
-                        tid = UUID(topic_id_str)
-                    except Exception:
-                        tid = None
-                else:
-                    tid = None
+                if not topic_id_str:
+                    continue
+                tid = UUID(topic_id_str)
                 at = AssessmentTopic(
                     assessment_id=assessment.id,
                     topic_id=tid,
