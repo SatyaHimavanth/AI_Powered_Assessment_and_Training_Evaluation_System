@@ -25,6 +25,7 @@ from db.models import (
     QuestionType,
     StagedQuestion,
     StagedQuestionStatus,
+    Topic,
     User,
 )
 from api.timezone_helper import to_utc_iso
@@ -54,6 +55,13 @@ class BatchResponse(BaseModel):
     total_approved: int
     total_rejected: int
     requested_count: int
+    topic_id: Optional[UUID] = None
+    topic_name: str
+    question_type: str
+    difficulty: str
+    error_message: Optional[str] = None
+    can_retry: bool = False
+    retry_blocked_reason: Optional[str] = None
     active_saved_count: int = 0
     archived_saved_count: int = 0
     created_at: str
@@ -209,6 +217,12 @@ def _saved_question_counts(db, batch: QuestionGenerationBatch) -> tuple[int, int
 
 def _batch_response(db, batch: QuestionGenerationBatch) -> dict:
     active_saved_count, archived_saved_count = _saved_question_counts(db, batch)
+    topic = db.get(Topic, batch.topic_id) if batch.topic_id else None
+    has_approved = db.execute(select(StagedQuestion.id).where(
+        StagedQuestion.batch_id == batch.id,
+        StagedQuestion.status == StagedQuestionStatus.approved,
+    ).limit(1)).first() is not None
+    blocked_reason = _retry_blocked_reason(batch, has_approved)
     return {
         "id": batch.id,
         "status": batch.status.value,
@@ -217,11 +231,52 @@ def _batch_response(db, batch: QuestionGenerationBatch) -> dict:
         "total_approved": batch.total_approved,
         "total_rejected": batch.total_rejected,
         "requested_count": batch.requested_count,
+        "topic_id": batch.topic_id,
+        "topic_name": (topic.name if topic else None) or "General",
+        "question_type": batch.question_type.value if batch.question_type else "text",
+        "difficulty": batch.difficulty.value if batch.difficulty else "medium",
+        "error_message": batch.error_message,
+        "can_retry": batch.status == GenerationBatchStatus.failed and blocked_reason is None,
+        "retry_blocked_reason": blocked_reason if batch.status == GenerationBatchStatus.failed else None,
         "active_saved_count": active_saved_count,
         "archived_saved_count": archived_saved_count,
         "created_at": to_utc_iso(batch.created_at),
         "completed_at": to_utc_iso(batch.completed_at),
     }
+
+
+def _retry_blocked_reason(batch: QuestionGenerationBatch, has_approved: bool) -> str | None:
+    if has_approved or (batch.total_approved or 0) > 0:
+        return "This batch has approved questions. Review or archive saved questions instead of regenerating them."
+    if not batch.source_text or not batch.source_text.strip():
+        return "The original source text is missing. Create a new batch with source material."
+    if not batch.requested_count or not 1 <= batch.requested_count <= 50:
+        return "The original question count is invalid. Create a new batch."
+    if batch.question_type and batch.question_type not in {
+        QuestionType.text, QuestionType.single_mcq, QuestionType.multi_mcq,
+    }:
+        return "This question type is not supported by generation. Create a new batch."
+    return None
+
+
+def _clear_batch_staging(db, staged_rows: list[StagedQuestion]) -> None:
+    staged_ids = [staged.id for staged in staged_rows]
+    if not staged_ids:
+        return
+    # Older installations may still link an embedding to both a bank and staged row.
+    # Preserve bank embeddings; only temporary staging embeddings are discarded.
+    embeddings = db.execute(select(QuestionEmbedding).where(
+        QuestionEmbedding.staged_question_id.in_(staged_ids)
+    ).with_for_update()).scalars().all()
+    for embedding in embeddings:
+        if embedding.question_id:
+            embedding.staged_question_id = None
+        else:
+            db.delete(embedding)
+    db.flush()
+    for staged in staged_rows:
+        db.delete(staged)
+    db.flush()
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -275,19 +330,7 @@ async def start_generation(
             db.add(batch)
             db.commit()
             db.refresh(batch)
-            return {
-                "id": batch.id,
-                "status": batch.status.value,
-                "filename": batch.filename,
-                "total_generated": batch.total_generated,
-                "total_approved": batch.total_approved,
-                "total_rejected": batch.total_rejected,
-                "requested_count": batch.requested_count,
-                "active_saved_count": 0,
-                "archived_saved_count": 0,
-                "created_at": to_utc_iso(batch.created_at),
-                "completed_at": to_utc_iso(batch.completed_at),
-            }
+            return _batch_response(db, batch)
         finally:
             db.close()
 
@@ -356,6 +399,64 @@ async def get_batch(
     if not result:
         raise HTTPException(404, "Batch not found")
     return result
+
+
+@router.post("/batches/{batch_id}/retry", response_model=BatchResponse)
+async def retry_failed_batch(batch_id: UUID, admin: User = Depends(require_admin)):
+    """Requeue an owned failed request without duplicating partial staged output."""
+    def _sync_work():
+        with SessionLocal() as db:
+            batch = db.execute(select(QuestionGenerationBatch).where(
+                QuestionGenerationBatch.id == batch_id,
+                QuestionGenerationBatch.admin_id == admin.id,
+            ).with_for_update()).scalar_one_or_none()
+            if not batch:
+                raise HTTPException(404, "Batch not found")
+            if batch.status != GenerationBatchStatus.failed:
+                raise HTTPException(409, "Only failed generation batches can be retried")
+            staged_rows = db.execute(select(StagedQuestion).where(
+                StagedQuestion.batch_id == batch_id
+            ).with_for_update()).scalars().all()
+            reason = _retry_blocked_reason(
+                batch, any(staged.status == StagedQuestionStatus.approved for staged in staged_rows)
+            )
+            if reason:
+                raise HTTPException(409, reason)
+            _clear_batch_staging(db, staged_rows)
+            batch.status = GenerationBatchStatus.pending
+            batch.error_message = None
+            batch.completed_at = None
+            batch.total_generated = 0
+            batch.total_approved = 0
+            batch.total_rejected = 0
+            db.commit()
+            return _batch_response(db, batch)
+
+    return await run_db_sync(_sync_work)
+
+
+@router.delete("/batches/{batch_id}")
+async def delete_failed_batch(batch_id: UUID, admin: User = Depends(require_admin)):
+    """Delete an owned failed batch and staging data, retaining all saved bank questions."""
+    def _sync_work():
+        with SessionLocal() as db:
+            batch = db.execute(select(QuestionGenerationBatch).where(
+                QuestionGenerationBatch.id == batch_id,
+                QuestionGenerationBatch.admin_id == admin.id,
+            ).with_for_update()).scalar_one_or_none()
+            if not batch:
+                raise HTTPException(404, "Batch not found")
+            if batch.status != GenerationBatchStatus.failed:
+                raise HTTPException(409, "Only failed generation batches can be deleted")
+            staged_rows = db.execute(select(StagedQuestion).where(
+                StagedQuestion.batch_id == batch_id
+            ).with_for_update()).scalars().all()
+            _clear_batch_staging(db, staged_rows)
+            db.delete(batch)
+            db.commit()
+            return {"message": "Failed generation batch deleted. Saved question-bank questions were not changed."}
+
+    return await run_db_sync(_sync_work)
 
 
 @router.post("/batches/{batch_id}/archive-questions", response_model=ArchiveGeneratedQuestionsResponse)

@@ -159,3 +159,27 @@ def test_blank_practice_text_answer_does_not_call_evaluator(monkeypatch):
         0.0,
         "No answer provided.",
     )
+
+
+def test_practice_rejects_indistinguishable_correct_and_wrong_options():
+    import pytest
+
+    with pytest.raises(ValueError, match="duplicate option text"):
+        routers_practice._validate_generated_questions([{
+            "type": "single_mcq", "question": "Choose",
+            "options": [
+                {"text": "Same", "is_correct": True},
+                {"text": " same ", "is_correct": False},
+            ],
+        }], 1)
+
+
+def test_practice_multi_choice_needs_multiple_correct_and_an_incorrect_option():
+    import pytest
+
+    for correct_count in (1, 4):
+        with pytest.raises(ValueError, match="multiple correct options"):
+            routers_practice._validate_generated_questions([{
+                "type": "multi_mcq", "question": "Choose",
+                "options": [{"text": str(index), "is_correct": index < correct_count} for index in range(4)],
+            }], 1)

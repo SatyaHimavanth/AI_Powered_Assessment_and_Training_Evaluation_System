@@ -9,6 +9,10 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 load_dotenv()
 
 
+class AIServiceUnavailable(RuntimeError):
+    """The configured AI provider could not complete a request."""
+
+
 def get_chat_model() -> BaseChatModel:
     if os.getenv("CHAT_PROVIDER") == "ollama":
         model_name = os.getenv("CHAT_MODEL_NAME")

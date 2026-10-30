@@ -116,6 +116,19 @@ contains placeholders; do not use those values in a deployed environment.
 
 ## Assessment and Recovery Behavior
 
+- AI Generation Batches show the topic, question type, difficulty, requested
+  question count, saved generation totals, and failure reason. Active batches
+  refresh automatically. Failed batches can be retried with their original
+  inputs or deleted after confirmation. Retrying clears partial staging and is
+  blocked once questions have been approved; deleting a failed batch never
+  deletes saved bank questions or assessment answers. No schema migration is
+  required for these controls.
+
+- The assessment creation page is a single form. Required fields and selections
+  are marked with `*`; description and scheduled start/end times are optional.
+  Choose at least one batch/user and either question-bank sections or an Excel
+  import before creating the assessment.
+
 - Editing a bank question already linked to an assessment creates a new active
   version and archives the bank entry for the original. Existing assessments,
   option IDs, saved answers, and grading retain the original version.
@@ -137,6 +150,24 @@ contains placeholders; do not use those values in a deployed environment.
   discarding the candidate's answers.
 - Missing assessment answers count as zero in topic reporting. Rejected
   registration requests can be resubmitted after the configured cooldown.
+- AI interviews store their full transcript and evaluations in PostgreSQL.
+  The agent is reconstructed from the stored conversation on each request; it
+  does not depend on process-local chat memory. Model prompts use the most
+  recent stored history within a bounded context, without deleting older turns.
+- Interview text/voice drafts autosave to the database after 500 ms. Wait for
+  "Draft saved in the database" before closing: unsynced text can still be lost
+  if the browser/device crashes before a save reaches the server.
+- Once an interview answer is accepted, its pending-evaluation marker and timer
+  pause are committed before calling AI. Provider/format failures return a
+  retry-later message; reopening the session restores the same answer and retry
+  action. Successful evaluation resumes the timer without using pause allowance.
+  No new database migration is needed; existing transcript/feedback JSON and
+  paused-session fields hold this state.
+- Practice questions and saved answers also live in PostgreSQL. An evaluation
+  outage preserves submitted answers and leaves the test resumable from history.
+  Browser local storage contains only interview interruption markers, not the
+  interview transcript. Timed exams separately retain local offline drafts as
+  well as server-saved answers.
 
 See [TestSuite](TestSuite/README.md) for executable recovery, failure-injection,
 browser, and live concurrency scenarios and their validation boundaries.

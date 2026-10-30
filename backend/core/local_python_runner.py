@@ -87,6 +87,11 @@ def execute_in_local_venv(code: str, stdin_input: str = "") -> dict:
                 "TEMP": workdir,
                 "TMP": workdir,
             }
+            if os.name == "nt":
+                # Windows needs SystemRoot to initialize Winsock in Python imports.
+                system_root = os.environ.get("SystemRoot")
+                if system_root:
+                    child_env["SystemRoot"] = system_root
             try:
                 proc = subprocess.Popen(
                     [sys.executable, "-I", str(source_path)],

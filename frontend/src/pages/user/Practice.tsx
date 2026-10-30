@@ -917,7 +917,7 @@ export default function Practice() {
               )}
               {todayTest.status === "failed" && (
                 <div className="flex items-center gap-3">
-                  <p className="text-sm text-red-600">Generation failed.</p>
+                  <p className="text-sm text-red-600">AI generation is temporarily unavailable or returned invalid questions. Please try again after some time.</p>
                   <button
                     onClick={() => void handleRetryGeneration(todayTest)}
                     className="px-3 py-1.5 border border-red-300 text-red-700 text-sm rounded-lg hover:bg-red-50 cursor-pointer"

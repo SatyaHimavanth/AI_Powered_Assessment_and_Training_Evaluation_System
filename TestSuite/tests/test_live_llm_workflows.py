@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,16 +73,83 @@ def test_live_interview_followup_obeys_the_application_schema(application_llm):
     assert isinstance(result["strengths"], list)
 
 
-@pytest.mark.parametrize("question_type", ["text", "single_mcq", "multi_mcq"])
-def test_live_question_generation_before_embedding_stage(application_llm, question_type):
-    from core.question_generation import generate_questions_from_text
+@pytest.mark.parametrize("question_type,count,difficulty", [
+    ("text", 2, "easy"),
+    ("single_mcq", 2, "easy"),
+    ("multi_mcq", 2, "easy"),
+    ("text", 10, "medium"),
+    ("single_mcq", 10, "medium"),
+    ("multi_mcq", 10, "medium"),
+    ("single_mcq", 25, "hard"),
+])
+def test_live_question_generation_before_embedding_stage(application_llm, monkeypatch, question_type, count, difficulty):
+    from core import question_generation
 
-    questions = generate_questions_from_text(
-        "A database transaction is atomic. COMMIT saves changes. ROLLBACK discards changes.",
-        question_type, "easy", "Transactions", count=2,
+    calls = []
+
+    def invoke(prompt):
+        calls.append(True)
+        return application_llm.invoke(prompt)
+
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+
+    questions = question_generation.generate_questions_from_text(
+        "A transaction is an atomic unit of database work. COMMIT saves changes and ROLLBACK discards them. "
+        "ACID means atomicity, consistency, isolation, and durability. Isolation levels include read "
+        "uncommitted, read committed, repeatable read, and serializable. Dirty reads observe uncommitted "
+        "changes. Nonrepeatable reads observe changed rows. Phantom reads observe changed result sets. "
+        "MVCC maintains row versions. Serializable execution can require retrying serialization failures. "
+        "Deadlocks require conflicting lock dependencies; consistent lock order can reduce them. "
+        "Savepoints allow partial rollback. Unique constraints prevent duplicate keys. "
+        "Foreign keys enforce references. Indexes accelerate lookups but add write overhead.",
+        question_type, difficulty, "Transactions", count=count,
     )
-    assert len(questions) == 2
+    assert len(questions) == count
+    chunks = (count + question_generation.MAX_GENERATION_CHUNK_SIZE - 1) // question_generation.MAX_GENERATION_CHUNK_SIZE
+    assert chunks <= len(calls) <= chunks * question_generation.MAX_GENERATION_ATTEMPTS
+    assert len({question["question_text"].casefold() for question in questions}) == count
     assert all(question["question_type"] == question_type for question in questions)
+    if question_type != "text":
+        correct_counts = [sum(option["is_correct"] for option in question["options"]) for question in questions]
+        assert all(len(question["options"]) == 4 for question in questions)
+        if question_type == "single_mcq":
+            assert correct_counts == [1] * count
+        else:
+            assert all(2 <= value <= 3 for value in correct_counts)
+    print(f"\n{question_type}: requested={count}, returned={len(questions)}, difficulty={difficulty}, model_calls={len(calls)}")
+
+
+def test_live_question_generation_corrects_invalid_third_answer_key(application_llm, monkeypatch):
+    from core import question_generation
+
+    calls = []
+    malformed = [{
+        "question_type": "single_mcq", "question_text": f"Synthetic transaction question {index}",
+        "reference_answer": None,
+        "options": [
+            {"option_text": "COMMIT", "is_correct": True},
+            {"option_text": "ROLLBACK", "is_correct": index == 3},
+            {"option_text": "SELECT", "is_correct": False},
+            {"option_text": "UPDATE", "is_correct": False},
+        ],
+    } for index in range(1, 4)]
+
+    def invoke(prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return SimpleNamespace(content=json.dumps(malformed))
+        return application_llm.invoke(prompt)
+
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    questions = question_generation.generate_questions_from_text(
+        "COMMIT saves transaction changes. ROLLBACK discards changes. SELECT reads stored data.",
+        "single_mcq", "easy", "Transactions", count=3,
+    )
+    assert 2 <= len(calls) <= question_generation.MAX_GENERATION_ATTEMPTS
+    assert "question 3 needs exactly one correct option" in calls[1]
+    assert len(questions) == 3
+    assert all(sum(option["is_correct"] for option in question["options"]) == 1 for question in questions)
+    print(f"\nInjected invalid third answer key: recovered with {len(calls) - 1} real Cisco model call(s)")
 
 
 def test_live_practice_generation_prompt_and_answer_keys(application_llm):

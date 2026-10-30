@@ -95,6 +95,34 @@ python main.py
 
 ## Running Tests
 
+### Question generation and Windows execution recovery
+
+Bank question generation validates every generated answer key before computing
+embeddings or staging questions. Requests of up to 50 questions are generated in
+chunks of at most 10 to avoid incomplete large model responses. Each chunk is
+validated for question count, answer keys, and repeated question text; later
+chunks include the previously accepted question texts as exclusion context.
+If a response is invalid, that chunk is regenerated with validation feedback,
+up to three model calls per chunk. A valid request of 10 or fewer uses one call;
+a valid 25-question request uses three. It never guesses which option is correct.
+If validation still fails, the batch
+is marked failed with the final error; provider/network errors remain explicit
+and are not retried by this validation loop. Regeneration can incur additional
+provider latency and cost.
+
+On Windows, the local Python runner preserves `SystemRoot` in its otherwise
+restricted child environment. Windows requires it for Winsock initialization
+used by standard-library imports such as `asyncio`; omitting it can raise
+`OSError: [WinError 10106]`. Application credentials are not inherited. No
+Winsock reset, registry modification, or database migration is needed for this
+fix. Restart the backend/worker after deploying the updated code.
+
+Focused regressions, without a running API or LLM:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q tests\test_question_generation_validation.py tests\test_local_python_runner.py
+```
+
 ```powershell
 # From the backend directory, ensure the server is running first.
 # Then run pytest directly (do NOT use .venv activation for collection):

@@ -516,6 +516,8 @@ def test_malformed_persisted_option_selection_does_not_break_reports(application
 
 
 def test_failed_practice_evaluation_preserves_work_for_retry(application, monkeypatch):
+    from app.llms import AIServiceUnavailable
+    from fastapi import HTTPException
     app = application
     m = app.models
     test = m.PracticeTest(
@@ -536,11 +538,13 @@ def test_failed_practice_evaluation_preserves_work_for_retry(application, monkey
     ])
 
     def unavailable(*_args):
-        raise RuntimeError("Simulated provider outage")
+        raise AIServiceUnavailable("Simulated provider outage")
 
     monkeypatch.setattr(app.practice, "_score_practice_question", unavailable)
-    with pytest.raises(RuntimeError, match="Simulated provider outage"):
+    with pytest.raises(HTTPException) as exc:
         call(app.practice.submit_practice_test, test.id, payload, app.user)
+    assert exc.value.status_code == 503
+    assert "try again after some time" in exc.value.detail
     app.db.expire_all()
     assert app.db.get(m.PracticeTest, test.id).status == m.PracticeTestStatus.in_progress
     assert app.db.query(m.PracticeAnswer).one().answer == text
@@ -736,3 +740,163 @@ def test_practice_worker_provider_failure_is_visible_and_retryable(application, 
     call(app.practice.retry_practice_generation, test.id, app.user)
     app.db.refresh(test)
     assert test.status == m.PracticeTestStatus.generating and test.error_message is None
+
+
+@pytest.mark.parametrize("eventually_valid", [True, False])
+def test_bank_generation_recovers_invalid_answer_keys_before_staging(application, monkeypatch, eventually_valid):
+    from core import question_generation
+
+    app = application
+    m = app.models
+    batch = m.QuestionGenerationBatch(
+        admin_id=app.user.id, topic_id=app.topic.id, source_text="Synthetic question-generation regression",
+        question_type=m.QuestionType.single_mcq, difficulty=m.Difficulty.easy,
+        requested_count=3, auto_approve_unique=False, status=m.GenerationBatchStatus.pending,
+    )
+    app.db.add(batch)
+    app.db.commit()
+    calls = []
+
+    def invoke(prompt):
+        calls.append(prompt)
+        questions = [{
+            "question_type": "single_mcq", "question_text": f"Which value is even? Example {index}",
+            "difficulty": "easy", "reference_answer": None,
+            "options": [
+                {"option_text": "2", "is_correct": True},
+                {"option_text": "3", "is_correct": False},
+                {"option_text": "5", "is_correct": False},
+                {"option_text": "7", "is_correct": False},
+            ],
+        } for index in range(3)]
+        if not eventually_valid or len(calls) == 1:
+            questions[2]["options"][1]["is_correct"] = True
+        return SimpleNamespace(content=json.dumps(questions))
+
+    embedding_calls = []
+
+    def synthetic_embeddings(texts):
+        embedding_calls.append(texts)
+        return [[0.0] for _text in texts]
+
+    monkeypatch.setattr(question_generation, "SessionLocal", app.sessions)
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "compute_embeddings", synthetic_embeddings)
+    monkeypatch.setattr(question_generation, "check_similarity", lambda _text: (0.0, None, "unique"))
+    monkeypatch.setattr(question_generation, "store_question_embedding", lambda **_kwargs: None)
+    question_generation.process_generation_batch(batch.id)
+    app.db.refresh(batch)
+    staged = app.db.query(m.StagedQuestion).filter_by(batch_id=batch.id).all()
+    if eventually_valid:
+        assert len(calls) == 2
+        assert batch.status == m.GenerationBatchStatus.completed and batch.total_generated == 3
+        assert len(staged) == 3 and len(embedding_calls) == 1
+        assert all(sum(option["is_correct"] for option in question.options) == 1 for question in staged)
+    else:
+        assert len(calls) == question_generation.MAX_GENERATION_ATTEMPTS
+        assert batch.status == m.GenerationBatchStatus.failed
+        assert "failed validation after 3 attempts" in batch.error_message
+        assert not staged and not embedding_calls
+
+
+def test_interview_opening_outage_returns_retry_later_without_consuming_approval(application, monkeypatch):
+    from app.llms import AIServiceUnavailable
+    from fastapi import HTTPException
+
+    app = application
+    template, grant = interview_access(app)
+
+    def unavailable(*_args, **_kwargs):
+        raise AIServiceUnavailable("Provider temporarily unavailable")
+
+    monkeypatch.setattr(app.interviews, "generate_opening_question", unavailable)
+    with pytest.raises(HTTPException) as exc:
+        call(app.interviews.start_interview, app.interviews.InterviewStartIn(template_id=template.id), app.user)
+    assert exc.value.status_code == 503 and "try again after some time" in exc.value.detail
+    assert app.db.query(app.models.InterviewSession).count() == 0
+    app.db.refresh(grant)
+    assert grant.status == app.models.InterviewAccessStatus.approved
+
+
+@pytest.mark.parametrize("failure", ["provider", "malformed"])
+def test_interview_outage_is_durable_and_retry_restores_context_without_time_penalty(application, monkeypatch, failure):
+    from app.llms import AIServiceUnavailable
+    from fastapi import HTTPException
+    from sqlalchemy.orm import sessionmaker
+
+    app = application
+    m = app.models
+    template, _grant = interview_access(app)
+    started = call(app.interviews.start_interview, app.interviews.InterviewStartIn(template_id=template.id), app.user)
+    answer = "Candidate answer persisted before provider execution"
+    payload = app.interviews.InterviewMessageIn(response_text=answer)
+
+    def unavailable(*_args, **_kwargs):
+        with app.sessions() as observer:
+            stored = observer.get(m.InterviewSession, started.id)
+            assert stored.transcript[-1]["content"] == answer
+            assert stored.feedback["pending_evaluation"]
+            assert stored.status == m.InterviewSessionStatus.paused
+        if failure == "malformed":
+            raise ValueError("Invalid model response")
+        raise AIServiceUnavailable("Provider timeout")
+
+    monkeypatch.setattr(app.interviews, "evaluate_and_generate_followup", unavailable)
+    with pytest.raises(HTTPException) as exc:
+        call(app.interviews.interview_message, started.id, payload, app.user)
+    assert exc.value.status_code == 503 and "saved in the database" in exc.value.detail
+    assert "try again after some time" in exc.value.detail
+    with app.sessions() as db:
+        persisted = db.get(m.InterviewSession, started.id)
+        assert persisted.pause_count == 0
+        persisted.started_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        persisted.paused_at = persisted.started_at + timedelta(seconds=10)
+        db.commit()
+    # Replace the session factory to simulate a process with no retained session/agent state.
+    monkeypatch.setattr(app.interviews, "SessionLocal", sessionmaker(bind=app.db.bind, expire_on_commit=False))
+    restored = call(app.interviews.get_my_result, started.id, app.user)
+    assert restored["status"] == "paused"
+    assert restored["feedback"]["pending_evaluation"]
+    assert restored["remaining_seconds"] == 50
+    assert [turn["role"] for turn in restored["transcript"]] == ["assistant", "user"]
+    call(app.interviews.resume_interview, started.id, app.user)
+    assert call(app.interviews.get_my_result, started.id, app.user)["status"] == "paused"
+    with pytest.raises(HTTPException) as mismatch:
+        call(app.interviews.interview_message, started.id,
+             app.interviews.InterviewMessageIn(response_text="Changed answer"), app.user)
+    assert mismatch.value.status_code == 409
+    observed_history = []
+
+    def available(*_args, **kwargs):
+        observed_history.extend(kwargs["conversation"])
+        return {"score": 8, "feedback": "Good answer", "next_question": "Next database-backed question"}
+
+    monkeypatch.setattr(app.interviews, "evaluate_and_generate_followup", available)
+    call(app.interviews.interview_message, started.id, payload, app.user)
+    recovered = call(app.interviews.get_my_result, started.id, app.user)
+    assert recovered["status"] == "in_progress" and recovered["remaining_seconds"] >= 49
+    assert not recovered["feedback"].get("pending_evaluation")
+    assert recovered["pause_count"] == 0
+    assert [turn["role"] for turn in recovered["transcript"]] == ["assistant", "user", "assistant"]
+    assert observed_history == restored["transcript"][:-1]
+    assert app.db.query(m.InterviewResponseEvaluation).count() == 1
+
+
+def test_interview_draft_is_restored_from_database_not_browser_storage(application):
+    from fastapi import HTTPException
+    from types import SimpleNamespace
+
+    app = application
+    template, _grant = interview_access(app)
+    started = call(app.interviews.start_interview, app.interviews.InterviewStartIn(template_id=template.id), app.user)
+    draft = "Unsubmitted answer \u4f60\u597d stored durably"
+    call(app.interviews.save_interview_draft, started.id,
+         app.interviews.InterviewDraftIn(response_text=draft), app.user)
+    result = call(app.interviews.get_my_result, started.id, app.user)
+    assert result["feedback"]["draft_answer"] == draft
+    assert [turn["role"] for turn in result["transcript"]] == ["assistant"]
+    with pytest.raises(HTTPException) as exc:
+        call(app.interviews.save_interview_draft, started.id,
+             app.interviews.InterviewDraftIn(response_text="wrong user"), SimpleNamespace(id=uuid4()))
+    assert exc.value.status_code == 404
+    assert call(app.interviews.get_my_result, started.id, app.user)["feedback"]["draft_answer"] == draft

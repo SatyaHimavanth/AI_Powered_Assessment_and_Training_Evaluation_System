@@ -6,7 +6,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.llms import AIServiceUnavailable
 from core.auth import get_current_user, require_admin
+from core.logger import get_logger
 from core.interview_agent import generate_opening_question, evaluate_and_generate_followup
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
@@ -29,6 +31,7 @@ user_router = APIRouter(prefix="/interviews", tags=["interviews"])
 admin_router = APIRouter(prefix="/admin/interviews", tags=["admin-interviews"])
 
 INTERVIEW_REQUEST_EXPIRY_DAYS = int(os.getenv("INTERVIEW_REQUEST_EXPIRY_DAYS", "2"))
+logger = get_logger(__name__)
 
 
 def _mark_interview_expired(session: InterviewSession, now: datetime | None = None) -> bool:
@@ -182,6 +185,10 @@ class InterviewSessionOut(BaseModel):
 
 class InterviewMessageIn(BaseModel):
     response_text: str = Field(min_length=1, max_length=20_000)
+
+
+class InterviewDraftIn(BaseModel):
+    response_text: str = Field(max_length=20_000)
 
 
 class InterviewMessageOut(BaseModel):
@@ -1404,15 +1411,22 @@ async def start_interview(
             db.flush()
             db.refresh(session)
 
-            opening = generate_opening_question(
-                str(session.id),
-                template.role,
-                template.experience_level,
-                template.difficulty,
-                template.focus_areas or [],
-                template.default_questions_or_topics or [],
-                system_prompt=template.system_prompt,
-            )
+            try:
+                opening = generate_opening_question(
+                    str(session.id),
+                    template.role,
+                    template.experience_level,
+                    template.difficulty,
+                    template.focus_areas or [],
+                    template.default_questions_or_topics or [],
+                    system_prompt=template.system_prompt,
+                )
+            except AIServiceUnavailable as exc:
+                logger.exception("AI opening unavailable for interview template %s", template.id)
+                raise HTTPException(
+                    status_code=503,
+                    detail="AI is temporarily unavailable. Please try again after some time. Your interview approval has not been used.",
+                ) from exc
             session.transcript = [
                 {
                     "role": "assistant",
@@ -1445,6 +1459,30 @@ async def start_interview(
     return InterviewSessionOut(**data)
 
 
+@user_router.put("/{session_id}/draft", response_model=MessageResponse)
+async def save_interview_draft(
+    session_id: UUID,
+    payload: InterviewDraftIn,
+    current_user: User = Depends(get_current_user),
+):
+    def _sync_work():
+        with SessionLocal() as db:
+            session = db.query(InterviewSession).filter(
+                InterviewSession.id == session_id, InterviewSession.user_id == current_user.id
+            ).with_for_update().first()
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            feedback = dict(session.feedback or {})
+            if session.status != InterviewSessionStatus.in_progress or feedback.get("pending_evaluation"):
+                raise HTTPException(status_code=409, detail="Session is not accepting draft changes")
+            feedback["draft_answer"] = payload.response_text
+            session.feedback = feedback
+            db.commit()
+        return {"message": "Draft saved in the database"}
+
+    return await run_db_sync(_sync_work)
+
+
 @user_router.post("/{session_id}/message", response_model=InterviewMessageOut)
 async def interview_message(
     session_id: UUID,
@@ -1473,7 +1511,11 @@ async def interview_message(
             if _mark_interview_expired(session):
                 db.commit()
                 raise HTTPException(status_code=409, detail="Interview duration has expired")
-            if session.status != InterviewSessionStatus.in_progress:
+            feedback_obj = dict(session.feedback) if isinstance(session.feedback, dict) else {}
+            pending_evaluation = bool(feedback_obj.get("pending_evaluation"))
+            if session.status != InterviewSessionStatus.in_progress and not (
+                session.status == InterviewSessionStatus.paused and pending_evaluation
+            ):
                 raise HTTPException(status_code=400, detail="Session is not in progress")
 
             transcript = list(session.transcript or [])
@@ -1490,8 +1532,15 @@ async def interview_message(
                     "timestamp": to_utc_iso(datetime.now(timezone.utc)),
                 })
                 session.transcript = transcript
-                db.commit()
                 history = transcript[:-1]
+
+            if not pending_evaluation:
+                session.paused_at = datetime.now(timezone.utc)
+                session.status = InterviewSessionStatus.paused
+                feedback_obj["pending_evaluation"] = True
+                feedback_obj.pop("draft_answer", None)
+                session.feedback = feedback_obj
+            db.commit()
 
             focus_list = template.focus_areas or ["general"]
             feedback_obj = session.feedback if isinstance(session.feedback, dict) else {}
@@ -1543,10 +1592,12 @@ async def interview_message(
                 conversation=context["history"],
             )
         )
-    except Exception as exc:
+    except (AIServiceUnavailable, ValueError) as exc:
+        logger.exception("AI evaluation unavailable for interview session %s", session_id)
         raise HTTPException(
             status_code=503,
-            detail="Your answer was saved, but interview evaluation is temporarily unavailable. Retry the same answer.",
+            detail="AI evaluation is temporarily unavailable. Your questions and answers are saved in the database, "
+                   "and the interview timer is paused. Please try again after some time to continue.",
         ) from exc
 
     def _persist_turn():
@@ -1560,11 +1611,14 @@ async def interview_message(
             )
             if not session:
                 raise HTTPException(status_code=404, detail="Session not found")
-            if session.status not in {InterviewSessionStatus.in_progress, InterviewSessionStatus.completed}:
+            feedback_obj = dict(session.feedback) if isinstance(session.feedback, dict) else {}
+            pending_evaluation = bool(feedback_obj.get("pending_evaluation"))
+            if session.status not in {InterviewSessionStatus.in_progress, InterviewSessionStatus.completed} and not (
+                session.status == InterviewSessionStatus.paused and pending_evaluation
+            ):
                 raise HTTPException(status_code=409, detail="Session is no longer accepting responses")
 
             transcript = list(session.transcript or [])
-            feedback_obj = dict(session.feedback) if isinstance(session.feedback, dict) else {}
             turn_feedback = list(feedback_obj.get("turns", []))
             if (
                 len(transcript) != context["transcript_length"]
@@ -1590,6 +1644,15 @@ async def interview_message(
                 "feedback": eval_result.get("feedback", ""),
             })
             feedback_obj["turns"] = turn_feedback
+            feedback_obj.pop("pending_evaluation", None)
+            if session.status == InterviewSessionStatus.paused and pending_evaluation:
+                now = datetime.now(timezone.utc)
+                if session.paused_at:
+                    paused_seconds = (now - as_utc_aware(session.paused_at)).total_seconds()
+                    session.duration_seconds = int(session.duration_seconds or 0) + max(0, int(paused_seconds))
+                session.paused_at = None
+                session.resumed_at = now
+                session.status = InterviewSessionStatus.in_progress
             session.feedback = feedback_obj
 
             db.add(InterviewResponseEvaluation(
@@ -1764,6 +1827,8 @@ async def resume_interview(
                 return {"message": "Interview already resumed"}
             if session.status != InterviewSessionStatus.paused:
                 raise HTTPException(status_code=400, detail="Only paused sessions can be resumed")
+            if isinstance(session.feedback, dict) and session.feedback.get("pending_evaluation"):
+                return {"message": "Your saved answer is awaiting AI evaluation. Retry it after some time to continue."}
             if session.pause_count > int(session.max_pauses_allowed_snapshot or 3):
                 session.status = InterviewSessionStatus.missed
                 session.completed_at = datetime.now(timezone.utc)
@@ -1804,6 +1869,11 @@ async def end_interview(
                 raise HTTPException(status_code=404, detail="Session not found")
             if session.status in [InterviewSessionStatus.completed, InterviewSessionStatus.missed, InterviewSessionStatus.abandoned]:
                 return {"message": "Interview already closed"}
+            if isinstance(session.feedback, dict) and session.feedback.get("pending_evaluation"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Your saved answer is awaiting AI evaluation. Please try again after some time to continue.",
+                )
 
             session.status = InterviewSessionStatus.completed
             session.completed_at = datetime.now(timezone.utc)

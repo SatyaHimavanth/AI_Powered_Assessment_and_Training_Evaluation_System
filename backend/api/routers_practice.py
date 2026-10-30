@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.llms import AIServiceUnavailable
+from core.logger import get_logger
 from core.auth import get_current_user
 from core.evaluation_service import _evaluate_subjective_with_llm
 from core.uploads import read_upload_limited
@@ -30,6 +32,7 @@ from db.models import (
 from api.timezone_helper import as_utc_aware
 
 router = APIRouter(prefix="/practice", tags=["practice"])
+logger = get_logger(__name__)
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
@@ -307,9 +310,13 @@ def _validate_generated_questions(raw_questions: object, requested_count: int) -
                 ):
                     raise ValueError(f"Question {index} has a malformed option")
                 cleaned_options.append({"text": option["text"].strip(), "is_correct": option["is_correct"]})
+            if len({option["text"].casefold() for option in cleaned_options}) != len(cleaned_options):
+                raise ValueError(f"Question {index} has duplicate option text")
             correct = [option["text"] for option in cleaned_options if option["is_correct"]]
             if not correct or (question_type == "single_mcq" and len(correct) != 1):
                 raise ValueError(f"Question {index} has an invalid correct-option set")
+            if question_type == "multi_mcq" and not 2 <= len(correct) < len(cleaned_options):
+                raise ValueError(f"Question {index} requires multiple correct options and at least one incorrect option")
             normalized["options"] = cleaned_options
             normalized["correct_answer"] = correct
         else:
@@ -788,7 +795,15 @@ async def submit_practice_test(
             results.append({**question, "score": score, "feedback": feedback})
         return results
 
-    scored = await run_db_sync(_evaluate_all_answers)
+    try:
+        scored = await run_db_sync(_evaluate_all_answers)
+    except AIServiceUnavailable as exc:
+        logger.exception("AI evaluation unavailable for practice test %s", test_id)
+        raise HTTPException(
+            status_code=503,
+            detail="AI evaluation is temporarily unavailable. Your answers are saved in the database. "
+                   "Please try again after some time; you can reopen this test from Practice History.",
+        ) from exc
 
     def _finalize_submission():
         db = SessionLocal()

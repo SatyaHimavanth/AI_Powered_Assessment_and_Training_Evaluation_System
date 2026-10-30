@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import api from "../../api";
 import type { TopicInfo } from "./types";
 import { card, inputClass, selectClass, btnPrimary } from "./types";
@@ -16,6 +16,13 @@ interface BatchItem {
   total_approved: number;
   total_rejected: number;
   requested_count: number;
+  topic_id: string | null;
+  topic_name: string;
+  question_type: string;
+  difficulty: string;
+  error_message: string | null;
+  can_retry: boolean;
+  retry_blocked_reason: string | null;
   active_saved_count: number;
   archived_saved_count: number;
   created_at: string;
@@ -60,6 +67,23 @@ interface RestoreBatchResponse {
   question_ids: string[];
 }
 
+const QUESTION_TYPE_LABELS: Record<string, string> = {
+  text: "Text", single_mcq: "Single MCQ", multi_mcq: "Multi MCQ", coding: "Coding",
+};
+
+function batchActionError(error: unknown, fallback: string): string {
+  if (typeof error === "object" && error !== null && "response" in error) {
+    const response = error.response;
+    if (typeof response === "object" && response !== null && "data" in response) {
+      const data = response.data;
+      if (typeof data === "object" && data !== null && "detail" in data && typeof data.detail === "string") {
+        return data.detail;
+      }
+    }
+  }
+  return fallback;
+}
+
 export default function QuestionGeneration({ topics, setMessage }: Props) {
   // Generation form state
   const [sourceText, setSourceText] = useState("");
@@ -79,6 +103,9 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
   const [batchToRestore, setBatchToRestore] = useState<BatchItem | null>(null);
   const [archivingBatchId, setArchivingBatchId] = useState<string | null>(null);
   const [restoringBatchId, setRestoringBatchId] = useState<string | null>(null);
+  const [failedBatchAction, setFailedBatchAction] = useState<{ kind: "retry" | "delete"; batch: BatchItem } | null>(null);
+  const [failedBatchBusy, setFailedBatchBusy] = useState(false);
+  const failedBatchActionLock = useRef(false);
   const batchesPageSize = 10;
 
   // Staged questions for selected batch
@@ -143,6 +170,48 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
     return () => { active = false; };
   }, [selectedBatchId, loadStaged]);
 
+  const hasActiveBatch = batches.some((batch) => ["pending", "processing", "embedding", "similarity_check"].includes(batch.status));
+  useEffect(() => {
+    if (!hasActiveBatch) return;
+    const timer = window.setInterval(() => { void loadBatches(); }, 5000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveBatch, loadBatches]);
+
+  const confirmFailedBatchAction = async () => {
+    if (!failedBatchAction || failedBatchActionLock.current) return;
+    failedBatchActionLock.current = true;
+    setFailedBatchBusy(true);
+    const { batch, kind } = failedBatchAction;
+    try {
+      if (kind === "retry") {
+        const res = await api.post<BatchItem>(`/admin/questions/generation/batches/${batch.id}/retry`);
+        setBatches((current) => current.map((item) => item.id === batch.id ? res.data : item));
+        setMessage("Generation queued again using the original topic, type, count, and source material.");
+      } else {
+        const res = await api.delete<{ message: string }>(`/admin/questions/generation/batches/${batch.id}`);
+        setBatches((current) => current.filter((item) => item.id !== batch.id));
+        setMessage(res.data.message);
+      }
+      if (selectedBatchId === batch.id) {
+        setSelectedBatchId(null);
+        setStaged([]);
+        setStagedTotal(0);
+        setStagedPage(1);
+      }
+      setFailedBatchAction(null);
+      if (kind === "delete" && batches.length === 1 && batchesPage > 1) {
+        setBatchesPage((current) => current - 1);
+      } else {
+        await loadBatches();
+      }
+    } catch (error: unknown) {
+      setMessage(batchActionError(error, `Could not ${kind} this batch. Please try again.`));
+    } finally {
+      failedBatchActionLock.current = false;
+      setFailedBatchBusy(false);
+    }
+  };
+
   const handleGenerate = async () => {
     if (!sourceText.trim()) {
       setMessage("Please provide source text");
@@ -166,9 +235,10 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
         count,
         auto_approve_unique: autoApprove,
       });
-      setMessage("Generation started! Refresh batches to see progress.");
+      setMessage("Generation queued. Batch progress refreshes automatically.");
       setSourceText("");
-      setTimeout(loadBatches, 2000);
+      if (batchesPage !== 1) setBatchesPage(1);
+      else await loadBatches();
     } catch {
       setMessage("Failed to start generation");
     } finally {
@@ -364,21 +434,54 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
             {batches.map((b) => (
               <div
                 key={b.id}
-                className={`py-3 flex items-center justify-between cursor-pointer hover:bg-gray-50 px-2 rounded ${selectedBatchId === b.id ? "bg-blue-50" : ""}`}
+                className={`py-3 flex flex-wrap items-center justify-between gap-3 cursor-pointer hover:bg-gray-50 px-2 rounded ${selectedBatchId === b.id ? "bg-blue-50" : ""}`}
                 onClick={() => { setSelectedBatchId(b.id); setStagedPage(1); }}
               >
-                <div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-gray-900 break-words">
+                    {b.topic_name || "General"} · {QUESTION_TYPE_LABELS[b.question_type] || b.question_type} · {b.requested_count} questions
+                  </p>
+                  <p className="mt-1 text-xs text-gray-500">Difficulty: {b.difficulty} · Batch {b.id}</p>
                   <span className={`text-sm font-medium ${batchStatusColor(b.status)}`}>
                     {b.status}
                   </span>
+                  {b.status === "failed" && (
+                    <p className="text-xs text-red-600">
+                      {b.error_message || "Generation could not be completed. Please try again after some time."}
+                    </p>
+                  )}
+                  {b.status === "failed" && b.retry_blocked_reason && (
+                    <p className="text-xs text-amber-700">{b.retry_blocked_reason}</p>
+                  )}
                   <span className="text-sm text-gray-600 ml-3">
-                    {b.total_generated} generated · {b.total_approved} approved · {b.total_rejected} rejected
+                    {b.total_generated} / {b.requested_count} generated · {b.total_approved} approved · {b.total_rejected} rejected
                   </span>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                   <span className="text-xs text-gray-400">
                     {new Date(b.created_at).toLocaleDateString()}
                   </span>
+                  {b.status === "failed" && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={(event) => { event.stopPropagation(); setFailedBatchAction({ kind: "retry", batch: b }); }}
+                        disabled={!b.can_retry || failedBatchBusy}
+                        title={b.retry_blocked_reason || "Retry with the original generation settings"}
+                        className="text-xs px-3 py-1 border border-blue-200 text-blue-700 rounded hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Retry
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => { event.stopPropagation(); setFailedBatchAction({ kind: "delete", batch: b }); }}
+                        disabled={failedBatchBusy}
+                        className="text-xs px-3 py-1 border border-red-200 text-red-700 rounded hover:bg-red-50 disabled:opacity-40"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={(e) => {
@@ -550,6 +653,36 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
       )}
 
       {/* Archive Batch Questions Modal */}
+      {failedBatchAction && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="failed-batch-action-title"
+            className="bg-white rounded-lg shadow-xl w-full max-w-lg m-4 p-6 space-y-4"
+          >
+            <h3 id="failed-batch-action-title" className="text-base font-semibold">
+              {failedBatchAction.kind === "retry" ? "Retry failed generation?" : "Delete failed generation?"}
+            </h3>
+            <p className="text-sm text-gray-700">
+              {failedBatchAction.batch.topic_name} · {QUESTION_TYPE_LABELS[failedBatchAction.batch.question_type] || failedBatchAction.batch.question_type} · {failedBatchAction.batch.requested_count} questions
+            </p>
+            <p className="text-sm text-gray-600">
+              {failedBatchAction.kind === "retry"
+                ? "The original settings and source material will be reused. Any partial staged questions and their temporary embeddings will be discarded before restarting."
+                : "This removes the failed batch, its source material, and staged review data. Saved question-bank questions and assessment answers will not be deleted. This cannot be undone."}
+            </p>
+            <div className="flex justify-end gap-3">
+              <button type="button" disabled={failedBatchBusy} onClick={() => setFailedBatchAction(null)} className="px-4 py-2 text-sm border rounded disabled:opacity-40">
+                Cancel
+              </button>
+              <button type="button" disabled={failedBatchBusy} onClick={() => void confirmFailedBatchAction()} className="px-4 py-2 text-sm bg-blue-600 text-white rounded disabled:opacity-40">
+                {failedBatchBusy ? "Working..." : failedBatchAction.kind === "retry" ? "Retry generation" : "Delete batch"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {batchToArchive && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setBatchToArchive(null)}>
           <div className="bg-white rounded-lg shadow-xl w-full max-w-lg m-4" onClick={(e) => e.stopPropagation()}>

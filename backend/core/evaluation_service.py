@@ -16,7 +16,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, text
 
-from app.llms import get_chat_model
+from app.llms import AIServiceUnavailable, get_chat_model
 from core.logger import get_logger
 from db.database import SessionLocal, engine
 from db.models import (
@@ -429,7 +429,7 @@ Rules:
         return score, feedback
     except Exception as e:
         logger.error(f"LLM evaluation failed: {str(e)}")
-        raise  # Propagate so the job is retried, not scored as 0
+        raise AIServiceUnavailable("AI evaluation is temporarily unavailable. Please try again after some time.") from e
 
 
 def _objective_score(is_correct: bool, negative_marking: bool, answer: str | None) -> float:

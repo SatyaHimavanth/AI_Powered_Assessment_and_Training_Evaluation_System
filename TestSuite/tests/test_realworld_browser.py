@@ -130,3 +130,84 @@ def test_interview_countdown_reaches_results_instead_of_an_expiry_error(
     page.get_by_role("button", name="Start Interview", exact=True).click()
     expect(page.get_by_role("heading", name="Interview Completed")).to_be_visible(timeout=10_000)
     assert closed
+
+
+def test_ai_outage_preserves_answer_across_reload_and_resumes_without_timer_loss(
+    require_e2e, page, frontend_url, api_url
+):
+    template = {
+        "id": "outage-template", "title": "Outage recovery interview", "role": "Engineer",
+        "experience_level": "junior", "difficulty": "easy", "duration_minutes": 1,
+        "question_count": 2, "focus_areas": [], "default_questions_or_topics": [],
+        "max_pauses_allowed": 3, "is_archived": False,
+    }
+    session = {
+        "id": "outage-session", "template_id": template["id"], "template_title": template["title"],
+        "status": "in_progress", "attempt_number": 1, "pause_count": 0, "max_pauses_allowed": 3,
+        "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None, "total_score": None,
+        "remaining_seconds": 50, "feedback": {},
+        "transcript": [{"role": "assistant", "content": "Explain transactions", "timestamp": "2026-01-01T00:00:00Z"}],
+    }
+    messages = []
+    ended = []
+    drafts = []
+
+    def api(route):
+        path = urlparse(route.request.url).path
+        if path == "/interviews/templates":
+            data = [template]
+        elif path == "/interviews/my-requests":
+            data = []
+        elif path == "/interviews/my-sessions":
+            data = [session]
+        elif path == "/interviews/outage-session/results":
+            data = session
+        elif path == "/interviews/outage-session/draft":
+            session["feedback"]["draft_answer"] = route.request.post_data_json["response_text"]
+            drafts.append(session["feedback"]["draft_answer"])
+            data = {"message": "Draft saved"}
+        elif path == "/interviews/outage-session/message":
+            text = route.request.post_data_json["response_text"]
+            messages.append(text)
+            if len(messages) == 1:
+                session["transcript"].append({"role": "user", "content": text, "timestamp": "2026-01-01T00:00:01Z"})
+                session["status"] = "paused"
+                session["feedback"] = {"pending_evaluation": True}
+                route.fulfill(status=503, json={"detail": "AI unavailable. Your answers are saved in the database. Please try again after some time."})
+                return
+            session["status"] = "in_progress"
+            session["feedback"] = {"turns": [{"score": 8}]}
+            session["transcript"].append({"role": "assistant", "content": "How does rollback work?", "timestamp": "2026-01-01T00:00:02Z"})
+            data = {"score": 8}
+        elif path == "/interviews/outage-session/end":
+            ended.append(True)
+            data = {"message": "Closed"}
+        else:
+            data = base_response(path)
+        route.fulfill(json=data)
+
+    page.route(f"{api_url}/**", api)
+    sign_in(page, frontend_url)
+    page.get_by_role("button", name="Interviews", exact=True).click()
+    page.get_by_role("button", name="Resume", exact=True).click()
+    answer = "All changes commit together or roll back together."
+    page.get_by_role("textbox").fill(answer)
+    expect(page.get_by_text("Draft saved in the database.", exact=True)).to_be_visible()
+    assert drafts[-1] == answer
+    page.get_by_role("button", name="Submit Response", exact=True).click()
+    expect(page.get_by_role("alert")).to_contain_text("try again after some time")
+    expect(page.get_by_role("textbox")).to_be_disabled()
+    page.reload()
+    page.get_by_role("button", name="Interviews", exact=True).click()
+    page.get_by_role("button", name="Resume", exact=True).click()
+    expect(page.get_by_role("textbox")).to_have_value(answer)
+    expect(page.get_by_role("button", name="Retry AI and continue")).to_be_visible()
+    page.clock.install()
+    page.clock.run_for(90_000)
+    expect(page.get_by_text("0:50", exact=True)).to_be_visible()
+    assert not ended
+    page.get_by_role("button", name="Retry AI and continue").click()
+    expect(page.get_by_text("How does rollback work?", exact=True)).to_be_visible()
+    expect(page.get_by_role("textbox")).to_be_editable()
+    assert messages == [answer, answer]
+    assert sum(turn["role"] == "user" for turn in session["transcript"]) == 1

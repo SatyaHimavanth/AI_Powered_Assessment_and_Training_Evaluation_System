@@ -178,7 +178,9 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
       setImportId(data.import_id || data.id || null);
       setImportPreview((data.preview || data) as ImportPreview);
       setImportErrors(data.errors || null);
-      setMessage("Import uploaded and validated");
+      setMessage(data.errors?.length
+        ? "Import contains validation errors. Review them below; only valid rows can be used."
+        : "Import uploaded and validated");
     } catch (err: unknown) {
       console.error(err);
       setMessage("Failed to upload import");
@@ -438,17 +440,15 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
       <div className={`${card} p-6`}>
         <h2 className="text-sm font-semibold mb-1">Create Assessment</h2>
         <p className="text-xs text-[var(--color-text-secondary)] mb-4">Set up the assessment content, choose its audience, then confirm the schedule.</p>
-        <ol className="mb-5 grid grid-cols-3 gap-2" aria-label="Assessment setup steps">
-          {["1. Content", "2. Audience", "3. Schedule & review"].map((step) => (
-            <li key={step} className="rounded-md bg-gray-50 px-3 py-2 text-xs font-medium text-[var(--color-text-secondary)]">{step}</li>
-          ))}
-        </ol>
+        <p className="text-xs text-[var(--color-text-secondary)] mb-5">Fields marked * are required.</p>
 
         <div className="space-y-4">
           <div className="grid grid-cols-3 gap-4">
             <div className="col-span-2">
-              <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Title</label>
+              <label htmlFor="assessment-title" className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Title *</label>
               <input
+                id="assessment-title"
+                required
                 type="text"
                 value={assessmentTitle}
                 onChange={(e) => setAssessmentTitle(e.target.value)}
@@ -457,8 +457,10 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Duration (active minutes)</label>
+              <label htmlFor="assessment-duration" className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Duration (active minutes) *</label>
               <input
+                id="assessment-duration"
+                required
                 type="number"
                 value={assessmentDuration}
                 onChange={(e) => setAssessmentDuration(Number(e.target.value))}
@@ -492,8 +494,9 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
           {/* Start/End Time */}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Start Time</label>
+              <label htmlFor="assessment-start-time" className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">Start Time (optional)</label>
               <input
+                id="assessment-start-time"
                 type="datetime-local"
                 value={startTime}
                 onChange={(e) => setStartTime(e.target.value)}
@@ -501,8 +504,9 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">End Time</label>
+              <label htmlFor="assessment-end-time" className="block text-xs font-medium text-[var(--color-text-secondary)] mb-1.5">End Time (optional)</label>
               <input
+                id="assessment-end-time"
                 type="datetime-local"
                 value={endTime}
                 onChange={(e) => setEndTime(e.target.value)}
@@ -542,13 +546,14 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
 
           {/* Batch Selection */}
           {assignmentMode === "batches" && <div>
-            <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-2">Assign to Batches</label>
+            <label htmlFor="assessment-batch-search" className="block text-xs font-medium text-[var(--color-text-secondary)] mb-2">Assign to Batches *</label>
+            <p className="text-xs text-[var(--color-text-secondary)] mb-2">Select at least one batch.</p>
             {visibleBatches.length === 0 ? (
               <p className="text-xs text-[var(--color-text-secondary)]">No batches available. Create a batch first.</p>
             ) : (
               <div className="space-y-2">
                 <div className="min-h-10 w-full px-3 py-2 border border-[var(--color-border)] rounded-[var(--radius-sm)] bg-white focus-within:border-[var(--color-primary)] focus-within:ring-2 focus-within:ring-blue-100">
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex max-h-40 flex-wrap items-center gap-2 overflow-y-auto">
                     {selectedBatches.map((batch) => (
                       <span
                         key={batch.id}
@@ -566,6 +571,7 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                       </span>
                     ))}
                     <input
+                      id="assessment-batch-search"
                       type="text"
                       value={batchSearch}
                       onChange={(e) => setBatchSearch(e.target.value)}
@@ -614,13 +620,14 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
           </div>}
 
           {assignmentMode === "users" && <div>
-            <label className="block text-xs font-medium text-[var(--color-text-secondary)] mb-2">Assign to Individual Users</label>
+            <label htmlFor="assessment-user-search" className="block text-xs font-medium text-[var(--color-text-secondary)] mb-2">Assign to Individual Users *</label>
+            <p className="text-xs text-[var(--color-text-secondary)] mb-2">Select at least one user.</p>
             {visibleUsers.length === 0 ? (
               <p className="text-xs text-[var(--color-text-secondary)]">No active candidate accounts are available.</p>
             ) : (
               <div className="space-y-2">
                 <div className="min-h-10 w-full px-3 py-2 border border-[var(--color-border)] rounded-[var(--radius-sm)] bg-white focus-within:border-[var(--color-primary)] focus-within:ring-2 focus-within:ring-blue-100">
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex max-h-40 flex-wrap items-center gap-2 overflow-y-auto">
                     {selectedUsers.map((user) => (
                       <span
                         key={user.id}
@@ -638,6 +645,7 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                       </span>
                     ))}
                     <input
+                      id="assessment-user-search"
                       type="search"
                       value={userSearch}
                       onChange={(e) => setUserSearch(e.target.value)}
@@ -679,7 +687,7 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
           
           <div className="flex items-center gap-4 mb-3">
             <div className="inline-flex items-center gap-3">
-              <div className="text-sm font-medium text-[var(--color-text-secondary)]">Source</div>
+              <div className="text-sm font-medium text-[var(--color-text-secondary)]">Source *</div>
               <div
                 role="tablist"
                 aria-label="Assessment source"
@@ -720,7 +728,7 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
           {!useImport ? (
             <div>
               <div className="flex items-center justify-between mb-3">
-                <label className="text-xs font-medium text-[var(--color-text-secondary)]">Sections</label>
+                <span className="text-xs font-medium text-[var(--color-text-secondary)]">Sections * (at least one)</span>
                 <button
                   type="button"
                   onClick={addTopicConfig}
@@ -769,8 +777,10 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                           />
                         </div>
                         <div>
-                          <label className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Topic</label>
+                          <label htmlFor={`assessment-topic-${idx}`} className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Topic *</label>
                           <select
+                            id={`assessment-topic-${idx}`}
+                            required
                             value={tc.topic_id}
                             onChange={(e) => updateTopicConfig(idx, "topic_id", e.target.value)}
                             className={`${selectClass} w-full`}
@@ -782,8 +792,10 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                           </select>
                         </div>
                         <div>
-                          <label className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Type</label>
+                          <label htmlFor={`assessment-type-${idx}`} className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Type *</label>
                           <select
+                            id={`assessment-type-${idx}`}
+                            required
                             value={tc.question_type}
                             onChange={(e) => updateTopicConfig(idx, "question_type", e.target.value)}
                             className={`${selectClass} w-full`}
@@ -795,8 +807,10 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                           </select>
                         </div>
                         <div>
-                          <label className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Difficulty</label>
+                          <label htmlFor={`assessment-difficulty-${idx}`} className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">Difficulty *</label>
                           <select
+                            id={`assessment-difficulty-${idx}`}
+                            required
                             value={tc.difficulty}
                             onChange={(e) => updateTopicConfig(idx, "difficulty", e.target.value)}
                             className={`${selectClass} w-full`}
@@ -807,8 +821,8 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                           </select>
                         </div>
                         <div>
-                          <label className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">
-                            Questions
+                          <label htmlFor={`assessment-count-${idx}`} className="block text-[10px] font-medium text-[var(--color-text-secondary)] mb-1">
+                            Questions *
                             {availableCounts[`${idx}`] !== undefined && (
                               <span className="ml-1 text-[var(--color-text-secondary)]">
                                 (max: {availableCounts[`${idx}`]})
@@ -816,6 +830,8 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
                             )}
                           </label>
                           <input
+                            id={`assessment-count-${idx}`}
+                            required
                             type="number"
                             value={tc.question_count}
                             onChange={(e) => updateTopicConfig(idx, "question_count", Number(e.target.value))}
@@ -842,11 +858,11 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
           ) : (
             <div>
               <div className="flex items-center justify-between mb-3">
-                <label className="text-xs font-medium text-[var(--color-text-secondary)]">Import Questions (Excel)</label>
+                <label htmlFor="assessment-import" className="text-xs font-medium text-[var(--color-text-secondary)]">Import Questions (Excel) *</label>
                 <div className="text-xs text-[var(--color-text-secondary)]">Upload .xlsx (each sheet is a section)</div>
               </div>
               <div className="border border-dashed rounded-[var(--radius-sm)] p-4">
-                <input type="file" accept=".xlsx,.xls" onChange={handleImportFileChange} className="text-sm" />
+                <input id="assessment-import" required type="file" accept=".xlsx,.xls" onChange={handleImportFileChange} className="text-sm" />
                 {importing && <p className="text-xs text-[var(--color-text-secondary)] mt-2">Uploading and validating...</p>}
                 {importPreview && (
                   <div className="mt-3 bg-white p-3 rounded border border-gray-200 text-sm text-[var(--color-text-secondary)]">

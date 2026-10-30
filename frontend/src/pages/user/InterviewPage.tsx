@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import api from "../../api";
+import { AnswerSaveQueue } from "../../answerSaveQueue";
 import SpeechToTextControl, { type SpeechToTextControlHandle } from "../../components/SpeechToTextControl";
 
 interface InterviewTemplate {
@@ -37,6 +38,7 @@ interface SessionResult {
   started_at: string | null;
   remaining_seconds: number | null;
   transcript: { role: string; content: string; timestamp: string }[];
+  feedback?: { pending_evaluation?: boolean; draft_answer?: string };
 }
 
 interface Props {
@@ -82,6 +84,12 @@ function apiErrorDetail(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function isProviderUnavailable(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "response" in error
+    && typeof error.response === "object" && error.response !== null
+    && "status" in error.response && error.response.status === 503;
+}
+
 export default function InterviewPage({ templateId, sessionId: resumeSessionId, onExit }: Props) {
   const [phase, setPhase] = useState<Phase>(resumeSessionId ? "interview" : "details");
   const [template, setTemplate] = useState<InterviewTemplate | null>(null);
@@ -96,6 +104,9 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   const [isTtsSpeaking, setIsTtsSpeaking] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [aiPaused, setAiPaused] = useState(false);
+  const [draftSaveStatus, setDraftSaveStatus] = useState("");
+  const [draftSaveFailed, setDraftSaveFailed] = useState(false);
 
   const lastSpokenRef = useRef<string>("");
   const sessionIdRef = useRef<string | null>(null);
@@ -110,6 +121,35 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
   const submitDraftRef = useRef<(auto: boolean) => Promise<void>>(async () => {});
   const submitMessageRef = useRef<(sessionId: string, text: string, auto: boolean) => Promise<void>>(async () => {});
   const reportInterruptRef = useRef<(sessionId: string) => Promise<void>>(async () => {});
+  const draftQueueRef = useRef<AnswerSaveQueue | null>(null);
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function initializeDraftQueue(sessionId: string) {
+    draftQueueRef.current = new AnswerSaveQueue(async (_key, answer) => {
+      await api.put(`/interviews/${sessionId}/draft`, { response_text: answer });
+    });
+  }
+
+  function updateDraft(text: string) {
+    draftRef.current = text;
+    setDraft(text);
+    draftQueueRef.current?.enqueue("draft", text);
+    setDraftSaveFailed(false);
+    setDraftSaveStatus("Saving draft...");
+    if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = setTimeout(() => {
+      void draftQueueRef.current?.flush().then(() => {
+        setDraftSaveStatus("Draft saved in the database.");
+      }).catch(() => {
+        setDraftSaveFailed(true);
+        setDraftSaveStatus("Draft could not be saved. Keep this page open and retry saving.");
+      });
+    }, 500);
+  }
+
+  useEffect(() => () => {
+    if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+  }, []);
 
   // Keep draftRef in sync
   useEffect(() => { draftRef.current = draft; }, [draft]);
@@ -160,14 +200,21 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
         if (cancelled) return;
         const transcript = Array.isArray(result.transcript) ? result.transcript : [];
         const pendingAnswer = transcript[transcript.length - 1];
+        const awaitingAI = Boolean(result.feedback?.pending_evaluation);
+        setAiPaused(awaitingAI);
+        initializeDraftQueue(resumeSessionId);
+        if (typeof result.feedback?.draft_answer === "string") {
+          setDraft(result.feedback.draft_answer);
+          setDraftSaveStatus("Draft restored from the database.");
+        }
         if (pendingAnswer?.role === "user" && typeof pendingAnswer.content === "string") {
           setDraft(pendingAnswer.content);
-          setError("Your last answer was saved but could not be evaluated. Retry it to continue.");
+          setError("Your last answer is saved in the database. AI evaluation is pending; please try again after some time to continue.");
         }
-        if (result.status === "paused") {
+        if (result.status === "paused" && !awaitingAI) {
           await api.post(`/interviews/${resumeSessionId}/resume`);
           if (cancelled) return;
-        } else if (result.status !== "in_progress" && result.status !== "started") {
+        } else if (result.status !== "paused" && result.status !== "in_progress" && result.status !== "started") {
           setPhase("completed");
           return;
         }
@@ -178,7 +225,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
           : template.duration_minutes * 60;
         setOverallSecondsLeft(result.remaining_seconds ?? Math.max(0, template.duration_minutes * 60 - elapsed));
         setPhase("interview");
-        markPotentialInterrupt(resumeSessionId);
+        if (!awaitingAI) markPotentialInterrupt(resumeSessionId);
         try {
           await document.documentElement.requestFullscreen();
         } catch (fullscreenError) {
@@ -211,6 +258,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       );
       const newSession: InterviewSession = res.data;
       setSession(newSession);
+      initializeDraftQueue(newSession.id);
       sessionIdRef.current = newSession.id;
       setDraft("");
       setEditSecondsLeft(null);
@@ -231,7 +279,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
   // Overall interview timer countdown
   useEffect(() => {
-    if (phase !== "interview") return;
+    if (phase !== "interview" || aiPaused || isSubmittingDraft || !session) return;
     overallTimerRef.current = window.setInterval(() => {
       setOverallSecondsLeft((prev) => {
         if (prev <= 1) {
@@ -246,10 +294,10 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
     return () => {
       if (overallTimerRef.current) window.clearInterval(overallTimerRef.current);
     };
-  }, [phase]);
+  }, [phase, aiPaused, isSubmittingDraft, session]);
 
   // Edit window timer (starts when mic stops, 3 minutes)
-  const isEditTimerActive = editSecondsLeft !== null;
+  const isEditTimerActive = editSecondsLeft !== null && !aiPaused && !isSubmittingDraft;
   useEffect(() => {
     if (!isEditTimerActive) {
       if (editTimerRef.current) {
@@ -291,7 +339,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       silenceTimerRef.current = null;
     }
     // Start 3-minute edit window
-    setEditSecondsLeft(180);
+    if (!aiPaused && !submittingDraftRef.current) setEditSecondsLeft(180);
   };
 
   // Handle mic started
@@ -303,7 +351,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
   // TTS for AI messages - auto-start mic after TTS completes
   useEffect(() => {
-    if (!sessionResult || !ttsEnabled) return;
+    if (!sessionResult || !ttsEnabled || aiPaused) return;
     const transcript = sessionResult.transcript || [];
     if (!transcript.length) return;
     const last = transcript[transcript.length - 1];
@@ -326,11 +374,11 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       window.speechSynthesis.speak(utter);
       lastSpokenRef.current = last.content;
     }
-  }, [sessionResult, ttsEnabled]);
+  }, [sessionResult, ttsEnabled, aiPaused]);
 
   // Disconnect tracking
   useEffect(() => {
-    if (phase !== "interview" || !sessionIdRef.current) return;
+    if (phase !== "interview" || !sessionIdRef.current || aiPaused || isSubmittingDraft) return;
 
     const onBeforeUnload = () => {
       markPotentialInterrupt(sessionIdRef.current);
@@ -364,7 +412,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       window.removeEventListener("online", onOnline);
       document.removeEventListener("fullscreenchange", onFullscreenChange);
     };
-  }, [phase]);
+  }, [phase, aiPaused, isSubmittingDraft]);
 
   async function reportInterrupt(sessionId: string) {
     try {
@@ -378,8 +426,18 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
   async function submitMessage(sessionId: string, text: string, auto = false) {
     if (submittingDraftRef.current) return;
+    const transcriptLengthBeforeSubmission = sessionResult?.transcript.length ?? 0;
     submittingDraftRef.current = true;
+    micRef.current?.stop();
     setIsSubmittingDraft(true);
+    setEditSecondsLeft(null);
+    setError("");
+    if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+    try {
+      await draftQueueRef.current?.flush();
+    } catch {
+      setDraftSaveStatus("Draft save could not be confirmed; submitting the full answer now.");
+    }
     try {
       const res = await api.post(
         `/interviews/${sessionId}/message`,
@@ -389,14 +447,48 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
       const fromAuto = auto ? " (auto-submitted)" : "";
       console.log(`Response submitted${fromAuto}. Score: ${res.data?.score ?? "N/A"}`);
       setDraft("");
+      initializeDraftQueue(sessionId);
+      setDraftSaveStatus("");
+      setDraftSaveFailed(false);
+      setAiPaused(false);
       setEditSecondsLeft(null); // Reset edit timer
-      await loadSessionResult(sessionId);
+      const restored = await loadSessionResult(sessionId);
+      if (typeof restored.remaining_seconds === "number") setOverallSecondsLeft(restored.remaining_seconds);
       // If TTS is disabled, start edit window immediately for next response
       if (!ttsEnabled) {
         setEditSecondsLeft(180);
       }
     } catch (err: unknown) {
       setError(apiErrorDetail(err, "Failed to submit response"));
+      let savedPendingAnswer = isProviderUnavailable(err);
+      if (!savedPendingAnswer) {
+        try {
+          const restored = await loadSessionResult(sessionId);
+          savedPendingAnswer = Boolean(restored.feedback?.pending_evaluation);
+          const last = restored.transcript?.[restored.transcript.length - 1];
+          const submittedTurn = restored.transcript?.[restored.transcript.length - 2];
+          if (!savedPendingAnswer && last?.role === "assistant"
+            && restored.transcript.length > transcriptLengthBeforeSubmission
+            && submittedTurn?.role === "user" && submittedTurn.content === text) {
+            setAiPaused(false);
+            setDraft("");
+            initializeDraftQueue(sessionId);
+            setError("");
+            if (typeof restored.remaining_seconds === "number") setOverallSecondsLeft(restored.remaining_seconds);
+          }
+        } catch (recoveryError) {
+          console.error("Could not confirm interview submission status", recoveryError);
+          setError("Submission could not be confirmed. Keep this page open and reconnect before retrying; your latest answer may not have reached the server.");
+        }
+      }
+      if (savedPendingAnswer) {
+        setAiPaused(true);
+        setDraft(text);
+        setError("AI evaluation is pending. Your questions and answers are saved in the database, and the timer is paused. Please try again after some time to continue.");
+        initializeDraftQueue(sessionId);
+        clearPotentialInterrupt(sessionId);
+        if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+      }
     } finally {
       submittingDraftRef.current = false;
       setIsSubmittingDraft(false);
@@ -586,7 +678,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
                   </button>
                   <button
                     onClick={startInterview}
-                    disabled={loading}
+                    disabled={loading || aiPaused || isSubmittingDraft}
                     className="h-11 px-8 text-sm font-semibold rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
                   >
                     {loading ? "Starting..." : "Start Interview"}
@@ -664,7 +756,7 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
             <button
               onClick={endInterview}
-              disabled={loading}
+              disabled={loading || aiPaused || isSubmittingDraft}
               className="h-8 px-4 text-xs font-medium rounded-lg bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50"
             >
               End
@@ -673,6 +765,34 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
         </div>
 
         {/* Transcript */}
+        {error && (
+          <div role="alert" className="border-b border-amber-200 bg-amber-50 px-6 py-3 text-sm text-amber-900">
+            {error}
+          </div>
+        )}
+        {aiPaused && (
+          <div className="border-b border-blue-200 bg-blue-50 px-6 py-4 text-sm">
+            <p>Your progress is saved in the database. You can close this page and resume from My Interview Sessions later. This AI pause does not use a pause allowance.</p>
+            <div className="mt-3 flex gap-3">
+              <button
+                type="button"
+                disabled={isSubmittingDraft || !draft.trim()}
+                onClick={() => void submitDraft(false)}
+                className="rounded bg-blue-600 px-4 py-2 text-white disabled:opacity-50"
+              >
+                {isSubmittingDraft ? "Retrying..." : "Retry AI and continue"}
+              </button>
+              <button
+                type="button"
+                disabled={isSubmittingDraft}
+                onClick={() => { clearPotentialInterrupt(sessionIdRef.current); onExit(); }}
+                className="rounded border border-blue-300 px-4 py-2"
+              >
+                Return to interviews
+              </button>
+            </div>
+          </div>
+        )}
         <div className="flex-1 overflow-auto p-6 bg-gray-50">
           <div className="max-w-3xl mx-auto space-y-3">
             {(sessionResult.transcript || []).map((m, idx) => (
@@ -702,9 +822,10 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
               </div>
               <SpeechToTextControl
                 ref={micRef}
-                disabled={isSubmittingDraft || isTtsSpeaking}
+                disabled={isSubmittingDraft || isTtsSpeaking || aiPaused}
                 onTranscriptChange={(text) => {
-                  setDraft((prev) => (prev ? `${prev} ${text}` : text));
+                  if (submittingDraftRef.current || aiPaused) return;
+                  updateDraft((draftRef.current ? `${draftRef.current} ${text}` : text).slice(0, 20_000));
                   // Reset silence timer on new speech
                   if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
                   silenceTimerRef.current = setTimeout(() => {
@@ -720,17 +841,28 @@ export default function InterviewPage({ templateId, sessionId: resumeSessionId, 
 
             <textarea
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              disabled={isSubmittingDraft || isMicActive}
+              onChange={(e) => updateDraft(e.target.value)}
+              maxLength={20_000}
+              disabled={isSubmittingDraft || isMicActive || aiPaused}
               className="w-full min-h-20 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
               placeholder={isMicActive ? "Mic is active — speak your response..." : "Edit your response here, or use mic to dictate..."}
             />
+            {draftSaveStatus && (
+              <div role="status" className="text-xs text-gray-600">
+                {draftSaveStatus}
+                {draftSaveFailed && !aiPaused && !isSubmittingDraft && (
+                  <button type="button" className="ml-2 text-blue-700 underline" onClick={() => updateDraft(draftRef.current)}>
+                    Retry saving draft
+                  </button>
+                )}
+              </div>
+            )}
 
             <div className="flex justify-end">
               <button
                 type="button"
                 onClick={() => void submitDraft(false)}
-                disabled={isSubmittingDraft || !(draft || "").trim()}
+                disabled={isSubmittingDraft || aiPaused || isMicActive || !(draft || "").trim()}
                 className="h-9 px-4 text-sm font-medium rounded-lg bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSubmittingDraft ? "Submitting..." : "Submit Response"}

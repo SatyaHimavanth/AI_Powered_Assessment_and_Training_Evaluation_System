@@ -3,7 +3,7 @@ from typing import Any
 
 from langchain.agents import create_agent
 
-from app.llms import get_chat_model
+from app.llms import AIServiceUnavailable, get_chat_model
 
 
 _BASE_SYSTEM_PROMPT = (
@@ -62,7 +62,6 @@ def generate_opening_question(
     default_questions: list[str] | None,
     system_prompt: str | None = None,
 ) -> str:
-    agent = get_interview_agent(system_prompt)
     focus = " | ".join(focus_areas or []) or "problem solving"
 
     # If default questions are provided, use the first one directly
@@ -75,11 +74,14 @@ def generate_opening_question(
         f"Focus areas (topics to cover): {focus}."
     )
     try:
+        agent = get_interview_agent(system_prompt)
         result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
         text = _extract_text_from_result(result).strip()
-    except Exception:
-        text = ""
-    return text or "Tell me about a challenging technical problem you solved recently."
+        if not text:
+            raise ValueError("The opening question was empty")
+        return text
+    except Exception as exc:
+        raise AIServiceUnavailable("Interview opening provider failed. Please try again after some time.") from exc
 
 
 def evaluate_and_generate_followup(
@@ -97,7 +99,6 @@ def evaluate_and_generate_followup(
     evaluation_rubric: dict[str, Any] | None = None,
     conversation: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    agent = get_interview_agent(system_prompt)
     focus = " | ".join(focus_areas or []) or "problem solving"
     topic_instruction = ""
     if current_topic_turns >= max_followup_depth:
@@ -115,7 +116,16 @@ def evaluate_and_generate_followup(
             f"\"{default_questions[current_turn]}\""
         )
 
-    history_json = json.dumps(conversation or [], ensure_ascii=False)[:20_000]
+    recent_history = list(conversation or [])
+    history_json = json.dumps(recent_history, ensure_ascii=False)
+    while len(history_json) > 20_000 and len(recent_history) > 1:
+        recent_history.pop(0)
+        history_json = json.dumps(recent_history, ensure_ascii=False)
+    if len(history_json) > 20_000:
+        last = recent_history[-1]
+        history_json = json.dumps([{
+            "role": last.get("role"), "content": str(last.get("content", ""))[-10_000:],
+        }], ensure_ascii=False)
     candidate_json = json.dumps(candidate_response, ensure_ascii=False)[:20_000]
     prompt = (
         "Evaluate this interview response and produce the next interviewer question. "
@@ -132,10 +142,11 @@ def evaluate_and_generate_followup(
         f"<candidate_response_json>{candidate_json}</candidate_response_json>"
     )
     try:
+        agent = get_interview_agent(system_prompt)
         result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
         raw = _extract_text_from_result(result).strip()
     except Exception as exc:
-        raise RuntimeError("Interview evaluation provider failed") from exc
+        raise AIServiceUnavailable("Interview evaluation provider failed") from exc
 
     try:
         parsed = json.loads(raw)

@@ -113,11 +113,25 @@ default they do not connect to the configured application database. They cover:
 | An admin approves a retry after a completed/missed/abandoned interview | Approval starts exactly one new attempt; consumed approvals cannot be reused |
 | An interview ends at its deadline or the end request is retried | Completion is successful and idempotent |
 | Evaluation finishes after an accepted interview answer and session end | The accepted answer keeps its evaluation |
+| Interview AI fails to initialize or returns malformed evaluation | Start failures keep approval unused; accepted answers pause durably and show a retry-later message |
+| A process/browser restarts while AI evaluation is pending | Reopen the database-backed transcript and retry the same answer, without duplicate turns or consuming downtime |
+| A candidate types or dictates an interview draft | Save to database; restore server draft without relying on browser answer storage |
 | An assessment reconnects after deadline within its offline-sync grace | One draft is applied; subsequent retries cannot overwrite finalized answers |
 | Practice evaluation fails after submission | Answers remain persisted; a later submission can complete successfully |
+| The third bank-generated single-choice question has zero or multiple correct options | Regenerate with validation feedback; only a valid complete batch reaches staging |
+| Repeated bank-generation responses remain invalid | Stop after three attempts for the affected chunk, retain a failed status, and never call downstream embedding/staging |
 | Interview start or registration resubmission arrives twice concurrently | Only one attempt/request is accepted |
 | A successful interview resume is retried | Pause counters and accumulated duration remain unchanged |
 | Several administrators publish assessments from overlapping section pools | Each assessment retains distinct questions and creation completes without database errors |
+
+`tests/test_generation_batch_management.py` covers generation metadata in all
+states, create/list response consistency, failed-only retry/delete, ownership,
+partial-staging and temporary-embedding cleanup, bank-question preservation,
+retry through the worker, and simultaneous retry/delete requests. It uses
+synthetic embedding values solely for lifecycle checks, not similarity quality.
+Run with the backend Python environment; concurrency cases require
+`REALWORLD_TEST_DATABASE_URL`. Retry is deliberately blocked if the batch has
+approved output; deletion still retains saved bank content.
 
 When run in the standalone TestSuite environment, local regression scenarios
 skip if backend dependencies are absent. PostgreSQL-only concurrency scenarios
@@ -232,11 +246,20 @@ Coverage includes:
 
 - native structured-output grading with correct, incorrect, and partial answers;
 - interview evaluation and follow-up schema compatibility;
-- generation of text, single-choice and multiple-choice questions;
+- generation of text, single-choice and multiple-choice questions with 2- and
+  10-question batches, plus a 25-question hard single-choice request;
+- recovery from an injected invalid third answer key using a real Cisco
+  correction response, with exact count and answer-key assertions;
 - ten-question practice generation and actual worker persistence;
 - offline verification that structured calls obtain current OAuth tokens;
 - provider failure preserving an empty question set, exposing a failed state,
   and allowing explicit generation retry.
+
+Generated bank multi-choice questions must have two or three correct options,
+and both bank and practice options must have distinct trimmed, case-insensitive
+labels. Practice multi-choice also requires at least one incorrect option.
+Deterministic tests cover these constraints and do not infer factual correctness
+from the marked answer key.
 
 **No embedding model is required for these checks.** Question generation stops
 before the embedding/similarity stages. The tests do not fabricate embeddings,

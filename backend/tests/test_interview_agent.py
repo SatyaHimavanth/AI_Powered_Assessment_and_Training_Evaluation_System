@@ -86,3 +86,43 @@ def test_provider_failure_remains_retryable_and_is_not_silently_graded(monkeypat
             focus_areas=[],
             candidate_response="answer",
         )
+
+
+def test_predefined_opening_does_not_initialize_ai(monkeypatch):
+    monkeypatch.setattr(
+        interview_agent, "get_interview_agent",
+        lambda *_args: pytest.fail("A predefined question must not need a model"),
+    )
+    assert interview_agent.generate_opening_question(
+        "id", "Engineer", "junior", "easy", [], ["Existing question"],
+    ) == "Existing question"
+
+
+@pytest.mark.parametrize("failure", ["initialization", "invoke", "empty"])
+def test_opening_failure_is_explicit_instead_of_generic_fallback(monkeypatch, failure):
+    from app.llms import AIServiceUnavailable
+
+    def agent(*_args):
+        if failure == "initialization":
+            raise RuntimeError("Missing provider config")
+        if failure == "empty":
+            return StubAgent("")
+        return SimpleNamespace(invoke=lambda *_args: (_ for _ in ()).throw(TimeoutError("timeout")))
+
+    monkeypatch.setattr(interview_agent, "get_interview_agent", agent)
+    with pytest.raises(AIServiceUnavailable, match="try again after some time"):
+        interview_agent.generate_opening_question("id", "Engineer", "junior", "easy", [], [])
+
+
+def test_long_interview_uses_newest_database_context_as_valid_json(monkeypatch):
+    stub = StubAgent(json.dumps({
+        "score": 7, "strengths": [], "improvements": [], "feedback": "Good", "next_question": "Next?",
+    }))
+    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda *_args: stub)
+    conversation = [{"role": "user", "content": f"Earlier {i} " + "x" * 1000} for i in range(30)]
+    conversation.append({"role": "assistant", "content": "Newest stored question"})
+    interview_agent.evaluate_and_generate_followup("id", "Engineer", "junior", "easy", [], "Answer", conversation=conversation)
+    context = stub.prompt.split("<interview_history_json>")[1].split("</interview_history_json>")[0]
+    restored = json.loads(context)
+    assert restored[-1]["content"] == "Newest stored question"
+    assert len(context) <= 20_000

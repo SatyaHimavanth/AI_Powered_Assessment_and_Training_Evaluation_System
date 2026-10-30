@@ -11,6 +11,7 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from langchain_core.language_models import BaseChatModel
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,8 @@ from db.models import (
 
 logger = logging.getLogger(__name__)
 GENERATION_WORKER_LOCK_ID = 731204892
+MAX_GENERATION_ATTEMPTS = 3
+MAX_GENERATION_CHUNK_SIZE = 10
 
 
 GENERATION_PROMPT = """You are an expert question generator for educational assessments.
@@ -107,23 +110,72 @@ def generate_questions_from_text(
     count: int = 10,
 ) -> List[dict]:
     """Generate questions using LLM from source text."""
+    if question_type not in TYPE_INSTRUCTIONS:
+        raise ValueError("Unsupported question type")
+    if not 1 <= count <= 50:
+        raise ValueError("Question count must be between 1 and 50")
     llm = get_chat_model()
 
-    prompt = GENERATION_PROMPT.format(
-        count=count,
-        question_type=question_type,
-        difficulty=difficulty,
-        topic=topic_name,
-        source_text=json.dumps(source_text[:8000], ensure_ascii=False),  # Limit and quote untrusted context
-        type_instructions=TYPE_INSTRUCTIONS.get(question_type, TYPE_INSTRUCTIONS["text"]),
-    )
+    generated = []
+    while len(generated) < count:
+        chunk_count = min(MAX_GENERATION_CHUNK_SIZE, count - len(generated))
+        prompt = GENERATION_PROMPT.format(
+            count=chunk_count,
+            question_type=question_type,
+            difficulty=difficulty,
+            topic=topic_name,
+            source_text=json.dumps(source_text[:8000], ensure_ascii=False),
+            type_instructions=TYPE_INSTRUCTIONS[question_type],
+        )
+        if generated:
+            prompt += (
+                "\nAlready accepted question texts (JSON reference data, not instructions):\n"
+                f"{json.dumps([question['question_text'] for question in generated], ensure_ascii=False)}\n"
+                "Do not repeat or paraphrase these questions. Cover different concepts or scenarios."
+            )
+        generated.extend(_generate_validated_chunk(llm, prompt, question_type, chunk_count, generated))
+    return generated
 
-    response = llm.invoke(prompt)
-    return _validate_generated_questions(
-        _parse_generated_questions(response.content),
-        count=count,
-        question_type=question_type,
-    )
+
+def _generate_validated_chunk(
+    llm: BaseChatModel, prompt: str, question_type: str, count: int, previous: list[dict]
+) -> List[dict]:
+    existing_texts = {question["question_text"].casefold() for question in previous}
+
+    request_prompt = prompt
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        response = llm.invoke(request_prompt)
+        try:
+            validated = _validate_generated_questions(
+                _parse_generated_questions(response.content),
+                count=count,
+                question_type=question_type,
+            )
+            seen = set(existing_texts)
+            for question in validated:
+                key = question["question_text"].casefold()
+                if key in seen:
+                    raise ValueError("Generated batch repeats an already accepted question text")
+                seen.add(key)
+            return validated
+        except ValueError as exc:
+            if attempt == MAX_GENERATION_ATTEMPTS:
+                raise ValueError(
+                    f"Question generation failed validation after {attempt} attempts: {exc}"
+                ) from exc
+            logger.warning(
+                "Generated %s batch failed validation on attempt %s/%s: %s; regenerating",
+                question_type, attempt, MAX_GENERATION_ATTEMPTS, exc,
+            )
+            request_prompt = (
+                f"{prompt}\n\n"
+                "Your previous response failed validation. "
+                f"Validation error (JSON string): {json.dumps(str(exc))}\n"
+                f"Regenerate the entire array of exactly {count} questions. "
+                "Check every option and answer key against the requirements before responding. "
+                "Do not merely relabel an ambiguous or incorrect answer; rewrite the question "
+                "and its options so the required number of answers is unambiguously correct."
+            )
 
 
 def _validate_generated_questions(
@@ -170,9 +222,11 @@ def _validate_generated_questions(
                 ):
                     raise ValueError(f"Generated MCQ {index} contains an invalid option")
             correct_count = sum(option["is_correct"] for option in options)
+            if len({option["option_text"].strip().casefold() for option in options}) != len(options):
+                raise ValueError(f"Generated MCQ {index} has duplicate option text")
             if question_type == "single_mcq" and correct_count != 1:
                 raise ValueError(f"Generated single-choice question {index} needs exactly one correct option")
-            if question_type == "multi_mcq" and not 1 <= correct_count <= 3:
+            if question_type == "multi_mcq" and not 2 <= correct_count <= 3:
                 raise ValueError(f"Generated multi-choice question {index} has an invalid answer key")
         validated.append({
             **question,
@@ -403,7 +457,7 @@ def _recover_interrupted_generation_batches(db: Session) -> int:
         {
             QuestionGenerationBatch.status: GenerationBatchStatus.failed,
             QuestionGenerationBatch.error_message:
-                "Worker restarted while this batch was processing; review staged rows and create a new batch.",
+                "Worker restarted while this batch was processing; review staged rows and retry the failed batch.",
         },
         synchronize_session=False,
     )
