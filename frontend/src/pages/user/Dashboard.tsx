@@ -30,7 +30,7 @@ interface AnswerReview {
   correct_answer: string;
   is_correct: boolean;
   score: number | null;
-  answer_status: "unattempted" | "awaiting_evaluation" | "correct" | "incorrect" | "partial";
+  answer_status: "unattempted" | "awaiting_evaluation" | "not_evaluated" | "correct" | "incorrect" | "partial";
   suggestion: string | null;
 }
 
@@ -158,6 +158,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
 
   const pending = sortDescByTime(assessments.filter((a) => a.status === "pending"));
   const evaluating = sortDescByTime(assessments.filter((a) => a.status === "evaluating"));
+  const evaluationFailed = sortDescByTime(assessments.filter((a) => a.status === "evaluation_failed"));
   const completed = sortDescByTime(assessments.filter((a) => a.status === "completed"));
   const incomplete = sortDescByTime(assessments.filter((a) => a.status === "incomplete"));
   const missed = sortDescByTime(assessments.filter((a) => a.status === "missed"));
@@ -175,6 +176,8 @@ export default function Dashboard({ profile, onStartExam }: Props) {
     ? { title: resumableNext.title, message: "Continue where you left off.", action: () => onStartExam(resumableNext), label: "Resume assessment" }
     : availableNext
     ? { title: availableNext.title, message: "This assessment is ready to start.", action: () => onStartExam(availableNext), label: "Start assessment" }
+    : evaluationFailed[0]
+    ? { title: evaluationFailed[0].title, message: "Evaluation failed. Contact an administrator to retry evaluation.", action: null, label: "" }
     : evaluating[0]
     ? { title: evaluating[0].title, message: "Your answers are submitted. Results will appear here when evaluation is complete.", action: null, label: "" }
     : null;
@@ -237,7 +240,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
       {/* Summary Cards */}
       <div>
         <h2 className="text-sm font-semibold mb-3">My Assessments</h2>
-        <div className="grid grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
           <div className={`${card} p-5`}>
             <div className="flex items-center gap-3 mb-3">
               <div className="w-8 h-8 rounded-[var(--radius-sm)] bg-amber-50 text-[var(--color-warning)] flex items-center justify-center">
@@ -272,6 +275,14 @@ export default function Dashboard({ profile, onStartExam }: Props) {
               <p className="text-sm font-medium text-[var(--color-success)]">Completed</p>
             </div>
             <p className="text-2xl font-semibold">{completed.length}</p>
+          </div>
+
+          <div className={`${card} p-5`}>
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 rounded-[var(--radius-sm)] bg-red-50 text-[var(--color-danger)] flex items-center justify-center" aria-hidden="true">!</div>
+              <p className="text-sm font-medium text-[var(--color-danger)]">Evaluation failed</p>
+            </div>
+            <p className="text-2xl font-semibold">{evaluationFailed.length}</p>
           </div>
 
           <div className={`${card} p-5`}>
@@ -387,6 +398,28 @@ export default function Dashboard({ profile, onStartExam }: Props) {
         </div>
       )}
 
+      {evaluationFailed.length > 0 && (
+        <div>
+          <h2 className="text-sm font-semibold mb-3 text-[var(--color-danger)]">Evaluation failed</h2>
+          <div className="space-y-3">
+            {evaluationFailed.map((a) => (
+              <div key={a.id} className={`${card} p-5 flex items-center justify-between border-l-4 border-l-red-400`}>
+                <div>
+                  <p className="text-sm font-medium">{a.title}</p>
+                  <p className="text-xs text-[var(--color-text-secondary)] mt-1">Your submission is saved, but scoring did not complete. Please contact an administrator to retry evaluation.</p>
+                </div>
+                <button
+                  onClick={() => viewResults(a.id)}
+                  className="h-9 px-4 border border-[var(--color-border)] text-sm font-medium rounded-[var(--radius-sm)] hover:bg-gray-50 cursor-pointer"
+                >
+                  View status
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {completed.length > 0 && (
         <div>
           <h2 className="text-sm font-semibold mb-3">Completed</h2>
@@ -469,7 +502,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                   {/* Score Cards */}
                   <div className="grid grid-cols-3 gap-4">
                     <div className={`${card} p-4 text-center`}>
-                      <p className="text-xs text-[var(--color-text-secondary)] mb-1">Score</p>
+                      <p className="text-xs text-[var(--color-text-secondary)] mb-1">{results.status === "evaluation_failed" && results.score !== null ? "Partial score" : "Score"}</p>
                       <p className="text-2xl font-bold text-[var(--color-primary)]">
                         {results.evaluation_pending ? "Pending" : results.score !== null ? `${results.score}%` : "N/A"}
                       </p>
@@ -483,7 +516,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                     <div className={`${card} p-4 text-center`}>
                       <p className="text-xs text-[var(--color-text-secondary)] mb-1">Status</p>
                       <p className={`text-lg font-bold ${results.status === "completed" ? "text-[var(--color-success)]" : results.status === "evaluating" ? "text-[var(--color-primary)]" : "text-[var(--color-danger)]"}`}>
-                        {results.status}
+                        {results.status === "evaluation_failed" ? "Evaluation failed" : results.status}
                       </p>
                     </div>
                   </div>
@@ -491,6 +524,12 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                   {results.evaluation_pending && (
                     <div className="p-4 rounded-[var(--radius-sm)] border border-blue-200 bg-blue-50 text-sm text-[var(--color-primary)]">
                       Your answers are being scored. Results will update automatically when evaluation completes.
+                    </div>
+                  )}
+
+                  {results.status === "evaluation_failed" && (
+                    <div role="status" className="p-4 rounded-[var(--radius-sm)] border border-red-200 bg-red-50 text-sm text-red-800">
+                      Evaluation failed. The displayed score uses only answers that were evaluated successfully; questions that could not be evaluated are excluded. Please contact an administrator to retry evaluation.
                     </div>
                   )}
 
@@ -543,7 +582,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                               <div className="flex items-start justify-between gap-3 mb-2">
                                 <p className="text-sm font-medium">{ans.question_text}</p>
                                 <span className={`shrink-0 inline-flex items-center px-2 py-1 rounded text-xs font-semibold ${
-                                  ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation"
+                              ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation" || ans.answer_status === "not_evaluated"
                                     ? "bg-gray-100 text-gray-600"
                                     : ans.answer_status === "correct"
                                     ? "bg-green-50 text-green-700"
@@ -551,7 +590,7 @@ export default function Dashboard({ profile, onStartExam }: Props) {
                                     ? "bg-amber-50 text-amber-700"
                                     : "bg-red-50 text-red-700"
                                 }`}>
-                                  {ans.answer_status === "unattempted" ? "Unattempted" : ans.answer_status === "awaiting_evaluation" ? "Pending" : `${ans.answer_status === "partial" ? "Partial" : ans.answer_status === "correct" ? "Correct" : "Incorrect"} · ${ans.score?.toFixed(2)} / 1`}
+                                  {ans.answer_status === "unattempted" ? "Unattempted" : ans.answer_status === "not_evaluated" ? "Not evaluated" : ans.answer_status === "awaiting_evaluation" ? "Pending" : `${ans.answer_status === "partial" ? "Partial" : ans.answer_status === "correct" ? "Correct" : "Incorrect"} · ${ans.score?.toFixed(2)} / 1`}
                                 </span>
                               </div>
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">

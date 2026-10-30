@@ -218,6 +218,9 @@ permissions, starts a read-only transaction, sets the schema search path, and
 applies statement, lock, row-count, and output limits. Only one `SELECT` or
 `WITH ... SELECT` statement is accepted.
 
+For SQL to create tables, import/update data, provision the role manually, and
+update the allowlist when adding tables, see [SQL_SANDBOX.md](SQL_SANDBOX.md).
+
 For the example `demo.employees` and `demo.departments` tables:
 
 1. Provision the demo schema if it is not already present by running

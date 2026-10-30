@@ -58,7 +58,7 @@ interface AnswerReview {
   correct_answer: string;
   is_correct: boolean;
   score: number | null;
-  answer_status: "unattempted" | "awaiting_evaluation" | "correct" | "incorrect" | "partial";
+  answer_status: "unattempted" | "awaiting_evaluation" | "not_evaluated" | "correct" | "incorrect" | "partial";
   suggestion?: string | null;
 }
 
@@ -347,7 +347,7 @@ export default function Results({ batches }: Props) {
                 <>
                   <div className="grid grid-cols-3 gap-4">
                     <div className={`${card} p-4 text-center`}>
-                      <p className="text-xs text-[var(--color-text-secondary)] mb-1">Score</p>
+                      <p className="text-xs text-[var(--color-text-secondary)] mb-1">{attemptResults.status === "evaluation_failed" && attemptResults.score !== null ? "Partial score" : "Score"}</p>
                       <p className="text-2xl font-bold text-[var(--color-primary)]">
                         {attemptResults.evaluation_pending ? "Pending" : attemptResults.score !== null ? `${attemptResults.score}%` : "N/A"}
                       </p>
@@ -359,7 +359,7 @@ export default function Results({ batches }: Props) {
                     <div className={`${card} p-4 text-center`}>
                       <p className="text-xs text-[var(--color-text-secondary)] mb-1">Status</p>
                       <p className={`text-lg font-bold ${attemptResults.status === "completed" ? "text-[var(--color-success)]" : attemptResults.status === "evaluating" ? "text-[var(--color-primary)]" : "text-[var(--color-danger)]"}`}>
-                        {attemptResults.status}
+                        {attemptResults.status === "evaluation_failed" ? "Evaluation failed" : attemptResults.status}
                       </p>
                     </div>
                   </div>
@@ -367,6 +367,12 @@ export default function Results({ batches }: Props) {
                   {attemptResults.evaluation_pending && (
                     <div className="p-4 rounded-[var(--radius-sm)] border border-blue-200 bg-blue-50 text-sm text-[var(--color-primary)]">
                       Some subjective answers are still being evaluated. Results will update when evaluation completes.
+                    </div>
+                  )}
+
+                  {attemptResults.status === "evaluation_failed" && (
+                    <div role="status" className="p-4 rounded-[var(--radius-sm)] border border-red-200 bg-red-50 text-sm text-red-800">
+                      Evaluation failed. This partial score includes only answers evaluated successfully; unevaluated questions are excluded.
                     </div>
                   )}
 
@@ -397,14 +403,14 @@ export default function Results({ batches }: Props) {
                       {attemptResults.answers.map((ans, idx) => (
                         <div key={ans.question_id} className="px-5 py-4">
                           <div className="flex items-start gap-3">
-                            <span className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${ans.answer_status === "correct" ? "bg-green-50 text-green-700" : ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation" ? "bg-gray-100 text-gray-600" : ans.answer_status === "partial" ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>
+                            <span className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${ans.answer_status === "correct" ? "bg-green-50 text-green-700" : ans.answer_status === "unattempted" || ans.answer_status === "awaiting_evaluation" || ans.answer_status === "not_evaluated" ? "bg-gray-100 text-gray-600" : ans.answer_status === "partial" ? "bg-amber-50 text-amber-700" : "bg-red-50 text-red-700"}`}>
                               {idx + 1}
                             </span>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-start justify-between gap-3 mb-2">
                                 <p className="text-sm font-medium">{ans.question_text}</p>
                                 <span className={`shrink-0 inline-flex items-center px-2 py-1 rounded text-xs font-semibold ${ans.answer_status === "correct" ? "bg-green-50 text-green-700" : ans.answer_status === "partial" ? "bg-amber-50 text-amber-700" : ans.answer_status === "incorrect" ? "bg-red-50 text-red-700" : "bg-gray-100 text-gray-600"}`}>
-                                  {ans.answer_status === "unattempted" ? "Unattempted" : ans.answer_status === "awaiting_evaluation" ? "Pending" : `${ans.answer_status === "partial" ? "Partial" : ans.answer_status === "correct" ? "Correct" : "Incorrect"} · ${ans.score} / 1`}
+                                  {ans.answer_status === "unattempted" ? "Unattempted" : ans.answer_status === "not_evaluated" ? "Not evaluated" : ans.answer_status === "awaiting_evaluation" ? "Pending" : `${ans.answer_status === "partial" ? "Partial" : ans.answer_status === "correct" ? "Correct" : "Incorrect"} · ${ans.score} / 1`}
                                 </span>
                               </div>
                               <p className="text-xs text-[var(--color-text-secondary)] mb-1">{ans.topic_name} • {ans.question_type}</p>
@@ -647,6 +653,7 @@ export default function Results({ batches }: Props) {
                   <option value="in_progress">In Progress</option>
                   <option value="completed">Completed</option>
                   <option value="evaluating">Evaluating</option>
+                  <option value="evaluation_failed">Evaluation failed</option>
                   <option value="missed">Missed</option>
                 </select>
                 <select
@@ -709,7 +716,7 @@ export default function Results({ batches }: Props) {
                           className={`inline-flex px-2 py-0.5 text-xs font-medium rounded-full ${
                             ur.status === "completed"
                               ? "bg-green-50 text-green-700"
-                              : ur.status === "missed"
+                              : ur.status === "missed" || ur.status === "evaluation_failed"
                               ? "bg-red-50 text-red-700"
                               : ur.status === "evaluating"
                               ? "bg-blue-50 text-blue-700"
@@ -718,7 +725,7 @@ export default function Results({ batches }: Props) {
                               : "bg-yellow-50 text-yellow-700"
                           }`}
                         >
-                          {ur.status}
+                          {ur.status === "evaluation_failed" ? "Evaluation failed" : ur.status}
                         </span>
                         {ur.evaluation_status === "failed" && (
                           <span
@@ -726,7 +733,7 @@ export default function Results({ batches }: Props) {
                             title={ur.evaluation_error || "Evaluation failed"}
                             onClick={() => setErrorModalUser(ur)}
                           >
-                            eval failed ⓘ
+                            Details ⓘ
                           </span>
                         )}
                         {ur.status === "evaluating" && (

@@ -5,10 +5,24 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
-from api.results_helpers import answer_score_label, classify_answer_status, require_completed_attempt
+from api.results_helpers import answer_score_label, assessment_evaluation_status, classify_answer_status, require_completed_attempt
 from api.routers_code import RunCodeRequest, run_code
 from api.routers_practice import require_completed_practice_test
-from db.models import AttemptStatus, PracticeTestStatus
+from db.models import AttemptStatus, EvaluationJobStatus, PracticeTestStatus
+
+
+@pytest.mark.parametrize(
+    "attempt_status,job_status,expected",
+    [
+        (AttemptStatus.completed, EvaluationJobStatus.failed, "evaluation_failed"),
+        (AttemptStatus.completed, EvaluationJobStatus.pending, "evaluating"),
+        (AttemptStatus.completed, EvaluationJobStatus.in_progress, "evaluating"),
+        (AttemptStatus.completed, EvaluationJobStatus.completed, "completed"),
+        (AttemptStatus.missed, EvaluationJobStatus.failed, "missed"),
+    ],
+)
+def test_assessment_status_exposes_failed_evaluation(attempt_status, job_status, expected):
+    assert assessment_evaluation_status(attempt_status, job_status) == expected
 
 
 def test_code_execution_validates_question_before_sandbox_access():
@@ -47,6 +61,11 @@ def test_assessment_results_are_released_after_completion():
 )
 def test_result_classifies_unattempted_pending_correct_partial_and_wrong(answer, score, expected):
     assert classify_answer_status(answer, score) == expected
+
+
+def test_failed_attempt_marks_unscored_answer_as_not_evaluated():
+    assert classify_answer_status("candidate answer", None, evaluation_failed=True) == "not_evaluated"
+    assert answer_score_label("not_evaluated", None) == "Not evaluated"
 
 
 @pytest.mark.parametrize(

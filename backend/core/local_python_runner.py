@@ -6,6 +6,7 @@ Use the queue runner for a separate networkless sandbox.
 """
 
 import os
+import logging
 import signal
 import subprocess
 import sys
@@ -23,6 +24,7 @@ MAX_CONCURRENT_RUNS = 4
 UNPRIVILEGED_UID = 65534
 UNPRIVILEGED_GID = 65534
 _RUN_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_RUNS)
+logger = logging.getLogger(__name__)
 
 
 def _prepare_posix_child(workdir: str, drop_privileges: bool) -> None:
@@ -108,7 +110,11 @@ def execute_in_local_venv(code: str, stdin_input: str = "") -> dict:
                         else None
                     ),
                 )
-            except (OSError, subprocess.SubprocessError):
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.exception(
+                    "Could not start the local Python execution subprocess (%s)",
+                    type(exc).__name__,
+                )
                 return {"stdout": "", "stderr": "Python execution unavailable: unable to start runner", "exit_code": -1, "timed_out": False}
 
             outputs = {"stdout": bytearray(), "stderr": bytearray()}

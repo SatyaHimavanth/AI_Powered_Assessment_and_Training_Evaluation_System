@@ -14,7 +14,7 @@ import re
 from core.auth import require_admin
 from db.async_helpers import run_db_sync
 from db.database import SessionLocal
-from .results_helpers import build_attempt_results
+from .results_helpers import assessment_evaluation_status, build_attempt_results
 from db.models import (
     Answer,
     Assessment,
@@ -29,6 +29,7 @@ from db.models import (
     BatchUser,
     Difficulty,
     EvaluationJob,
+    EvaluationJobStatus,
     Question,
     AssessmentQuestionItem,
     QuestionType,
@@ -801,7 +802,7 @@ async def get_assessment_results(
                     user_name=user.name if user else "Unknown",
                     username=user.username if user else "unknown",
                     score=score,
-                    status=("evaluating" if attempt.status == AttemptStatus.completed and score is None else (attempt.status.value if attempt.status else "unknown")),
+                    status=assessment_evaluation_status(attempt.status, eval_job.status if eval_job else None),
                     started_at=to_utc_iso(attempt.started_at),
                     submitted_at=to_utc_iso(attempt.submitted_at),
                     total_answered=answer_count,
@@ -999,7 +1000,7 @@ async def export_assessment_results(
                 if score is not None:
                     total_scores.append(score)
                 eval_job = db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt.id).first()
-                status = "evaluating" if attempt.status == AttemptStatus.completed and score is None else (attempt.status.value if attempt.status else "unknown")
+                status = assessment_evaluation_status(attempt.status, eval_job.status if eval_job else None)
                 rows.append({
                     "attempt": attempt,
                     "user": user,
@@ -1130,6 +1131,9 @@ def _calculate_attempt_score(db: Session, attempt: Attempt) -> float | None:
     if not answers:
         return None
 
+    evaluation_job = db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt.id).first()
+    partial_evaluation = bool(evaluation_job and evaluation_job.status == EvaluationJobStatus.failed)
+
     total = 0
     earned = 0.0
 
@@ -1146,9 +1150,11 @@ def _calculate_attempt_score(db: Session, attempt: Attempt) -> float | None:
         if not q and not item:
             continue
 
-        total += 1
         if ans.score is None:
+            if partial_evaluation:
+                continue
             return None
+        total += 1
         earned += float(ans.score)
 
     return round((earned / total) * 100, 1) if total > 0 else None
@@ -1160,6 +1166,14 @@ def _calculate_topic_performance(
     """Calculate per-topic performance across all attempts."""
     # Get assessment questions grouped by topic
     aq_links = db.query(AssessmentQuestion).filter(AssessmentQuestion.assessment_id == assessment_id).all()
+
+    failed_attempt_ids = {
+        job.attempt_id
+        for job in db.query(EvaluationJob).filter(
+            EvaluationJob.attempt_id.in_([attempt.id for attempt in attempts]),
+            EvaluationJob.status == EvaluationJobStatus.failed,
+        ).all()
+    } if attempts else set()
 
     topic_stats: dict = {}  # topic_name -> {total, correct}
 
@@ -1180,7 +1194,8 @@ def _calculate_topic_performance(
                     .filter(Answer.attempt_id == attempt.id, Answer.assessment_item_id == item.id)
                     .first()
                 )
-                topic_stats[topic_name]["total"] += 1
+                if attempt.id not in failed_attempt_ids or (ans and ans.score is not None):
+                    topic_stats[topic_name]["total"] += 1
                 if ans and ans.score is not None:
                     topic_stats[topic_name]["correct"] += float(ans.score)
         else:
@@ -1200,7 +1215,8 @@ def _calculate_topic_performance(
                     .filter(Answer.attempt_id == attempt.id, Answer.question_id == question.id)
                     .first()
                 )
-                topic_stats[topic_name]["total"] += 1
+                if attempt.id not in failed_attempt_ids or (ans and ans.score is not None):
+                    topic_stats[topic_name]["total"] += 1
                 if ans and ans.score is not None:
                     topic_stats[topic_name]["correct"] += float(ans.score)
 

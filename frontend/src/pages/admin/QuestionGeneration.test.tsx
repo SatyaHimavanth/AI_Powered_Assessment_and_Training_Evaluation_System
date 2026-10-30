@@ -58,6 +58,24 @@ describe("generation batch context and failed actions", () => {
     expect(button("Delete").disabled).toBe(false);
   });
 
+  it("highlights similarity score with the duplicate band color", async () => {
+    const stagedQuestion = {
+      id: "staged-question", question_type: "single_mcq", question_text: "Which feature does FastAPI provide?",
+      reference_answer: null, options: null, difficulty: "easy", similarity_score: 0.924,
+      matched_question_id: "existing-question", match_band: "high_dup", status: "pending", created_at: "2026-01-01T10:00:00Z",
+    };
+    apiMock.get.mockImplementation(async (path: string) => path.endsWith("/staged")
+      ? { data: { items: [stagedQuestion], total: 1 } }
+      : { data: { items: [{ ...failedBatch, status: "completed" }], total: 1 } });
+    await render();
+    const batchTitle = [...container.querySelectorAll("p")].find((item) => item.textContent?.includes("SQL transactions Â· Multi MCQ"));
+    await act(async () => batchTitle?.parentElement?.parentElement?.click());
+
+    const score = container.querySelector('[aria-label="Similarity score 92.4 percent"]');
+    expect(score?.textContent).toContain("92.4%");
+    expect(score?.className).toContain("bg-red-100");
+  });
+
   it("confirms retry and suppresses rapid duplicate requests", async () => {
     await render();
     await act(async () => button("Retry").click());

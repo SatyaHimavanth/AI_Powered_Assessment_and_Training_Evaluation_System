@@ -242,7 +242,11 @@ def ensure_execution_available(result: dict) -> None:
         marker in error.lower()
         for marker in ("execution unavailable", "runner is not configured")
     ):
-        raise RuntimeError("Coding evaluation is unavailable until a Python runner is configured")
+        # Preserve the runner's safe, actionable reason (e.g. queue service is
+        # not configured or the local subprocess could not be started) in worker
+        # logs and API 503 responses instead of misreporting every failure as a
+        # missing configuration.
+        raise RuntimeError(error or "Python execution is unavailable")
 
 def run_test_case(code: str, input_data: str, expected_output: str) -> dict:
     """

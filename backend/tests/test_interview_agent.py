@@ -13,7 +13,16 @@ class StubAgent:
 
     def invoke(self, request, config=None):
         self.prompt = request["messages"][0]["content"]
-        return {"messages": [SimpleNamespace(content=self.response)]}
+        payload = self.response
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = None
+        return {
+            "structured_response": payload,
+            "messages": [SimpleNamespace(content=self.response if isinstance(self.response, str) else "")],
+        }
 
 
 def test_interview_evaluation_uses_rubric_and_treats_candidate_text_as_untrusted(monkeypatch):
@@ -25,7 +34,12 @@ def test_interview_evaluation_uses_rubric_and_treats_candidate_text_as_untrusted
         "next_question": "How would you test it?",
     })
     stub = StubAgent(response)
-    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda _prompt: stub)
+
+    def get_agent(_prompt, **kwargs):
+        assert kwargs["response_format"] is interview_agent.InterviewEvaluation
+        return stub
+
+    monkeypatch.setattr(interview_agent, "get_interview_agent", get_agent)
 
     result = interview_agent.evaluate_and_generate_followup(
         session_id="test-session",
@@ -58,9 +72,9 @@ def test_interview_evaluation_uses_rubric_and_treats_candidate_text_as_untrusted
 )
 def test_malformed_model_evaluations_are_not_accepted(monkeypatch, payload):
     stub = StubAgent(json.dumps(payload))
-    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda _prompt: stub)
+    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda _prompt, **_kwargs: stub)
 
-    with pytest.raises(ValueError, match="required schema"):
+    with pytest.raises(RuntimeError, match="provider failed after 3 retries"):
         interview_agent.evaluate_and_generate_followup(
             session_id="test-session",
             role="Engineer",
@@ -72,12 +86,14 @@ def test_malformed_model_evaluations_are_not_accepted(monkeypatch, payload):
 
 
 def test_provider_failure_remains_retryable_and_is_not_silently_graded(monkeypatch):
+    calls = []
     class FailingAgent:
         def invoke(self, *_args, **_kwargs):
+            calls.append(1)
             raise TimeoutError("provider timeout")
 
-    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda _prompt: FailingAgent())
-    with pytest.raises(RuntimeError, match="provider failed"):
+    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda _prompt, **_kwargs: FailingAgent())
+    with pytest.raises(RuntimeError, match="provider failed after 3 retries"):
         interview_agent.evaluate_and_generate_followup(
             session_id="test-session",
             role="Engineer",
@@ -86,6 +102,7 @@ def test_provider_failure_remains_retryable_and_is_not_silently_graded(monkeypat
             focus_areas=[],
             candidate_response="answer",
         )
+    assert len(calls) == 4
 
 
 def test_predefined_opening_does_not_initialize_ai(monkeypatch):
@@ -118,7 +135,7 @@ def test_long_interview_uses_newest_database_context_as_valid_json(monkeypatch):
     stub = StubAgent(json.dumps({
         "score": 7, "strengths": [], "improvements": [], "feedback": "Good", "next_question": "Next?",
     }))
-    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda *_args: stub)
+    monkeypatch.setattr(interview_agent, "get_interview_agent", lambda *_args, **_kwargs: stub)
     conversation = [{"role": "user", "content": f"Earlier {i} " + "x" * 1000} for i in range(30)]
     conversation.append({"role": "assistant", "content": "Newest stored question"})
     interview_agent.evaluate_and_generate_followup("id", "Engineer", "junior", "easy", [], "Answer", conversation=conversation)

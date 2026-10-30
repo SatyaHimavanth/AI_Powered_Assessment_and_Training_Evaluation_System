@@ -3,7 +3,15 @@
 import logging
 import os
 import time
+from pathlib import Path
 from threading import Thread
+
+from dotenv import load_dotenv
+
+# The standalone worker is launched separately from the FastAPI process. Load
+# the backend's local configuration before importing services that read env.
+# Platform-provided variables still take precedence over .env values.
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 from core.embedding_backfill import backfill_missing_embeddings
 from core.evaluation_service import process_evaluation_jobs
@@ -32,6 +40,15 @@ def _initial_embedding_backfill() -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    runner_mode = os.getenv("PYTHON_RUNNER_MODE", "local").strip().lower()
+    if runner_mode == "local":
+        logging.info(
+            "Python execution runner mode: local backend subprocess (not an OS sandbox)"
+        )
+    elif runner_mode == "queue":
+        logging.info("Python execution runner mode: isolated queue service")
+    else:
+        logging.error("Invalid PYTHON_RUNNER_MODE; expected 'local' or 'queue'")
     # This idempotent scan runs whenever the worker restarts, so interrupted
     # embeddings remain eligible for a later retry. Evaluation jobs are polled
     # continuously and protected by a PostgreSQL advisory lock.

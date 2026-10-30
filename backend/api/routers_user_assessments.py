@@ -332,10 +332,14 @@ async def get_my_assessments(
 
                 # Determine status
                 if attempt:
-                    if attempt.status == AttemptStatus.completed and not _is_attempt_fully_evaluated(db, attempt):
-                        status = "evaluating"
-                    elif attempt.status == AttemptStatus.completed:
-                        status = "completed"
+                    if attempt.status == AttemptStatus.completed:
+                        evaluation_job = db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt.id).first()
+                        if evaluation_job and evaluation_job.status == EvaluationJobStatus.failed:
+                            status = "evaluation_failed"
+                        elif not _is_attempt_fully_evaluated(db, attempt):
+                            status = "evaluating"
+                        else:
+                            status = "completed"
                     elif attempt.status == AttemptStatus.in_progress:
                         status = "incomplete"
                     else:

@@ -269,7 +269,8 @@ For each question provide:
 - "correct_answer": for MCQs provide the correct option text(s) as a JSON array, for text provide an ideal reference answer
 - "topic": which topic this question belongs to
 
-Return ONLY a valid JSON array of question objects. No markdown, no explanation.
+Return a structured object with a "questions" array containing exactly {question_count} question objects.
+Do not include fields outside the requested question structure.
 """
 
 

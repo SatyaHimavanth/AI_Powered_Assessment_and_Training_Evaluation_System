@@ -259,6 +259,9 @@ SQL coding questions use a dedicated restricted login against the configured
 demo schema in the application database; this is a separate role and permission
 boundary, not a separate database instance.
 
+For schema creation, data imports, grants, and adding allowlisted tables, see
+[SQL_SANDBOX.md](SQL_SANDBOX.md).
+
 Provision the example tables with `uv run python -m core.setup_demo_db` from
 `backend/` after configuring the application database. The command creates and
 seeds:

@@ -8,12 +8,25 @@ from api.timezone_helper import to_utc_iso
 logger = logging.getLogger(__name__)
 
 
-def classify_answer_status(answer_text: str | None, score: float | None) -> str:
+def assessment_evaluation_status(attempt_status, evaluation_job_status=None) -> str:
+    """Expose terminal evaluation failure instead of leaving a submission 'evaluating'."""
+    from db.models import AttemptStatus, EvaluationJobStatus
+
+    if attempt_status == AttemptStatus.completed:
+        if evaluation_job_status == EvaluationJobStatus.failed:
+            return "evaluation_failed"
+        if evaluation_job_status == EvaluationJobStatus.completed:
+            return "completed"
+        return "evaluating"
+    return attempt_status.value if attempt_status else "unknown"
+
+
+def classify_answer_status(answer_text: str | None, score: float | None, evaluation_failed: bool = False) -> str:
     """Give unanswered and unevaluated answers distinct report states."""
     if not (answer_text or "").strip():
         return "unattempted"
     if score is None:
-        return "awaiting_evaluation"
+        return "not_evaluated" if evaluation_failed else "awaiting_evaluation"
     if score >= 0.999:
         return "correct"
     if score > 0:
@@ -25,7 +38,11 @@ def answer_score_label(answer_status: str, score: float | None) -> str | float:
     """Format an answer score consistently in exported result sheets."""
     if score is not None:
         return score
-    return "Unattempted" if answer_status == "unattempted" else "Pending"
+    if answer_status == "unattempted":
+        return "Unattempted"
+    if answer_status == "not_evaluated":
+        return "Not evaluated"
+    return "Pending"
 
 
 def require_completed_attempt(attempt) -> None:
@@ -64,6 +81,8 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
         Topic,
         Answer,
         AttemptStatus,
+        EvaluationJob,
+        EvaluationJobStatus,
     )
 
     # If caller passed an id, load the attempt here so callers can safely pass
@@ -107,7 +126,9 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
     topic_stats: dict[str, dict] = {}
     correct_count = 0
     pending_answers = db.query(Answer).filter(Answer.attempt_id == attempt.id, Answer.score.is_(None)).count()
-    evaluation_pending = pending_answers > 0 or attempt.score is None
+    evaluation_job = db.query(EvaluationJob).filter(EvaluationJob.attempt_id == attempt.id).first()
+    evaluation_failed = bool(evaluation_job and evaluation_job.status == EvaluationJobStatus.failed)
+    evaluation_pending = (pending_answers > 0 or attempt.score is None) and not evaluation_failed
 
     for aq in aq_links:
         user_ans = None
@@ -143,14 +164,15 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                     user_answer_text = user_ans.answer
                     is_correct = (user_ans.score or 0) >= 0.999 if user_ans.score is not None else False
 
-            earned_score = float(user_ans.score or 0) if user_ans and user_ans.score is not None else 0.0
-            topic_stats.setdefault(topic_name, {"total": 0, "correct": 0})
-            topic_stats[topic_name]["total"] += 1
-            topic_stats[topic_name]["correct"] += earned_score
+            score_val = round(float(user_ans.score), 2) if user_ans and user_ans.score is not None else None
+            if not evaluation_failed or score_val is not None:
+                earned_score = float(score_val or 0)
+                topic_stats.setdefault(topic_name, {"total": 0, "correct": 0})
+                topic_stats[topic_name]["total"] += 1
+                topic_stats[topic_name]["correct"] += earned_score
             if is_correct:
                 correct_count += 1
 
-            score_val = round(float(user_ans.score), 2) if user_ans and user_ans.score is not None else None
             answers_out.append({
                 "question_id": item.id,
                 "question_text": question_text,
@@ -160,7 +182,7 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                 "correct_answer": correct_answer_text,
                 "is_correct": is_correct,
                 "score": score_val,
-                "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val),
+                "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val, evaluation_failed),
                 "suggestion": (user_ans.feedback if user_ans and user_ans.feedback else None),
             })
         else:
@@ -203,14 +225,15 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                     user_answer_text = user_ans.answer
                     is_correct = (user_ans.score or 0) >= 0.999 if user_ans.score is not None else False
 
-            earned_score = float(user_ans.score or 0) if user_ans and user_ans.score is not None else 0.0
-            topic_stats.setdefault(topic_name, {"total": 0, "correct": 0})
-            topic_stats[topic_name]["total"] += 1
-            topic_stats[topic_name]["correct"] += earned_score
+            score_val = round(float(user_ans.score), 2) if user_ans and user_ans.score is not None else None
+            if not evaluation_failed or score_val is not None:
+                earned_score = float(score_val or 0)
+                topic_stats.setdefault(topic_name, {"total": 0, "correct": 0})
+                topic_stats[topic_name]["total"] += 1
+                topic_stats[topic_name]["correct"] += earned_score
             if is_correct:
                 correct_count += 1
 
-            score_val = round(float(user_ans.score), 2) if user_ans and user_ans.score is not None else None
             answers_out.append({
                 "question_id": q.id,
                 "question_text": question_text,
@@ -220,7 +243,7 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
                 "correct_answer": correct_answer_text,
                 "is_correct": is_correct,
                 "score": score_val,
-                "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val),
+                "answer_status": classify_answer_status(user_ans.answer if user_ans else None, score_val, evaluation_failed),
                 "suggestion": (user_ans.feedback if user_ans and user_ans.feedback else None),
             })
 
@@ -233,7 +256,7 @@ def build_attempt_results(db: Session, attempt) -> dict[str, Any]:
         pct = round(max(0.0, stats["correct"] / stats["total"]) * 100, 1) if stats["total"] > 0 else 0
         topic_scores.append({"topic_name": name, "total": stats["total"], "correct": stats["correct"], "percentage": pct})
 
-    status = ("evaluating" if evaluation_pending and attempt.status == AttemptStatus.completed else (attempt.status.value if attempt.status else "unknown"))
+    status = assessment_evaluation_status(attempt.status, evaluation_job.status if evaluation_job else None)
 
     return {
         "assessment_title": assessment.title,

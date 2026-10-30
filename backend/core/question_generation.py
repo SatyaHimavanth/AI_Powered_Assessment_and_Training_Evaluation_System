@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from langchain_core.language_models import BaseChatModel
-from sqlalchemy import select, text
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.llms import get_chat_model
@@ -40,7 +41,40 @@ from db.models import (
 logger = logging.getLogger(__name__)
 GENERATION_WORKER_LOCK_ID = 731204892
 MAX_GENERATION_ATTEMPTS = 3
+MAX_LLM_RETRIES = 3
 MAX_GENERATION_CHUNK_SIZE = 10
+
+
+class GeneratedQuestionOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    option_text: StrictStr = Field(min_length=1, max_length=1_000)
+    is_correct: StrictBool
+
+
+class GeneratedQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question_text: StrictStr = Field(min_length=1, max_length=10_000)
+    question_type: StrictStr
+    difficulty: StrictStr
+    reference_answer: StrictStr | None = Field(default=None, max_length=20_000)
+    options: List[GeneratedQuestionOption] | None = Field(default=None, max_length=4)
+
+
+class GeneratedQuestionSet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    questions: List[GeneratedQuestion] = Field(max_length=MAX_GENERATION_CHUNK_SIZE)
+
+
+def transfer_staged_embedding_to_question(db: Session, staged_id: uuid_mod.UUID, question_id: uuid_mod.UUID) -> bool:
+    """Atomically transfer an embedding to its approved question owner."""
+    from db.models import QuestionEmbedding
+
+    result = db.execute(
+        update(QuestionEmbedding)
+        .where(QuestionEmbedding.staged_question_id == staged_id)
+        .values(question_id=question_id, staged_question_id=None)
+    )
+    return bool(result.rowcount)
 
 
 GENERATION_PROMPT = """You are an expert question generator for educational assessments.
@@ -61,7 +95,7 @@ Source material JSON:
 {source_text}
 </source_material_json>
 
-Respond with a JSON array of questions. Each question object must have:
+Respond with a questions object containing an array of questions. Each question object must have:
 - "question_text": the question string
 - "question_type": "{question_type}"
 - "difficulty": "{difficulty}"
@@ -69,7 +103,7 @@ Respond with a JSON array of questions. Each question object must have:
 - "options": array of {{"option_text": "...", "is_correct": true/false}} (for MCQ) or null (for text)
 
 IMPORTANT: Every question MUST have "question_type" set to exactly "{question_type}".
-Return ONLY valid JSON, no markdown fencing or explanation.
+Return only fields matching the structured question schema.
 """
 
 TYPE_INSTRUCTIONS = {
@@ -77,29 +111,6 @@ TYPE_INSTRUCTIONS = {
     "single_mcq": "- Generate multiple-choice questions with exactly ONE correct answer\n- Provide exactly 4 options per question\n- Mark exactly one option as is_correct: true",
     "multi_mcq": "- Generate multiple-choice questions with MULTIPLE correct answers\n- Provide exactly 4 options per question\n- Mark 2 or 3 options as is_correct: true",
 }
-
-
-def _parse_generated_questions(response_text: str) -> List[dict]:
-    """Parse LLM response into a list of question dicts."""
-    # Strip any markdown code fencing
-    text = response_text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # Remove first and last lines (```json and ```)
-        lines = [l for l in lines[1:] if not l.strip().startswith("```")]
-        text = "\n".join(lines)
-
-    try:
-        questions = json.loads(text)
-        if isinstance(questions, list):
-            return questions
-        if isinstance(questions, dict) and "questions" in questions:
-            return questions["questions"]
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse LLM response as JSON: {e}")
-        raise ValueError(f"LLM response is not valid JSON: {e}")
-
-    raise ValueError("Unexpected LLM response format")
 
 
 def generate_questions_from_text(
@@ -143,11 +154,25 @@ def _generate_validated_chunk(
     existing_texts = {question["question_text"].casefold() for question in previous}
 
     request_prompt = prompt
+    structured_llm = llm.with_structured_output(GeneratedQuestionSet)
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
-        response = llm.invoke(request_prompt)
+        for retry in range(1, MAX_LLM_RETRIES + 2):
+            try:
+                response = structured_llm.invoke(request_prompt)
+                generated_set = GeneratedQuestionSet.model_validate(response)
+                break
+            except Exception as exc:
+                if retry == MAX_LLM_RETRIES + 1:
+                    raise RuntimeError(
+                        f"Question generation provider failed after {MAX_LLM_RETRIES} retries"
+                    ) from exc
+                logger.warning(
+                    "Question generation model invocation failed on retry %s/%s: %s",
+                    retry, MAX_LLM_RETRIES, type(exc).__name__,
+                )
         try:
             validated = _validate_generated_questions(
-                _parse_generated_questions(response.content),
+                [question.model_dump() for question in generated_set.questions],
                 count=count,
                 question_type=question_type,
             )
@@ -164,14 +189,14 @@ def _generate_validated_chunk(
                     f"Question generation failed validation after {attempt} attempts: {exc}"
                 ) from exc
             logger.warning(
-                "Generated %s batch failed validation on attempt %s/%s: %s; regenerating",
-                question_type, attempt, MAX_GENERATION_ATTEMPTS, exc,
+                "Generated %s batch failed on attempt %s/%s: %s; retrying",
+                question_type, attempt, MAX_GENERATION_ATTEMPTS, type(exc).__name__,
             )
             request_prompt = (
                 f"{prompt}\n\n"
-                "Your previous response failed validation. "
+                "Your previous generation attempt failed. "
                 f"Validation error (JSON string): {json.dumps(str(exc))}\n"
-                f"Regenerate the entire array of exactly {count} questions. "
+                f"Regenerate the entire questions object with exactly {count} questions. "
                 "Check every option and answer key against the requirements before responding. "
                 "Do not merely relabel an ambiguous or incorrect answer; rewrite the question "
                 "and its options so the required number of answers is unambiguously correct."
@@ -571,12 +596,7 @@ def approve_staged_question(staged_id: uuid_mod.UUID, reviewer_id: uuid_mod.UUID
         staged.reviewed_at = datetime.now(timezone.utc)
 
         # Update embedding to point to actual question
-        from db.models import QuestionEmbedding
-        emb = db.execute(
-            select(QuestionEmbedding).where(QuestionEmbedding.staged_question_id == staged_id)
-        ).scalar_one_or_none()
-        if emb:
-            emb.question_id = new_question.id
+        transfer_staged_embedding_to_question(db, staged_id, new_question.id)
 
         # Update batch counters
         batch = db.execute(

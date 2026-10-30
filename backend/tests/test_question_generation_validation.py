@@ -1,10 +1,29 @@
 import pytest
 import copy
 import json
-from types import SimpleNamespace
 
 from core import question_generation
-from core.question_generation import _validate_generated_questions, generate_questions_from_text
+from core.question_generation import (
+    _validate_generated_questions,
+    generate_questions_from_text,
+    transfer_staged_embedding_to_question,
+)
+
+
+class StubStructuredModel:
+    def __init__(self, invoke):
+        self._invoke = invoke
+
+    def with_structured_output(self, schema):
+        class Runnable:
+            def invoke(_self, prompt):
+                response = self._invoke(prompt)
+                if isinstance(response, str):
+                    response = json.loads(response)
+                if isinstance(response, list):
+                    response = {"questions": response}
+                return schema.model_validate(response)
+        return Runnable()
 
 
 def test_question_generation_rejects_short_or_wrong_type_responses():
@@ -22,6 +41,31 @@ def test_question_generation_rejects_short_or_wrong_type_responses():
             count=1,
             question_type="single_mcq",
         )
+
+
+def test_embedding_approval_transfers_both_owner_columns_atomically():
+    from uuid import uuid4
+
+    class FakeResult:
+        rowcount = 1
+
+    class FakeDB:
+        statement = None
+
+        def execute(self, statement):
+            self.statement = statement
+            return FakeResult()
+
+    db = FakeDB()
+    staged_id = uuid4()
+    question_id = uuid4()
+
+    assert transfer_staged_embedding_to_question(db, staged_id, question_id)
+    updated_columns = {column.key for column in db.statement._values}
+    assert updated_columns == {"question_id", "staged_question_id"}
+    values_by_column = {column.key: value.value for column, value in db.statement._values.items()}
+    assert values_by_column["question_id"] == question_id
+    assert values_by_column["staged_question_id"] is None
 
 
 def test_question_generation_requires_one_correct_single_choice_answer():
@@ -84,30 +128,30 @@ def test_generation_regenerates_invalid_third_answer_key_without_guessing(monkey
 
     def invoke(prompt):
         prompts.append(prompt)
-        return SimpleNamespace(content=json.dumps(next(responses)))
+        return next(responses)
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     result = generate_questions_from_text("Synthetic source", "single_mcq", "easy", "Numbers", count=3)
 
     assert result == valid
     assert invalid == original
     assert len(prompts) == 2
     assert "question 3 needs exactly one correct option" in prompts[1]
-    assert "Regenerate the entire array of exactly 3 questions" in prompts[1]
+    assert "Regenerate the entire questions object with exactly 3 questions" in prompts[1]
 
 
-def test_generation_recovers_from_invalid_json_then_wrong_question_count(monkeypatch):
-    responses = iter(["not JSON", "[]", json.dumps([_single_choice_question()])])
+def test_generation_recovers_from_empty_and_wrong_count_structured_output(monkeypatch):
+    responses = iter([[], [], [_single_choice_question()]])
     prompts = []
 
     def invoke(prompt):
         prompts.append(prompt)
-        return SimpleNamespace(content=next(responses))
+        return next(responses)
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     assert len(generate_questions_from_text("Source", "single_mcq", "easy", "Numbers", count=1)) == 1
     assert len(prompts) == 3
-    assert "not valid JSON" in prompts[1]
+    assert "previous generation attempt failed" in prompts[1]
     assert "Expected exactly 1" in prompts[2]
 
 
@@ -116,26 +160,26 @@ def test_generation_stops_after_bounded_validation_failures(monkeypatch, caplog)
 
     def invoke(prompt):
         calls.append(prompt)
-        return SimpleNamespace(content="[]")
+        return []
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     with pytest.raises(ValueError, match="failed validation after 3 attempts: Expected exactly 1"):
         generate_questions_from_text("Source", "single_mcq", "easy", "Numbers", count=1)
     assert len(calls) == question_generation.MAX_GENERATION_ATTEMPTS == 3
-    assert "regenerating" in caplog.text
+    assert "retrying" in caplog.text
 
 
-def test_generation_does_not_repeat_provider_errors(monkeypatch):
+def test_generation_retries_provider_errors_three_times(monkeypatch):
     calls = []
 
     def invoke(prompt):
         calls.append(prompt)
         raise RuntimeError("Provider unavailable")
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
-    with pytest.raises(RuntimeError, match="Provider unavailable"):
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
+    with pytest.raises(RuntimeError, match="after 3 retries"):
         generate_questions_from_text("Source", "single_mcq", "easy", "Numbers", count=1)
-    assert len(calls) == 1
+    assert len(calls) == 4
 
 
 def test_valid_generation_uses_only_one_provider_call(monkeypatch):
@@ -143,9 +187,9 @@ def test_valid_generation_uses_only_one_provider_call(monkeypatch):
 
     def invoke(prompt):
         calls.append(prompt)
-        return SimpleNamespace(content=json.dumps([_single_choice_question()]))
+        return [_single_choice_question()]
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     generate_questions_from_text("Source", "single_mcq", "easy", "Numbers", count=1)
     assert len(calls) == 1
 
@@ -162,9 +206,9 @@ def test_large_generation_chunks_requests_and_preserves_requested_count(monkeypa
             question = _single_choice_question()
             question["question_text"] += f" Batch {len(calls)}, question {index}"
             questions.append(question)
-        return SimpleNamespace(content=json.dumps(questions))
+        return questions
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     result = generate_questions_from_text("Source", "single_mcq", "hard", "Numbers", count=requested)
     assert len(result) == len({question["question_text"] for question in result}) == requested
     assert len(calls) == len(sizes)
@@ -184,9 +228,9 @@ def test_chunk_retries_repeated_questions_instead_of_accepting_duplicates(monkey
             question = _single_choice_question()
             question["question_text"] += f" Example {index if len(prompts) < 3 else 10}"
             questions.append(question)
-        return SimpleNamespace(content=json.dumps(questions))
+        return questions
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     result = generate_questions_from_text("Source", "single_mcq", "easy", "Numbers", count=11)
     assert len(result) == len({question["question_text"] for question in result}) == 11
     assert len(prompts) == 3
@@ -214,9 +258,9 @@ def test_invalid_later_chunk_never_returns_a_partial_generation(monkeypatch):
                 question = _single_choice_question()
                 question["question_text"] += f" Example {index}"
                 questions.append(question)
-        return SimpleNamespace(content=json.dumps(questions))
+        return questions
 
-    monkeypatch.setattr(question_generation, "get_chat_model", lambda: SimpleNamespace(invoke=invoke))
+    monkeypatch.setattr(question_generation, "get_chat_model", lambda: StubStructuredModel(invoke))
     with pytest.raises(ValueError, match="failed validation after 3 attempts"):
         generate_questions_from_text("Source", "single_mcq", "easy", "Numbers", count=11)
     assert len(calls) == 4

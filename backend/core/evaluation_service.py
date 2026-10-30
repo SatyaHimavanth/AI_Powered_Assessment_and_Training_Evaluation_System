@@ -52,6 +52,14 @@ class EvaluationResult(BaseModel):
     feedback: str = Field(max_length=3000, strict=True, description="Concise feedback in 1-3 sentences")
 
 
+def partial_evaluation_percentage(scores) -> float | None:
+    """Average only persisted scores, excluding answers that could not be evaluated."""
+    evaluated = [float(score) for score in scores if score is not None]
+    if not evaluated:
+        return None
+    return round(max(0.0, sum(evaluated) / len(evaluated)) * 100, 1)
+
+
 def finalize_attempt_at_deadline(
     attempt, assessment, now: datetime | None = None, *, renew_active_lease: bool = True
 ) -> bool:
@@ -153,6 +161,7 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
 
     answers = db.query(Answer).filter(Answer.attempt_id == attempt_id).all()
     total_score = 0.0
+    evaluation_failures: list[str] = []
     # Scores are percentages of every question selected for the assessment,
     # not merely of questions for which the user sent an Answer row.
     question_links = (
@@ -163,6 +172,7 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
     total_questions = len(question_links)
     topic_totals = {}
     topic_counts = {}
+    evaluated_topic_counts = {}
     question_topics = {}
     for link in question_links:
         question = db.query(Question).filter(Question.id == link.question_id).first() if link.question_id else None
@@ -231,9 +241,15 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
                 total_score += float(ans.score)
                 if topic_key:
                     topic_totals[topic_key] += float(ans.score)
+                    evaluated_topic_counts[topic_key] = evaluated_topic_counts.get(topic_key, 0) + 1
                 continue
             if question:
-                score, feedback = _evaluate_coding_with_tests(db, question, ans.answer or "")
+                try:
+                    score, feedback = _evaluate_coding_with_tests(db, question, ans.answer or "")
+                except Exception as exc:
+                    logger.warning("Coding answer evaluation failed for attempt %s: %s", attempt_id, exc)
+                    evaluation_failures.append(str(exc))
+                    continue
             else:
                 # Evaluate using test_cases stored on the item (if any)
                 from core.code_runner import run_test_case
@@ -258,20 +274,29 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
                     passed = 0
                     total = len(item.test_cases or [])
                     failures = []
+                    execution_error = None
                     is_sql_item = bool(item.default_code and str(item.default_code).strip().startswith("--"))
                     for tc in item.test_cases or []:
-                        inp = tc.get("input", "")
-                        exp = tc.get("expected_output", "")
-                        if is_sql_item:
-                            result = run_sql_test_case(full_code, inp, exp)
-                        else:
-                            result = run_test_case(full_code, inp, exp)
-                        ensure_execution_available(result)
+                        try:
+                            inp = tc.get("input", "")
+                            exp = tc.get("expected_output", "")
+                            if is_sql_item:
+                                result = run_sql_test_case(full_code, inp, exp)
+                            else:
+                                result = run_test_case(full_code, inp, exp)
+                            ensure_execution_available(result)
+                        except Exception as exc:
+                            execution_error = exc
+                            break
                         if result.get("passed"):
                             passed += 1
                         else:
                             if len(failures) < 3:
                                 failures.append(result.get("error") or f"Expected: {exp[:50]}")
+                    if execution_error:
+                        logger.warning("Code answer evaluation failed for attempt %s: %s", attempt_id, execution_error)
+                        evaluation_failures.append(str(execution_error))
+                        continue
                     score = passed / total if total > 0 else 0.0
                     if passed == total:
                         feedback = f"All {total} test cases passed."
@@ -289,6 +314,7 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
                 total_score += float(ans.score)
                 if topic_key:
                     topic_totals[topic_key] += float(ans.score)
+                    evaluated_topic_counts[topic_key] = evaluated_topic_counts.get(topic_key, 0) + 1
                 continue
             if question:
                 q_text = question.question
@@ -298,12 +324,17 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
                 q_text = item.question_text
                 ref = item.reference_answer or ""
                 qtype_val = (item.question_type or "text")
-            score, feedback = _evaluate_subjective_with_llm(
-                q_text,
-                ref,
-                ans.answer or "",
-                qtype_val,
-            )
+            try:
+                score, feedback = _evaluate_subjective_with_llm(
+                    q_text,
+                    ref,
+                    ans.answer or "",
+                    qtype_val,
+                )
+            except Exception as exc:
+                logger.warning("Subjective answer evaluation failed for attempt %s: %s", attempt_id, exc)
+                evaluation_failures.append(str(exc))
+                continue
             ans.score = score
             ans.evaluated_by = EvaluationType.llm
             ans.feedback = feedback
@@ -311,21 +342,30 @@ def evaluate_attempt_from_job(db: Session, attempt_id: UUID):
         total_score += float(ans.score or 0)
         if topic_key:
             topic_totals[topic_key] += float(ans.score or 0)
+            evaluated_topic_counts[topic_key] = evaluated_topic_counts.get(topic_key, 0) + 1
 
     for topic_id, score_total in topic_totals.items():
         db.add(
             TopicScore(
                 attempt_id=attempt_id,
                 topic_id=UUID(topic_id),
-                score=round(max(0.0, score_total / max(1, topic_counts[topic_id])) * 100, 1),
+                score=round(max(0.0, score_total / max(1, evaluated_topic_counts.get(topic_id, 0) if evaluation_failures else topic_counts[topic_id])) * 100, 1),
             )
         )
 
-    attempt_record.score = (
-        round(max(0.0, total_score / max(1, total_questions)) * 100, 1)
-        if total_questions > 0 else 0.0
-    )
+    if evaluation_failures:
+        # Preserve useful results from questions that completed successfully.
+        # Questions still lacking a score are excluded from the partial denominator.
+        attempt_record.score = partial_evaluation_percentage(ans.score for ans in answers)
+    else:
+        attempt_record.score = (
+            round(max(0.0, total_score / max(1, total_questions)) * 100, 1)
+            if total_questions > 0 else 0.0
+        )
     db.commit()
+    if evaluation_failures:
+        details = "; ".join(dict.fromkeys(evaluation_failures))[:1000]
+        raise RuntimeError(f"Some answers could not be evaluated: {details}")
 
 
 EDITABLE_START_MARKER = "# --- EDITABLE START ---"

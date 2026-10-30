@@ -1,6 +1,14 @@
 from api import routers_practice
 from core import evaluation_service
-from core.evaluation_service import _evaluate_coding_with_tests, _objective_score
+from core.evaluation_service import _evaluate_coding_with_tests, _objective_score, partial_evaluation_percentage
+
+
+def test_partial_evaluation_score_excludes_answers_without_a_score():
+    assert partial_evaluation_percentage([1.0, 0.0, None, None]) == 50.0
+
+
+def test_partial_evaluation_score_is_unavailable_when_every_answer_failed():
+    assert partial_evaluation_percentage([None, None]) is None
 
 
 def test_generated_practice_mcq_answer_key_is_derived_from_options():

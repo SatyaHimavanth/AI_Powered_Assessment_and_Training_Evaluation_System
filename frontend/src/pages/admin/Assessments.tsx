@@ -251,7 +251,7 @@ export default function Assessments({ topics, batches, users, setMessage }: Prop
       return;
     }
     if (!useImport && topicConfigs.length === 0) {
-      setFormError("Add at least one topic configuration.");
+      setFormError("Add at least one Section.");
       return;
     }
 

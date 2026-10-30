@@ -8,12 +8,52 @@ from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 
 from db.database import SessionLocal, engine
 from db.models import PracticeQuestion, PracticeTest, PracticeTestStatus
 
 logger = logging.getLogger(__name__)
 PRACTICE_GENERATION_WORKER_LOCK_ID = 731204893
+MAX_LLM_RETRIES = 3
+
+
+class PracticeGeneratedOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: StrictStr = Field(min_length=1, max_length=1000)
+    is_correct: StrictBool
+
+
+class PracticeGeneratedQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: StrictStr
+    question: StrictStr = Field(min_length=1, max_length=10_000)
+    topic: StrictStr | None = Field(default=None, max_length=500)
+    options: list[PracticeGeneratedOption] | None = Field(default=None, max_length=10)
+    correct_answer: StrictStr | list[StrictStr] | None = None
+
+
+class PracticeGeneratedQuestionSet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    questions: list[PracticeGeneratedQuestion] = Field(min_length=1, max_length=100)
+
+
+def _invoke_practice_generation(model, prompt: str) -> PracticeGeneratedQuestionSet:
+    """Invoke the structured model, retrying transient/provider/schema failures."""
+    structured_model = model.with_structured_output(PracticeGeneratedQuestionSet)
+    last_error = None
+    for attempt in range(1, MAX_LLM_RETRIES + 2):
+        try:
+            return PracticeGeneratedQuestionSet.model_validate(structured_model.invoke(prompt))
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Practice generation model attempt %s/%s failed: %s",
+                attempt, MAX_LLM_RETRIES + 1, type(exc).__name__,
+            )
+    raise RuntimeError(
+        f"Practice question generation failed after {MAX_LLM_RETRIES} retries"
+    ) from last_error
 
 
 def _recover_interrupted_practice_tests(db: Session) -> int:
@@ -67,11 +107,14 @@ def _generate_claimed_practice_test(test_id: UUID) -> None:
             "resume_text": test.resume_text,
         }
 
-    response = get_chat_model().invoke(GENERATION_PROMPT.format(
+    prompt = GENERATION_PROMPT.format(
         question_count=requested_count,
         context_json=json.dumps(context, ensure_ascii=True),
-    ))
-    questions = _validate_generated_questions(json.loads(response.content), requested_count)
+    )
+    generated = _invoke_practice_generation(get_chat_model(), prompt)
+    questions = _validate_generated_questions(
+        [question.model_dump() for question in generated.questions], requested_count
+    )
 
     with SessionLocal() as db:
         test = db.query(PracticeTest).filter(PracticeTest.id == test_id).with_for_update().first()

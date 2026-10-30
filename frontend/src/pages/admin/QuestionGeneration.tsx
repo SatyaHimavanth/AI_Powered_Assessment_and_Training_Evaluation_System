@@ -576,11 +576,21 @@ export default function QuestionGeneration({ topics, setMessage }: Props) {
                     </div>
                   </div>
                   {sq.similarity_score !== null && (
-                    <p className="text-xs text-gray-500">
-                      Similarity: {(sq.similarity_score * 100).toFixed(1)}%
-                      {sq.difficulty && <> · {sq.difficulty}</>}
-                      {sq.question_type && <> · {sq.question_type}</>}
-                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={`inline-flex items-center gap-2 rounded-md px-2.5 py-1 text-sm font-bold tabular-nums ring-1 ring-inset ${bandColor(sq.match_band)}`}
+                        aria-label={`Similarity score ${(sq.similarity_score * 100).toFixed(1)} percent`}
+                        title="Higher similarity can indicate a duplicate question"
+                      >
+                        <span className="text-[10px] font-semibold uppercase tracking-wide">Similarity</span>
+                        <span>{(sq.similarity_score * 100).toFixed(1)}%</span>
+                      </span>
+                      {(sq.difficulty || sq.question_type) && (
+                        <span className="text-xs text-gray-500">
+                          {[sq.difficulty, sq.question_type].filter(Boolean).join(" ? ")}
+                        </span>
+                      )}
+                    </div>
                   )}
                   {sq.options && sq.options.length > 0 && (
                     <div className="text-xs text-gray-600 pl-3">
